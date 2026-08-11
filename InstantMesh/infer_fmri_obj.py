@@ -126,7 +126,7 @@ device = torch.device('cuda')
 # load diffusion model
 print('Loading diffusion model ...')
 pipeline = DiffusionPipeline.from_pretrained(
-    pretrained_model_name_or_path = "~/.cache/huggingface/hub/models--sudo-ai--zero123plus-v1.2/snapshots/2da07e89919e1a130c9b5add1584c70c7aa065fd", 
+    pretrained_model_name_or_path = "/home/jionkim/.cache/huggingface/hub/models--sudo-ai--zero123plus-v1.2/snapshots/2da07e89919e1a130c9b5add1584c70c7aa065fd",
     custom_pipeline="src/zero123plus",
     torch_dtype=torch.float16,
 )
@@ -198,7 +198,10 @@ for idx, test_file in enumerate(input_files):
         input_image = np.concatenate([input_image, input_image[-(6-len(input_image)):]])
     input_image = torch.from_numpy(input_image).unsqueeze(0).to(torch.float16).cuda()
 
+    print("input_image shape:", input_image.shape)
+    print("input_image total elements:", input_image.numel())
     print(input_image.size())
+
     # sampling
     output_image = pipeline(
         input_image, 

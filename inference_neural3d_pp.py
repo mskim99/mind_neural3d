@@ -74,7 +74,7 @@ def main():
     model.eval()
     scheduler = model.pipeline.scheduler
     dtype = next(model.pipeline.unet.parameters()).dtype
-
+    
     print(f"[*] Starting Inference (CFG Scale: {args.guidance_scale}, Steps: {args.num_steps})")
 
     img_idx = 0

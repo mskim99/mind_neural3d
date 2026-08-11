@@ -5,7 +5,8 @@ import numpy as np
 import argparse
 import shutil
 import time
-from src.mvdiffusion_egg import MVDiffusion
+# from src.mvdiffusion_egg import MVDiffusion
+from src.mvdiffusion_var import MVDiffusion
 from src.utils import set_random_seed, CheckpointIO
 
 # [수정] egg_dataset에서 새로운 데이터셋 클래스 임포트
@@ -52,7 +53,8 @@ if __name__ == '__main__':
     set_random_seed(seed)
 
     # Output directory and copy the config file
-    out_dir = os.path.join("./output", args.out_dir)
+    # out_dir = os.path.join("./output", args.out_dir)
+    out_dir = os.path.join(args.out_dir)
     if (args.ddp and rank == 0) or not args.ddp:
         os.makedirs(out_dir, exist_ok=True)
         shutil.copyfile(args.config, os.path.join(out_dir, 'config.yaml'))
@@ -107,6 +109,20 @@ if __name__ == '__main__':
         logdir=out_dir
     ).cuda()
 
+    # =========================================================================
+    # 🚀 [수정] 원인 1 해결: 옵티마이저에 새 모듈(fmri_encoder) 파라미터 동적 등록
+    # =========================================================================
+    # MVDiffusion 내부에서 생성된 기본 학습률(Base LR)을 가져옵니다.
+    base_lr = model_full.opt.param_groups[0]['lr']
+
+    # 기존 옵티마이저에 우리가 새로 만든 fmri_encoder의 가중치 업데이트 권한을 추가합니다.
+    # 완전히 무작위로 초기화된 상태이므로, 기존 모델보다 10배 높은 학습률을 부여하여 빠른 수렴을 유도합니다.
+    model_full.opt.add_param_group({
+        'params': model_full.fmri_encoder.parameters(),
+        'lr': base_lr * 10.0
+    })
+    # =========================================================================
+
     # [수정] DDP 미사용 시 model_full_ddp를 None으로 초기화하여 참조 오류 방지
     model_full_ddp = None
     if args.ddp:
@@ -125,6 +141,8 @@ if __name__ == '__main__':
     validate_every = cfg.training.validate_every
     visualize_every = cfg.training.visualize_every
 
+    test_iterator = iter(test_loader)
+
     epoch_it = 0
     it = 0
     t0 = time.time()
@@ -141,11 +159,31 @@ if __name__ == '__main__':
             # [수정] args.ddp가 True일 때만 no_sync 컨텍스트를 사용하도록 안전하게 수정
             mcontext = model_full_ddp.no_sync if (args.ddp and it % args.accumulation_steps != 0) else nullcontext
 
+            # mvdiffusion_egg
+            '''
             with mcontext():
                 diff_loss, clip_loss = model_full.get_loss(train_item)
                 # loss = clip_loss
                 # loss = diff_loss + clip_loss
                 loss = diff_loss + (0.2 * clip_loss)
+                loss = loss / args.accumulation_steps
+                loss.backward()
+            '''
+
+            # mvdiffusion_var
+            with mcontext():
+                # 🌟 수정: get_loss가 이제 3개의 값을 반환합니다.
+                diff_loss, clip_loss, ortho_loss = model_full.get_loss(train_item)
+
+                # 🌟 각 손실(Loss)에 대한 스케일링 가중치 설정 (하이퍼파라미터)
+                lambda_diff = 1.0  # MSE (픽셀/잠재 공간 생성 손실)
+                lambda_clip = 0.02  # Semantic 정렬 손실 (값이 크므로 줄여줌)
+                lambda_ortho = 0.1  # 직교 제약 손실 (너무 크면 의미 공간이 붕괴될 수 있으므로 0.1 권장)
+
+                # Total Loss 합산
+                loss = (lambda_diff * diff_loss) + (lambda_clip * clip_loss) + (lambda_ortho * ortho_loss)
+
+                # Gradient Accumulation 적용 및 역전파
                 loss = loss / args.accumulation_steps
                 loss.backward()
 
@@ -160,10 +198,25 @@ if __name__ == '__main__':
                 logger.add_scalar('train/clip_loss', clip_loss.item(), it)
                 logger.add_scalar('lr', model_full.sche.get_lr()[0], it)
 
+                # mvdiffusion_egg.py
+                '''
                 if print_every > 0 and (it % print_every) == 0:
                     t = time.time() - t0
                     print('[Epoch %02d] it=%03d, Train: diff_loss=%.4f, clip_loss=%.4f, lr=%.8f, time: %.0fm %0.2fs'
                           % (epoch_it, it, diff_loss.item(), clip_loss.item(), model_full.sche.get_lr()[0], t // 60, t % 60))
+                '''
+
+                # mvdiffusion_var.py
+                # 로그 출력 부분 수정
+                if (args.ddp and rank == 0) or not args.ddp:
+                    if (print_every > 0 and (it % print_every) == 0):
+                        print(
+                            f"[Epoch {epoch_it}] it={it:07d}, "
+                            f"Loss: {loss.item():.4f}, "
+                            f"Diff: {diff_loss.item():.4f}, "
+                            f"CLIP: {clip_loss.item():.4f}, "
+                            f"Ortho: {ortho_loss.item():.4f}"
+                        )
 
                 # save model
                 if (backup_every > 0 and (it % backup_every) == 0):

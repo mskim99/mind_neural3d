@@ -17,7 +17,7 @@ model_config:
 
 infer_config:
   # unet_path: /ssd/gaojianxiong/diffusion_pytorch_model.bin
-  model_path: ./instant_mesh_large.ckpt
+  model_path: /home/jionkim/InstantMesh/instant_mesh_large.ckpt
   texture_resolution: 1024
   render_resolution: 512
 
