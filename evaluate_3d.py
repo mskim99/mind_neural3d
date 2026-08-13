@@ -175,7 +175,7 @@ def evaluate(pred_dir, gt_dir, num_points=2048, device='cuda'):
 
 if __name__ == '__main__':
     # 테스트할 폴더 경로를 사용자 환경에 맞게 지정합니다
-    PRED_DIRECTORY = "./inference_results/meshes"
+    PRED_DIRECTORY = "/home/jionkim/MinD-3D/InstantMesh/outputs/mind3d_pp_infer__sub1_clp_0_2/meshes/"
     GT_DIRECTORY = "/data/jionkim/neuro_3D/gt_meshes"
 
     evaluate(pred_dir=PRED_DIRECTORY, gt_dir=GT_DIRECTORY)

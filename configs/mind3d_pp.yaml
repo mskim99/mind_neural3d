@@ -21,6 +21,6 @@ model:
 
 training:
   print_every: 10
-  backup_every: 2000
+  backup_every: 5000
   validate_every: 1000
   visualize_every: 500

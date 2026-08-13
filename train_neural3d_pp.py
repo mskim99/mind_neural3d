@@ -109,19 +109,7 @@ if __name__ == '__main__':
         logdir=out_dir
     ).cuda()
 
-    # =========================================================================
-    # 🚀 [수정] 원인 1 해결: 옵티마이저에 새 모듈(fmri_encoder) 파라미터 동적 등록
-    # =========================================================================
-    # MVDiffusion 내부에서 생성된 기본 학습률(Base LR)을 가져옵니다.
-    base_lr = model_full.opt.param_groups[0]['lr']
-
-    # 기존 옵티마이저에 우리가 새로 만든 fmri_encoder의 가중치 업데이트 권한을 추가합니다.
-    # 완전히 무작위로 초기화된 상태이므로, 기존 모델보다 10배 높은 학습률을 부여하여 빠른 수렴을 유도합니다.
-    model_full.opt.add_param_group({
-        'params': model_full.fmri_encoder.parameters(),
-        'lr': base_lr * 10.0
-    })
-    # =========================================================================
+    opt_fmri = torch.optim.AdamW(model_full.fmri_encoder.parameters(), lr=1e-3, weight_decay=1e-4)
 
     # [수정] DDP 미사용 시 model_full_ddp를 None으로 초기화하여 참조 오류 방지
     model_full_ddp = None
@@ -177,7 +165,7 @@ if __name__ == '__main__':
 
                 # 🌟 각 손실(Loss)에 대한 스케일링 가중치 설정 (하이퍼파라미터)
                 lambda_diff = 1.0  # MSE (픽셀/잠재 공간 생성 손실)
-                lambda_clip = 0.02  # Semantic 정렬 손실 (값이 크므로 줄여줌)
+                lambda_clip = 1.0  # Semantic 정렬 손실
                 lambda_ortho = 0.1  # 직교 제약 손실 (너무 크면 의미 공간이 붕괴될 수 있으므로 0.1 권장)
 
                 # Total Loss 합산
@@ -191,6 +179,9 @@ if __name__ == '__main__':
                 model_full.opt.step()
                 model_full.opt.zero_grad()
                 model_full.sche.step()
+
+                opt_fmri.step()
+                opt_fmri.zero_grad()
 
             # 단일 GPU 및 DDP 환경 로그 분기 처리
             if (args.ddp and rank == 0) or not args.ddp:

@@ -63,18 +63,23 @@ class SpatioTemporalGCN(nn.Module):
 class DisentanglementModule(nn.Module):
     def __init__(self, combined_dim, embed_dim):
         super().__init__()
-        # 세 가지 독립적인 라우팅(Routing) 네트워크
+
+        # 🚨 기존의 nn.LayerNorm을 제거하고,
+        # CLIP 공간으로 이동할 수 있도록 GELU와 Linear(Projection Head)를 덧붙입니다.
         self.semantic_routing = nn.Sequential(
             nn.Linear(combined_dim, embed_dim),
-            nn.LayerNorm(embed_dim)
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim)
         )
         self.variation_routing = nn.Sequential(
             nn.Linear(combined_dim, embed_dim),
-            nn.LayerNorm(embed_dim)
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim)
         )
         self.bias_filtering = nn.Sequential(
             nn.Linear(combined_dim, embed_dim),
-            nn.LayerNorm(embed_dim)
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim)
         )
 
     def forward(self, mixed_features):
@@ -484,15 +489,17 @@ class MVDiffusion(nn.Module):
                         self.cal_clip_loss(text_features, combined_cond_norm, self.t_logit_scale.exp())
 
         else:
-            # [조건 포함 상황] 🌟
-            # Conv1d 에러를 막기 위해 UNet용 조건은 원본(cond_eeg)을 넣어 기존 인코더에서 뽑아냅니다.
             _, prompt_embeds, eeg_cond_latents = self.encode_embed_fmri_condition_fmri(cond_eeg)
-
-            # 🌟 CLIP Loss(의미론적 정렬)에는 우리가 새로 분리해 낸 combined_cond를 직접 사용합니다!
-            # 이렇게 하면 역전파(Backpropagation) 시, CLIP Loss의 기울기가 새로운 분리 모듈을 학습시킵니다.
             image_features, text_features = self.get_clip_feature(color_video_fea, txt_fea)
-            clip_loss = self.cal_clip_loss(image_features, combined_cond, self.i_logit_scale.exp()) + \
-                        self.cal_clip_loss(text_features, combined_cond, self.t_logit_scale.exp())
+
+            # cal_clip_loss (InfoNCE) 제거 -> Cosine Loss로 직접 교체
+            # 두 벡터가 같은 방향을 가리키면 1, 반대면 -1을 반환합니다.
+            # 1.0에서 이 값을 빼주면, 벡터가 정렬될수록 Loss가 0으로 떨어집니다.
+            cos_sim_img = F.cosine_similarity(image_features, combined_cond, dim=-1)
+            cos_sim_txt = F.cosine_similarity(text_features, combined_cond, dim=-1)
+
+            # 평균을 내어 직접적인 스칼라 Loss 생성 (초기값 약 2.0에서 시작)
+            clip_loss = (1.0 - cos_sim_img.mean()) + (1.0 - cos_sim_txt.mean())
 
         # ==========================================================
         # 4. UNet 노이즈 예측 및 Diffusion MSE Loss 계산

@@ -9,6 +9,9 @@ from pytorch_lightning import seed_everything
 from omegaconf import OmegaConf
 from einops import rearrange
 from tqdm import tqdm
+import rembg
+import torchvision.transforms as transforms
+from torchvision.utils import make_grid
 
 # 기존 프로젝트의 유틸리티 모듈 유지
 from src.utils.train_util import instantiate_from_config
@@ -130,16 +133,54 @@ print(f'Total number of input images: {len(input_files)}')
 input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0 * args.scale).to(device)
 chunk_size = 20 if IS_FLEXICUBES else 1
 
+rembg_session = rembg.new_session()
+
 for idx, image_file in enumerate(input_files):
     name = os.path.basename(image_file).split('.')[0]
     print(f'[{idx + 1}/{len(input_files)}] Creating 3D object for {name} ...')
 
-    # 1. 6시점 그리드 이미지 로드 및 텐서 변환 (기존 파이프라인의 후처리 방식 차용)
     image = Image.open(image_file).convert('RGB')
-    images_np = np.asarray(image, dtype=np.float32) / 255.0
-    images_tensor = torch.from_numpy(images_np).permute(2, 0, 1).contiguous().float()  # (3, 960, 640)
-    images_tensor = rearrange(images_tensor, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)  # (6, 3, 320, 320)
+    w, h = image.size
 
+    # 🚀 [핵심 최적화 2] 아래쪽에 다른 객체(소라 등)가 붙어있는 병합본이면 위쪽만 잘라냅니다.
+    if h / w > 2.0:
+        image = image.crop((0, 0, w, h // 2))
+        h = h // 2
+
+    # 개별 뷰(View) 크기 계산 및 순백색 캔버스 준비
+    view_w, view_h = w // 2, h // 3
+    clean_grid = Image.new('RGB', (w, h), (255, 255, 255))
+
+    # ==========================================================
+    # 🚀 [핵심 최적화 3] 각 뷰를 독립적으로 크롭하여 AI에게 배경 제거를 맡김
+    # ==========================================================
+    for row in range(3):
+        for col in range(2):
+            left, top = col * view_w, row * view_h
+            right, bottom = left + view_w, top + view_h
+
+            # 개별 시점 크롭
+            view_img = image.crop((left, top, right, bottom))
+
+            # AI(rembg)가 형태를 파악하여 배경만 투명하게 제거
+            view_rgba = rembg.remove(view_img, session=rembg_session)
+
+            # 순백색 배경에 객체만 안전하게 합성
+            view_white = Image.new('RGB', view_img.size, (255, 255, 255))
+            view_white.paste(view_rgba, mask=view_rgba.split()[3])
+
+            # 전체 그리드에 복구
+            clean_grid.paste(view_white, (left, top))
+
+    # 텐서 변환
+    images_np = np.asarray(clean_grid, dtype=np.float32) / 255.0
+    images_tensor = torch.from_numpy(images_np).permute(2, 0, 1).contiguous().float()
+
+    # [디버깅] 저장된 2D 이미지를 확인하면 흰색 변기가 깎이지 않고 완벽히 보존됩니다!
+    debug_image = transforms.ToPILImage()(images_tensor)
+    debug_image.save(os.path.join(args.output_path, f"debug_2d_{name}.png"))
+
+    images_tensor = rearrange(images_tensor, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)
     images = images_tensor.unsqueeze(0).to(device)
     images = v2.functional.resize(images, 320, interpolation=3, antialias=True).clamp(0, 1)
 
