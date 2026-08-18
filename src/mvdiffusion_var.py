@@ -192,6 +192,26 @@ class EEG_Transformer_Encoder(nn.Module):
         return eeg_embed, eeg_feature
 
 
+class SpatialLatentDecoder(nn.Module):
+    def __init__(self, embed_dim=512):
+        super().__init__()
+        self.fc = nn.Linear(embed_dim, 256 * 4 * 4)  # 초기 저해상도 맵
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # 8x8
+            nn.GELU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 16x16
+            nn.GELU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # 32x32
+            nn.GELU(),
+            nn.ConvTranspose2d(32, 4, kernel_size=4, stride=2, padding=1)  # 64x64 (최종 4채널)
+        )
+
+    def forward(self, x):
+        x = self.fc(x).view(-1, 256, 4, 4)
+        return self.decoder(x)
+
+
 # =========================================================================
 # 2. 유틸리티 함수
 # =========================================================================
@@ -282,12 +302,15 @@ class MVDiffusion(nn.Module):
             nn.Linear(1024, 1024),
             nn.LayerNorm(1024)
         )
-
+        '''
         self.latent_proj = nn.Sequential(
             nn.Linear(512, 1024),
             nn.GELU(),
             nn.Linear(1024, 4 * 64 * 64)
         )
+        '''
+
+        self.latent_proj = SpatialLatentDecoder(embed_dim=512)
 
         self.i_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.t_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
