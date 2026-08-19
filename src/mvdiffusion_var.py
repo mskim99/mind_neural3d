@@ -12,7 +12,7 @@ from src.zero123plus.pipeline import RefOnlyNoisedUNet
 from peft import LoraConfig, get_peft_model
 from torch import distributed as dist
 from src.pytorch_optimization import AdamW, get_linear_schedule_with_warmup
-import open_clip
+# import open_clip
 from safetensors.torch import load_file
 
 
@@ -348,12 +348,12 @@ class MVDiffusion(nn.Module):
         self.global_step = 0
         self.logdir = logdir
         self.on_fit_start()
-
+        '''
         self.clip_model, _, transform = open_clip.create_model_and_transforms(model_name="ViT-H-14",
                                                                               pretrained="laion2b_s32b_b79k")
         self.clip_model.eval()
         self.tokenizer = open_clip.get_tokenizer('ViT-H-14')
-
+        '''
         # [추가] 대조 학습용 메모리 큐 (VRAM 소모 거의 없음)
         '''
         self.queue_size = 16
@@ -397,7 +397,7 @@ class MVDiffusion(nn.Module):
         if self.global_rank == 0:
             os.makedirs(os.path.join(self.logdir, 'images'), exist_ok=True)
             os.makedirs(os.path.join(self.logdir, 'images_val'), exist_ok=True)
-
+    '''
     def prepare_batch_data(self, batch):
         dtype = next(self.eeg_encoder.parameters()).dtype
         cond_eeg = batch['eeg_data'].to(self.device).to(dtype)
@@ -407,6 +407,37 @@ class MVDiffusion(nn.Module):
         target_imgs = v2.functional.resize(target_imgs, 320, interpolation=3, antialias=True).clamp(0, 1)
         target_imgs = target_imgs[:, :6]
         target_imgs = rearrange(target_imgs, 'b (x y) c h w -> b c (x h) (y w)', x=3, y=2)
+        return cond_eeg, target_imgs
+    '''
+
+    def prepare_batch_data(self, batch):
+        dtype = next(self.eeg_encoder.parameters()).dtype
+
+        cond_eeg = batch['eeg_data'].to(
+            self.device,
+            dtype=dtype,
+            non_blocking=True
+        )
+        target_imgs = batch['rotation_images'].to(
+            self.device,
+            dtype=dtype,
+            non_blocking=True
+        )
+
+        if target_imgs.shape[1:] != (6, 3, 320, 320):
+            raise ValueError(
+                f"Expected rotation_images [B,6,3,320,320], "
+                f"got {tuple(target_imgs.shape)}"
+            )
+
+        target_imgs = target_imgs.clamp(0, 1)
+        target_imgs = rearrange(
+            target_imgs,
+            'b (x y) c h w -> b c (x h) (y w)',
+            x=3,
+            y=2
+        )
+
         return cond_eeg, target_imgs
 
     def encode_embed_fmri_condition_fmri(self, eeg):
