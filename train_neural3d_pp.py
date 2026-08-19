@@ -10,7 +10,7 @@ from src.mvdiffusion_var import MVDiffusion
 from src.utils import set_random_seed, CheckpointIO
 
 # [수정] egg_dataset에서 새로운 데이터셋 클래스 임포트
-from src.data.egg_dataset import AllDataFeatureTwoEEG
+from src.data.egg_dataset_ext import AllDataFeatureTwoEEG
 
 from torch import distributed as dist
 from torch.utils.tensorboard import SummaryWriter
@@ -71,7 +71,7 @@ if __name__ == '__main__':
         data_path=data_path,
         sub_list=sub_list,
         train=True,
-        num_frames=16
+        num_frames=6
     )
 
     train_sampler = None
@@ -91,7 +91,7 @@ if __name__ == '__main__':
         data_path=data_path,
         sub_list=sub_list,
         train=False,
-        num_frames=16
+        num_frames=6
     )
 
     test_loader = DataLoader(
