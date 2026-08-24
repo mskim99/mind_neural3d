@@ -1,6 +1,64 @@
+#!/usr/bin/env python3
+"""
+InstantMesh reconstruction aligned with the EEG inference output layout.
+
+Expected EEG inference output:
+    <inference_root>/
+        render/
+            airplane_00.png
+            chair_00.png
+            ...
+        views/
+            airplane_00/
+                00.png ... 05.png
+            ...
+        evaluation_pairs.csv
+
+This script can receive either:
+    --input_path <inference_root>
+or
+    --input_path <inference_root>/render
+or a single packed 3x2 PNG.
+
+For each packed 3x2 prediction:
+    1) split row-major into exactly six canonical views
+    2) reconstruct an InstantMesh/FlexiCubes mesh
+    3) save the mesh using the same object label
+    4) render the reconstructed geometry again from the SAME six canonical
+       Zero123++ camera poses and save 00.png ... 05.png for evaluation
+
+Output:
+    <output_path>/
+        meshes/
+            airplane_00.obj
+        views/
+            airplane_00/
+                00.png ... 05.png
+        videos/                 # only if --save_video
+            airplane_00.mp4
+        mesh_pairs.csv
+
+The script intentionally does NOT:
+    - remove background again
+    - crop object regions
+    - recenter
+    - reorder views
+    - vertically flip the packed grid
+
+GPU convention:
+    defaults to physical GPU 1 via CUDA_VISIBLE_DEVICES=1.
+"""
+
+# Must be set before importing torch.
 import os
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+
 import glob
+import csv
 import argparse
+from pathlib import Path
+
 import numpy as np
 import torch
 from PIL import Image
@@ -9,11 +67,7 @@ from pytorch_lightning import seed_everything
 from omegaconf import OmegaConf
 from einops import rearrange
 from tqdm import tqdm
-import rembg
-import torchvision.transforms as transforms
-from torchvision.utils import make_grid
 
-# 기존 프로젝트의 유틸리티 모듈 유지
 from src.utils.train_util import instantiate_from_config
 from src.utils.camera_util import (
     FOV_to_intrinsics,
@@ -24,151 +78,444 @@ from src.utils.mesh_util import save_obj, save_obj_with_mtl
 from src.utils.infer_util import save_video
 
 
-def get_render_cameras(batch_size=1, M=120, radius=4.0, elevation=20.0, is_flexicubes=False):
-    """
-    Get the rendering camera parameters.
-    """
-    c2ws = get_circular_camera_poses(M=M, radius=radius, elevation=elevation)
+# -----------------------------------------------------------------------------
+# Camera / rendering helpers
+# -----------------------------------------------------------------------------
+
+def get_render_cameras(
+    batch_size=1,
+    M=120,
+    radius=4.0,
+    elevation=20.0,
+    is_flexicubes=False,
+):
+    c2ws = get_circular_camera_poses(
+        M=M,
+        radius=radius,
+        elevation=elevation,
+    )
     if is_flexicubes:
         cameras = torch.linalg.inv(c2ws)
         cameras = cameras.unsqueeze(0).repeat(batch_size, 1, 1, 1)
     else:
         extrinsics = c2ws.flatten(-2)
-        intrinsics = FOV_to_intrinsics(30.0).unsqueeze(0).repeat(M, 1, 1).float().flatten(-2)
+        intrinsics = (
+            FOV_to_intrinsics(30.0)
+            .unsqueeze(0)
+            .repeat(M, 1, 1)
+            .float()
+            .flatten(-2)
+        )
         cameras = torch.cat([extrinsics, intrinsics], dim=-1)
         cameras = cameras.unsqueeze(0).repeat(batch_size, 1, 1)
     return cameras
 
 
-def render_frames(model, planes, render_cameras, render_size=512, chunk_size=1, is_flexicubes=False):
-    """
-    Render frames from triplanes.
-    """
+def render_frames(
+    model,
+    planes,
+    render_cameras,
+    render_size=512,
+    chunk_size=1,
+    is_flexicubes=False,
+):
     frames = []
-    for i in tqdm(range(0, render_cameras.shape[1], chunk_size)):
+    for i in range(0, render_cameras.shape[1], chunk_size):
         if is_flexicubes:
             frame = model.forward_geometry(
                 planes,
                 render_cameras[:, i:i + chunk_size],
                 render_size=render_size,
-            )['img']
+            )["img"]
         else:
             frame = model.forward_synthesizer(
                 planes,
                 render_cameras[:, i:i + chunk_size],
                 render_size=render_size,
-            )['images_rgb']
+            )["images_rgb"]
         frames.append(frame)
 
-    frames = torch.cat(frames, dim=1)[0]
-    return frames
+    return torch.cat(frames, dim=1)[0]
 
 
-###############################################################################
-# Arguments
-###############################################################################
+def input_camera_features_to_flexicubes_w2c(input_cameras):
+    """
+    InstantMesh input camera feature:
+        first 12 values = flattened 3x4 camera-to-world matrix
+        final 4 values  = normalized intrinsics
 
-parser = argparse.ArgumentParser()
-parser.add_argument('config', type=str, help='Path to config file.')
-parser.add_argument('--input_path', type=str, required=True,
-                    help='Path to a single 6-view grid image or a directory of images.')
-parser.add_argument('--output_path', type=str, default='outputs/', help='Output directory.')
-parser.add_argument('--save_name', type=str, default='', help='Prefix for the output directory.')
-parser.add_argument('--seed', type=int, default=42, help='Random seed for sampling.')
-parser.add_argument('--scale', type=float, default=1.0, help='Scale of generated object.')
-parser.add_argument('--distance', type=float, default=4.5, help='Render distance.')
-parser.add_argument('--view', type=int, default=6, choices=[4, 6], help='Number of input views.')
-parser.add_argument('--export_texmap', action='store_true', help='Export a mesh with texture map.')
-parser.add_argument('--save_video', action='store_true', help='Save a circular-view video.')
+    FlexiCubes rendering expects 4x4 world-to-camera matrices.
+    """
+    if input_cameras.ndim != 3 or input_cameras.shape[-1] < 12:
+        raise ValueError(
+            f"Expected camera features [B,V,>=12], got {tuple(input_cameras.shape)}"
+        )
+
+    B, V, _ = input_cameras.shape
+    c2w_3x4 = input_cameras[..., :12].reshape(B, V, 3, 4)
+
+    bottom = torch.zeros(
+        (B, V, 1, 4),
+        dtype=c2w_3x4.dtype,
+        device=c2w_3x4.device,
+    )
+    bottom[..., 0, 3] = 1.0
+
+    c2ws = torch.cat([c2w_3x4, bottom], dim=-2)
+    return torch.linalg.inv(c2ws)
+
+
+def tensor_to_pil(x):
+    """
+    [3,H,W] float tensor, expected [0,1] -> RGB PIL.
+    """
+    x = x.detach().float().cpu().clamp(0, 1)
+    arr = (
+        x.permute(1, 2, 0).numpy() * 255.0
+    ).round().astype(np.uint8)
+    return Image.fromarray(arr, mode="RGB")
+
+
+def save_six_mesh_views(frames, output_dir):
+    """
+    frames: [6,3,H,W]
+    """
+    if frames.ndim != 4 or frames.shape[0] != 6:
+        raise ValueError(
+            f"Expected six rendered frames [6,3,H,W], got {tuple(frames.shape)}"
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for view_idx in range(6):
+        tensor_to_pil(frames[view_idx]).save(
+            os.path.join(output_dir, f"{view_idx:02d}.png")
+        )
+
+
+# -----------------------------------------------------------------------------
+# Input discovery / label mapping
+# -----------------------------------------------------------------------------
+
+def resolve_render_input(input_path):
+    """
+    Return:
+        render_source_dir_or_none,
+        input_files,
+        inference_root_or_none
+
+    If input_path is an inference root containing render/, automatically use it.
+    """
+    p = Path(input_path).expanduser().resolve()
+
+    if p.is_file():
+        return None, [str(p)], None
+
+    if not p.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {p}")
+
+    # Preferred: user passes the EEG inference root.
+    render_child = p / "render"
+    if render_child.is_dir():
+        render_dir = render_child
+        inference_root = p
+    else:
+        # Also support passing .../render directly.
+        render_dir = p
+        inference_root = p.parent if (p.name == "render") else None
+
+    input_files = sorted(
+        str(f)
+        for f in render_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg"}
+    )
+
+    if not input_files:
+        raise RuntimeError(f"No packed render images found in: {render_dir}")
+
+    return str(render_dir), input_files, inference_root
+
+
+def load_evaluation_mapping(inference_root):
+    """
+    Read the evaluation_pairs.csv produced by
+    inference_neural3d_pp_render_views.py.
+
+    Mapping is keyed by render-grid stem / sample_id.
+    """
+    mapping = {}
+    if inference_root is None:
+        return mapping
+
+    csv_path = Path(inference_root) / "evaluation_pairs.csv"
+    if not csv_path.is_file():
+        return mapping
+
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sample_id = str(row.get("sample_id", "")).strip()
+            if not sample_id:
+                continue
+            mapping[sample_id] = row
+
+    print(f"Loaded label mapping: {csv_path} ({len(mapping)} entries)")
+    return mapping
+
+
+def validate_packed_grid(image, path):
+    """
+    EEG inference writes a 3(row)x2(col) packed grid.
+    It can be any size divisible by 3x2, but each tile is expected to be square.
+    """
+    W, H = image.size
+
+    if H % 3 != 0 or W % 2 != 0:
+        raise ValueError(
+            f"{path}: packed image {W}x{H} is not divisible into 3x2."
+        )
+
+    tile_h = H // 3
+    tile_w = W // 2
+
+    if tile_h != tile_w:
+        raise ValueError(
+            f"{path}: expected square tiles, got tile {tile_w}x{tile_h} "
+            f"from packed grid {W}x{H}."
+        )
+
+    return tile_w, tile_h
+
+
+def grid_image_to_model_tensor(image, device):
+    """
+    RGB packed 3x2 PIL image -> [1,6,3,320,320]
+
+    Row-major canonical order:
+        0 | 1
+        2 | 3
+        4 | 5
+    """
+    image_np = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    grid = (
+        torch.from_numpy(image_np)
+        .permute(2, 0, 1)
+        .contiguous()
+        .float()
+    )
+
+    views = rearrange(
+        grid,
+        "c (n h) (m w) -> (n m) c h w",
+        n=3,
+        m=2,
+    )
+
+    # The EEG inference currently produces 320x320 tiles.
+    # Resize only if another valid square resolution is supplied.
+    if views.shape[-2:] != (320, 320):
+        views = v2.functional.resize(
+            views,
+            [320, 320],
+            interpolation=v2.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+
+    return views.unsqueeze(0).to(device).clamp(0, 1)
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser(
+    description="InstantMesh reconstruction for EEG inference render/ outputs"
+)
+parser.add_argument("config", type=str, help="Path to InstantMesh config YAML.")
+parser.add_argument(
+    "--input_path",
+    type=str,
+    required=True,
+    help=(
+        "EEG inference root containing render/, the render/ directory itself, "
+        "or a single packed 3x2 image."
+    ),
+)
+parser.add_argument(
+    "--output_path",
+    type=str,
+    default="mesh_results",
+    help="Output root. Creates meshes/, views/, and optional videos/.",
+)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--scale", type=float, default=1.0)
+parser.add_argument("--distance", type=float, default=4.5)
+parser.add_argument("--export_texmap", action="store_true")
+parser.add_argument("--save_video", action="store_true")
+parser.add_argument(
+    "--eval_view_resolution",
+    type=int,
+    default=320,
+    help="Resolution for the six reconstructed-mesh evaluation views.",
+)
+parser.add_argument(
+    "--gt_render_root",
+    type=str,
+    default="/data/jionkim/neuro_3D/render_grid_v4",
+    help=(
+        "Optional GT canonical-view root used only to validate 1:1 labels. "
+        "Expected <root>/<label>/00.png ... 05.png."
+    ),
+)
+parser.add_argument(
+    "--allow_missing_gt",
+    action="store_true",
+    help="Allow mesh creation when no matching GT label directory exists.",
+)
 args = parser.parse_args()
 
 seed_everything(args.seed)
 
-###############################################################################
-# Stage 0: Configuration & Model Loading
-###############################################################################
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
 
 config = OmegaConf.load(args.config)
-config_name = os.path.basename(args.config).replace('.yaml', '')
 model_config = config.model_config
 infer_config = config.infer_config
 
 IS_FLEXICUBES = True
-if args.save_name:
-    config_name = config_name + "_" + args.save_name
-device = torch.device('cuda')
+device = torch.device("cuda")
 
-# 모델 로드 (Diffusion 모델 제외, 복원 모델만 로드)
-print('Loading reconstruction model ...')
+print(f"Using device: {device} (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})")
+print("Loading reconstruction model ...")
+
 model = instantiate_from_config(model_config)
 model_ckpt_path = infer_config.model_path
-state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
-state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith('lrm_generator.')}
+state_dict = torch.load(
+    model_ckpt_path,
+    map_location="cpu",
+)["state_dict"]
+state_dict = {
+    k[14:]: v
+    for k, v in state_dict.items()
+    if k.startswith("lrm_generator.")
+}
 model.load_state_dict(state_dict, strict=True)
 
 model = model.to(device)
 if IS_FLEXICUBES:
-    model.init_flexicubes_geometry(device, fovy=30.0)
+    model.init_flexicubes_geometry(
+        device,
+        fovy=30.0,
+    )
 model = model.eval()
 
-# 출력 디렉토리 생성
-mesh_path = os.path.join(args.output_path, config_name, 'meshes')
-video_path = os.path.join(args.output_path, config_name, 'videos')
-os.makedirs(mesh_path, exist_ok=True)
-os.makedirs(video_path, exist_ok=True)
+# -----------------------------------------------------------------------------
+# Output layout
+# -----------------------------------------------------------------------------
 
-# 입력 파일 목록 구성 (단일 파일 또는 디렉토리)
-if os.path.isdir(args.input_path):
-    input_files = glob.glob(os.path.join(args.input_path, '*.*'))
-    input_files = [f for f in input_files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-else:
-    input_files = [args.input_path]
+mesh_root = os.path.join(args.output_path, "meshes")
+view_root = os.path.join(args.output_path, "views")
+video_root = os.path.join(args.output_path, "videos")
 
-print(f'Total number of input images: {len(input_files)}')
+os.makedirs(mesh_root, exist_ok=True)
+os.makedirs(view_root, exist_ok=True)
+if args.save_video:
+    os.makedirs(video_root, exist_ok=True)
 
-###############################################################################
-# Stage 1: 3D Reconstruction
-###############################################################################
+# -----------------------------------------------------------------------------
+# Input discovery
+# -----------------------------------------------------------------------------
 
-input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0 * args.scale).to(device)
-chunk_size = 20 if IS_FLEXICUBES else 1
+render_dir, input_files, inference_root = resolve_render_input(args.input_path)
+label_mapping = load_evaluation_mapping(inference_root)
 
-rembg_session = rembg.new_session()
+print(f"Total packed input grids: {len(input_files)}")
+if render_dir is not None:
+    print(f"Input render directory: {render_dir}")
+
+# Fixed canonical input cameras: same convention as GT renderer / Zero123++.
+input_cameras_all = get_zero123plus_input_cameras(
+    batch_size=1,
+    radius=4.0 * args.scale,
+).to(device)
+
+if input_cameras_all.shape[1] != 6:
+    raise RuntimeError(
+        f"Expected 6 canonical input cameras, got {input_cameras_all.shape[1]}"
+    )
+
+# The SAME camera poses converted to FlexiCubes W2C for evaluation rendering.
+canonical_eval_w2c = input_camera_features_to_flexicubes_w2c(
+    input_cameras_all
+)
+
+rows_for_csv = []
+
+# -----------------------------------------------------------------------------
+# Reconstruction
+# -----------------------------------------------------------------------------
 
 for idx, image_file in enumerate(input_files):
-    name = os.path.basename(image_file).split('.')[0]
-    print(f'[{idx + 1}/{len(input_files)}] Creating 3D object for {name} ...')
+    sample_id = Path(image_file).stem
 
-    image = Image.open(image_file).convert('RGB')
-    w, h = image.size
+    # Prefer label from inference evaluation_pairs.csv.
+    map_row = label_mapping.get(sample_id, {})
+    label = str(map_row.get("label", sample_id)).strip() or sample_id
 
-    # Validation 이미지인 경우 위쪽(3x2) 정답 뷰만 크롭
-    if h / w > 2.0:
-        image = image.crop((0, 0, w, h // 2))
+    print(
+        f"[{idx + 1}/{len(input_files)}] "
+        f"Creating mesh: sample_id={sample_id}, label={label}"
+    )
 
-    images_np = np.asarray(image, dtype=np.float32) / 255.0
-    images_tensor = torch.from_numpy(images_np).permute(2, 0, 1).contiguous().float()
+    # 1:1 GT label validation.
+    gt_view_dir = ""
+    if args.gt_render_root:
+        gt_view_dir = os.path.join(
+            args.gt_render_root,
+            label,
+        )
+        missing_gt = [
+            f"{i:02d}.png"
+            for i in range(6)
+            if not os.path.isfile(
+                os.path.join(gt_view_dir, f"{i:02d}.png")
+            )
+        ]
+        if missing_gt and not args.allow_missing_gt:
+            raise FileNotFoundError(
+                f"No complete 1:1 GT six-view match for '{label}'.\n"
+                f"Expected: {gt_view_dir}/00.png ... 05.png\n"
+                f"Missing: {missing_gt}"
+            )
 
-    # [디버깅] 저장
-    debug_image = transforms.ToPILImage()(images_tensor)
-    debug_image.save(os.path.join(args.output_path, f"debug_2d_{name}.png"))
+    # No rembg here: render/ already contains cleaned white-background grids.
+    image = Image.open(image_file).convert("RGB")
+    tile_w, tile_h = validate_packed_grid(image, image_file)
 
-    # 2. 6시점 분할 및 모델 입력용 리사이즈 (배경 제거 로직 완전 삭제)
-    images_tensor = rearrange(images_tensor, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)
-    images = images_tensor.unsqueeze(0).to(device)
-    images = v2.functional.resize(images, 320, interpolation=3, antialias=True).clamp(0, 1)
+    print(
+        f"  packed={image.size[0]}x{image.size[1]}, "
+        f"tile={tile_w}x{tile_h}"
+    )
 
-    if args.view == 4:
-        indices = torch.tensor([0, 2, 4, 5]).long().to(device)
-        images = images[:, indices]
-        input_cameras = input_cameras[:, indices]
+    images = grid_image_to_model_tensor(
+        image,
+        device=device,
+    )
 
-    with torch.no_grad():
-        # 2. Triplane 추출
-        planes = model.forward_planes(images, input_cameras)
+    with torch.inference_mode():
+        # Reconstruct triplanes from the exact 6 input views.
+        planes = model.forward_planes(
+            images,
+            input_cameras_all,
+        )
 
-        # 3. 메쉬 추출 및 저장
-        mesh_path_idx = os.path.join(mesh_path, f'{name}.obj')
+        # Extract final mesh.
+        mesh_file = os.path.join(
+            mesh_root,
+            f"{sample_id}.obj",
+        )
         mesh_out = model.extract_mesh(
             planes,
             use_texture_map=args.export_texmap,
@@ -183,17 +530,55 @@ for idx, image_file in enumerate(input_files):
                 faces.data.cpu().numpy(),
                 mesh_tex_idx.data.cpu().numpy(),
                 tex_map.permute(1, 2, 0).data.cpu().numpy(),
-                mesh_path_idx,
+                mesh_file,
             )
         else:
             vertices, faces, vertex_colors = mesh_out
-            save_obj(vertices, faces, vertex_colors, mesh_path_idx)
-        print(f"  -> Mesh saved to {mesh_path_idx}")
+            save_obj(
+                vertices,
+                faces,
+                vertex_colors,
+                mesh_file,
+            )
 
-        # 4. (옵션) 비디오 렌더링
+        print(f"  -> Mesh: {mesh_file}")
+
+        # --------------------------------------------------------------
+        # Re-render the reconstructed FlexiCubes geometry from the SAME
+        # six canonical camera poses. These are the views that should be
+        # used for final mesh-quality evaluation against GT six views.
+        # --------------------------------------------------------------
+        mesh_view_dir = os.path.join(
+            view_root,
+            sample_id,
+        )
+
+        canonical_frames = render_frames(
+            model,
+            planes,
+            canonical_eval_w2c,
+            render_size=args.eval_view_resolution,
+            chunk_size=6,
+            is_flexicubes=IS_FLEXICUBES,
+        )
+
+        save_six_mesh_views(
+            canonical_frames,
+            mesh_view_dir,
+        )
+
+        print(
+            f"  -> Mesh evaluation views: "
+            f"{mesh_view_dir}/00.png ... 05.png"
+        )
+
+        # Optional 120-view turntable.
+        video_file = ""
         if args.save_video:
-            video_path_idx = os.path.join(video_path, f'{name}.mp4')
-            render_size = infer_config.render_resolution
+            video_file = os.path.join(
+                video_root,
+                f"{sample_id}.mp4",
+            )
             render_cameras = get_render_cameras(
                 batch_size=1,
                 M=120,
@@ -202,18 +587,66 @@ for idx, image_file in enumerate(input_files):
                 is_flexicubes=IS_FLEXICUBES,
             ).to(device)
 
-            frames = render_frames(
+            video_frames = render_frames(
                 model,
                 planes,
                 render_cameras=render_cameras,
-                render_size=render_size,
-                chunk_size=chunk_size,
+                render_size=infer_config.render_resolution,
+                chunk_size=20,
                 is_flexicubes=IS_FLEXICUBES,
             )
 
             save_video(
-                frames,
-                video_path_idx,
+                video_frames,
+                video_file,
                 fps=30,
             )
-            print(f"  -> Video saved to {video_path_idx}")
+            print(f"  -> Video: {video_file}")
+
+    rows_for_csv.append({
+        "sample_id": sample_id,
+        "label": label,
+        "input_grid": image_file,
+        "mesh_path": mesh_file,
+        "pred_mesh_view_dir": mesh_view_dir,
+        "gt_view_dir": gt_view_dir,
+        "video_path": video_file,
+    })
+
+# -----------------------------------------------------------------------------
+# Save explicit GT <-> mesh-view mapping for evaluation
+# -----------------------------------------------------------------------------
+
+pairs_csv = os.path.join(
+    args.output_path,
+    "mesh_pairs.csv",
+)
+
+with open(
+    pairs_csv,
+    "w",
+    newline="",
+    encoding="utf-8",
+) as f:
+    fieldnames = [
+        "sample_id",
+        "label",
+        "input_grid",
+        "mesh_path",
+        "pred_mesh_view_dir",
+        "gt_view_dir",
+        "video_path",
+    ]
+    writer = csv.DictWriter(
+        f,
+        fieldnames=fieldnames,
+    )
+    writer.writeheader()
+    writer.writerows(rows_for_csv)
+
+print("\nInference complete.")
+print(f"Meshes          : {mesh_root}")
+print(f"Mesh 6-view eval: {view_root}")
+if args.save_video:
+    print(f"Videos          : {video_root}")
+print(f"Evaluation pairs: {pairs_csv}")

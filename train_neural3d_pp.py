@@ -27,6 +27,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, help='Path to config file.', default="./configs/mind3d.yaml")
     # Training
     parser.add_argument('--sub_id', type=str, default="0001")
+    parser.add_argument('--rendered_view_path', type=str, default='/data/jionkim/neuro_3D/eeg3d_training')
     parser.add_argument('--batchsize', type=int, default=2)
     parser.add_argument('--accumulation_steps', type=int, default=1)
     parser.add_argument('--out_dir', type=str, default="stage2_model")
@@ -71,7 +72,8 @@ if __name__ == '__main__':
         data_path=data_path,
         sub_list=sub_list,
         train=True,
-        num_frames=6
+        num_frames=6,
+        rendered_view_path=args.rendered_view_path
     )
 
     train_sampler = None
@@ -91,7 +93,8 @@ if __name__ == '__main__':
         data_path=data_path,
         sub_list=sub_list,
         train=False,
-        num_frames=6
+        num_frames=6,
+        rendered_view_path=args.rendered_view_path
     )
 
     test_loader = DataLoader(
@@ -108,8 +111,6 @@ if __name__ == '__main__':
         fmri_encoder_config=cfg.model.params.fmri_encoder_config,
         logdir=out_dir
     ).cuda()
-
-    opt_fmri = torch.optim.AdamW(model_full.fmri_encoder.parameters(), lr=1e-3, weight_decay=1e-4)
 
     # [수정] DDP 미사용 시 model_full_ddp를 None으로 초기화하여 참조 오류 방지
     model_full_ddp = None
@@ -180,13 +181,11 @@ if __name__ == '__main__':
                 model_full.opt.zero_grad()
                 model_full.sche.step()
 
-                opt_fmri.step()
-                opt_fmri.zero_grad()
-
             # 단일 GPU 및 DDP 환경 로그 분기 처리
             if (args.ddp and rank == 0) or not args.ddp:
                 logger.add_scalar('train/diff_loss', diff_loss.item(), it)
                 logger.add_scalar('train/clip_loss', clip_loss.item(), it)
+                logger.add_scalar('train/ortho_loss', ortho_loss.item(), it)
                 logger.add_scalar('lr', model_full.sche.get_lr()[0], it)
 
                 # mvdiffusion_egg.py
@@ -239,8 +238,12 @@ if __name__ == '__main__':
                             B = cond_eeg.shape[0]
 
                             # A. CFG를 위한 조건(Cond) / 비조건(Uncond) 피처 추출
-                            _, prompt_embeds_cond, latents_cond = model_full.encode_embed_fmri_condition_fmri(cond_eeg)
-                            _, prompt_embeds_uncond, latents_uncond = model_full.encode_embed_fmri_condition_fmri(torch.zeros_like(cond_eeg))
+                            _, prompt_embeds_cond, latents_cond = model_full.encode_embed_fmri_condition_fmri(
+                                cond_eeg, drop_condition=False
+                            )
+                            _, prompt_embeds_uncond, latents_uncond = model_full.encode_embed_fmri_condition_fmri(
+                                cond_eeg, drop_condition=True
+                            )
 
                             prompt_embeds = torch.cat([prompt_embeds_uncond, prompt_embeds_cond], dim=0)
                             eeg_cond_latents = torch.cat([latents_uncond, latents_cond], dim=0)
