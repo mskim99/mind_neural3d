@@ -236,9 +236,11 @@ def extract_into_tensor(a, t, x_shape):
 # 3. Main MVDiffusion Pipeline
 # =========================================================================
 class MVDiffusion(nn.Module):
-    def __init__(self, args, stable_diffusion_config, drop_cond_prob=0.1, fmri_encoder_config=None, logdir=None):
+    def __init__(self, args, stable_diffusion_config, drop_cond_prob=0.1, fmri_encoder_config=None, logdir=None, num_classes=72, cls_label_smoothing=0.05):
         super(MVDiffusion, self).__init__()
         self.drop_cond_prob = drop_cond_prob
+        self.num_classes = int(num_classes)
+        self.cls_label_smoothing = float(cls_label_smoothing)
         self.register_schedule()
 
         if "pretrained_model_name_or_path" in stable_diffusion_config:
@@ -311,6 +313,14 @@ class MVDiffusion(nn.Module):
         nn.init.eye_(self.semantic_to_cross[1].weight)
         nn.init.zeros_(self.semantic_to_cross[1].bias)
 
+        # Explicit 72-way semantic identity supervision.
+        # This head is used only during training; the semantic feature itself
+        # still conditions Zero123++ cross-attention.
+        self.semantic_cls_head = nn.Sequential(
+            nn.LayerNorm(1024),
+            nn.Linear(1024, self.num_classes),
+        )
+
         # variation branch: non-semantic/view-dependent information -> spatial cond_lat
         self.variation_to_latent = SpatialLatentDecoder(embed_dim=1024)
 
@@ -322,11 +332,19 @@ class MVDiffusion(nn.Module):
         lr = args.learning_rate          # LoRA / diffusion LR
         eeg_lr = 1e-4                    # shared EEG encoder + conditioning heads
 
+        # Save the exact PEFT/LoRA parameter names that are trainable by default.
+        # Stage-1 temporarily freezes them; Stage-2 restores ONLY these names,
+        # never the full pretrained UNet.
+        self._unet_lora_trainable_names = {
+            name for name, p in self.unet.named_parameters() if p.requires_grad
+        }
+
         optimizer_parameters = [
             {'params': self.unet.parameters(), 'lr': lr},
             {'params': self.fmri_encoder.parameters(), 'lr': eeg_lr},
             {'params': self.semantic_to_cross.parameters(), 'lr': eeg_lr},
             {'params': self.variation_to_latent.parameters(), 'lr': eeg_lr},
+            {'params': self.semantic_cls_head.parameters(), 'lr': eeg_lr},
         ]
 
         self.opt = AdamW(optimizer_parameters, betas=(0.9, 0.95))
@@ -344,6 +362,14 @@ class MVDiffusion(nn.Module):
 
         self.global_step = 0
         self.logdir = logdir
+
+        # Stage-2 diagnostic option:
+        # Keep fmri_encoder trainable for CLIP / CE / SupCon / AvgCons / Ortho,
+        # but block ONLY diffusion-loss gradients at the semantic/variation
+        # feature boundary.
+        self.stop_diffusion_grad_to_eeg = False
+        self._stopgrad_debug_printed = False
+
         self.on_fit_start()
 
         # [추가] 대조 학습용 메모리 큐 (VRAM 소모 거의 없음)
@@ -355,6 +381,213 @@ class MVDiffusion(nn.Module):
         self.img_queue = F.normalize(self.img_queue, dim=-1)
         self.queue_ptr = 0
         '''
+
+    def set_training_stage(self, stage):
+        """
+        Two-stage optimization.
+
+        semantic:
+          - train shared EEG disentangling encoder
+          - train 72-way semantic classifier
+          - freeze Zero123++ LoRA + semantic/variation generation heads
+          - skip diffusion objective in forward()
+
+        joint:
+          - keep semantic supervision
+          - restore only LoRA parameters in Zero123++
+          - train semantic_to_cross and variation_to_latent
+          - enable diffusion objective
+        """
+        if stage not in {"semantic", "joint"}:
+            raise ValueError(f"Unknown training stage: {stage}")
+
+        self.training_stage = stage
+
+        # Shared EEG encoder and classification head are always optimized.
+        self.fmri_encoder.requires_grad_(True)
+        self.semantic_cls_head.requires_grad_(True)
+
+        if stage == "semantic":
+            for _, p in self.unet.named_parameters():
+                p.requires_grad_(False)
+            self.semantic_to_cross.requires_grad_(False)
+            self.variation_to_latent.requires_grad_(False)
+
+        else:
+            # Never unfreeze the full pretrained UNet.
+            for name, p in self.unet.named_parameters():
+                p.requires_grad_(name in self._unet_lora_trainable_names)
+            self.semantic_to_cross.requires_grad_(True)
+            self.variation_to_latent.requires_grad_(True)
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(
+            f"[stage={stage}] trainable params: "
+            f"{trainable / 1e6:.2f}M / {total / 1e6:.2f}M"
+        )
+
+    def _semantic_losses(self, batch):
+        """
+        Compute semantic / orthogonal objectives from the SAME dataset item
+        that provides the EEG and explicit cls_index.
+        """
+        dtype = next(self.fmri_encoder.parameters()).dtype
+        cond_eeg = batch["eeg_data"].to(
+            self.device, dtype=dtype, non_blocking=True
+        )
+
+        if "cls_index" not in batch:
+            raise KeyError(
+                "Batch is missing `cls_index`. Use "
+                "src.data.egg_dataset_ext_explicit_label.AllDataFeatureTwoEEG."
+            )
+
+        cls_target = batch["cls_index"].to(
+            self.device, dtype=torch.long, non_blocking=True
+        )
+
+        with torch.autocast("cuda", enabled=False):
+            sem_feat, var_feat, bias_feat = self.fmri_encoder(cond_eeg.float())
+            ortho_loss = self.fmri_encoder.get_orthogonal_loss(
+                sem_feat, var_feat, bias_feat
+            )
+
+            cls_logits = self.semantic_cls_head(sem_feat.float())
+            cls_loss = F.cross_entropy(
+                cls_logits,
+                cls_target,
+                label_smoothing=self.cls_label_smoothing,
+            )
+            cls_acc = (cls_logits.argmax(dim=-1) == cls_target).float().mean()
+
+        image_features, text_features = self.get_clip_feature(
+            batch["color_video_fea"], batch["txt_fea"]
+        )
+        clip_loss = (
+            self.cal_clip_loss(image_features, sem_feat)
+            + self.cal_clip_loss(text_features, sem_feat)
+        )
+
+        return {
+            "cond_eeg": cond_eeg,
+            "sem_feat": sem_feat,
+            "var_feat": var_feat,
+            "bias_feat": bias_feat,
+            "clip_loss": clip_loss,
+            "cls_loss": cls_loss,
+            "cls_acc": cls_acc,
+            "ortho_loss": ortho_loss,
+        }
+
+    def forward(self, batch, stage="joint"):
+        """
+        Returns a loss dictionary. In semantic stage, expensive VAE/UNet
+        diffusion computation is completely skipped.
+        """
+        sem = self._semantic_losses(batch)
+
+        if stage == "semantic":
+            zero = sem["clip_loss"].new_zeros(())
+            return {
+                "diff_loss": zero,
+                "clip_loss": sem["clip_loss"],
+                "cls_loss": sem["cls_loss"],
+                "cls_acc": sem["cls_acc"],
+                "ortho_loss": sem["ortho_loss"],
+            }
+
+        if stage != "joint":
+            raise ValueError(f"Unknown stage: {stage}")
+
+        # Target grid is needed only in Stage-2.
+        _, target_imgs = self.prepare_batch_data(batch)
+        B = sem["cond_eeg"].shape[0]
+        t = torch.randint(
+            0, self.num_timesteps, size=(B,), device=self.device
+        ).long()
+
+        drop_condition = bool(
+            torch.rand((), device=sem["cond_eeg"].device) < self.drop_cond_prob
+        )
+        # -------------------------------------------------------------
+        # IMPORTANT: optional stop-gradient is applied ONLY on the
+        # diffusion-conditioning branch.
+        #
+        # The original sem/var tensors remain attached to fmri_encoder and
+        # continue to receive gradients from semantic objectives computed in
+        # _semantic_losses() (CLIP / CE / Ortho) and from trainer-side
+        # SupCon / AvgCons losses.
+        #
+        # Diffusion still trains semantic_to_cross, variation_to_latent and
+        # the trainable UNet/LoRA parameters because detach() is placed
+        # BEFORE those generation heads.
+        # -------------------------------------------------------------
+        sem_for_diff = sem["sem_feat"]
+        var_for_diff = sem["var_feat"]
+
+        if self.stop_diffusion_grad_to_eeg:
+            sem_for_diff = sem_for_diff.detach()
+            var_for_diff = var_for_diff.detach()
+
+            # One-time runtime sanity check.  The source EEG features must
+            # remain attached, while the copies entering diffusion must not.
+            if not self._stopgrad_debug_printed:
+                print(
+                    "[diff-stopgrad] "
+                    f"source_sem_requires_grad={sem['sem_feat'].requires_grad}, "
+                    f"source_var_requires_grad={sem['var_feat'].requires_grad}, "
+                    f"diff_sem_requires_grad={sem_for_diff.requires_grad}, "
+                    f"diff_var_requires_grad={var_for_diff.requires_grad}"
+                )
+                self._stopgrad_debug_printed = True
+
+        _, prompt_embeds, eeg_cond_latents = (
+            self.build_zero123_condition_from_features(
+                sem_for_diff,
+                var_for_diff,
+                drop_condition=drop_condition,
+            )
+        )
+
+        self.pipeline.unet.training = True
+        latents = self.encode_target_images(target_imgs)
+        noise = torch.randn_like(latents)
+        latents_noisy = self.train_scheduler.add_noise(
+            latents, noise, t
+        )
+
+        v_pred = self.forward_unet(
+            latents_noisy, t, prompt_embeds, eeg_cond_latents
+        )
+        v_target = self.get_v(latents, noise, t)
+        diff_loss, _ = self.compute_loss(v_pred, v_target)
+
+        self.global_step += 1
+
+        return {
+            "diff_loss": diff_loss,
+            "clip_loss": sem["clip_loss"],
+            "cls_loss": sem["cls_loss"],
+            "cls_acc": sem["cls_acc"],
+            "ortho_loss": sem["ortho_loss"],
+        }
+
+    @torch.no_grad()
+    def semantic_validation(self, batch):
+        was_training = self.training
+        self.eval()
+        losses = self._semantic_losses(batch)
+        out = {
+            "clip_loss": losses["clip_loss"].detach(),
+            "cls_loss": losses["cls_loss"].detach(),
+            "cls_acc": losses["cls_acc"].detach(),
+            "ortho_loss": losses["ortho_loss"].detach(),
+        }
+        if was_training:
+            self.train()
+        return out
+
 
     @torch.no_grad()
     def get_clip_feature(self, color_video_fea, txt_fea):
@@ -490,61 +723,18 @@ class MVDiffusion(nn.Module):
                 extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x)
 
     @torch.autocast("cuda", dtype=torch.bfloat16)
-    def get_loss(self, batch, **kwargs):
-        cond_eeg, target_imgs = self.prepare_batch_data(batch)
-        B = cond_eeg.shape[0]
-        color_video_fea, txt_fea = batch['color_video_fea'], batch['txt_fea']
-        t = torch.randint(0, self.num_timesteps, size=(B,), device=self.device).long()
-
-        # ----------------------------------------------------------
-        # 1) One shared EEG encoder produces semantic/variation/bias.
-        # ----------------------------------------------------------
-        with torch.autocast("cuda", enabled=False):
-            sem_feat, var_feat, bias_feat = self.fmri_encoder(cond_eeg.float())
-            ortho_loss = self.fmri_encoder.get_orthogonal_loss(
-                sem_feat, var_feat, bias_feat
-            )
-
-        # ----------------------------------------------------------
-        # 2) Semantic supervision is applied ONLY to semantic branch.
-        #    This is now the same branch that conditions cross-attention.
-        # ----------------------------------------------------------
-        image_features, text_features = self.get_clip_feature(
-            color_video_fea, txt_fea
+    def get_loss(self, batch, stage="joint", **kwargs):
+        """
+        Backward-compatible tuple wrapper.
+        New training code should call model(batch, stage=...) and use the dict.
+        """
+        losses = self.forward(batch, stage=stage)
+        return (
+            losses["diff_loss"],
+            losses["clip_loss"],
+            losses["cls_loss"],
+            losses["ortho_loss"],
         )
-        clip_loss = (
-            self.cal_clip_loss(image_features, sem_feat)
-            + self.cal_clip_loss(text_features, sem_feat)
-        )
-
-        # ----------------------------------------------------------
-        # 3) CFG dropout affects generation conditioning only.
-        #    CLIP/orthogonal supervision remains active on real EEG.
-        # ----------------------------------------------------------
-        drop_condition = bool(torch.rand((), device=cond_eeg.device) < self.drop_cond_prob)
-        _, prompt_embeds, eeg_cond_latents = self.build_zero123_condition_from_features(
-            sem_feat, var_feat, drop_condition=drop_condition
-        )
-
-        # ----------------------------------------------------------
-        # 4) Diffusion objective. Gradients now flow as:
-        #      diff -> semantic_to_cross -> semantic branch
-        #      diff -> variation_to_latent -> variation branch
-        # ----------------------------------------------------------
-        self.pipeline.unet.training = True
-        latents = self.encode_target_images(target_imgs)
-        noise = torch.randn_like(latents)
-        latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
-
-        v_pred = self.forward_unet(
-            latents_noisy, t, prompt_embeds, eeg_cond_latents
-        )
-        v_target = self.get_v(latents, noise, t)
-
-        diff_loss, _ = self.compute_loss(v_pred, v_target)
-        self.global_step += 1
-
-        return diff_loss, clip_loss, ortho_loss
 
 
     def cal_clip_loss(self, target_features, eeg_features, logit_scale=None):

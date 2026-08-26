@@ -17,12 +17,13 @@ try:
 except ImportError:
     rembg = None
 
-from src.mvdiffusion_var_semantic_cls import MVDiffusion, unscale_image
+from src.mvdiffusion_var_protofinal import MVDiffusion, unscale_image
 from src.data.egg_dataset_ext_el import AllDataFeatureTwoEEG
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Inference script for End-to-End EEG-to-3D')
-    parser.add_argument('--config', type=str, default="./configs/mind3d.yaml", help='Path to config file')
+    parser.add_argument('--config', type=str, default="./configs/mind3d_pp.yaml", help='Path to MinD-3D++ config file')
     parser.add_argument('--ckpt_path', type=str, required=True,
                         help='Path to the trained model checkpoint (e.g., model_3000.pt)')
     parser.add_argument('--out_dir', type=str, default="./inference_results", help='Directory to save generated images')
@@ -476,6 +477,156 @@ def save_experiment_b_outputs(
     return raw_path, clean_path
 
 
+
+def _is_mind3d_pp_config(cfg):
+    """Return True only for a config usable by the Zero123++ MVDiffusion."""
+    return (
+        OmegaConf.select(
+            cfg,
+            "model.params.stable_diffusion_config",
+            default=None,
+        )
+        is not None
+    )
+
+
+def resolve_inference_config(args, checkpoint=None):
+    """
+    Resolve the EXACT MinD-3D++ config used for the training checkpoint.
+
+    Training layout produced by train_neural3d_pp_semantic_cls.py:
+        <out_dir>/
+            config.yaml
+            checkpoints/
+                model_XXXXXX.pt
+
+    Therefore, for a checkpoint in <out_dir>/checkpoints/, the matching config
+    is normally checkpoint.parent.parent / "config.yaml", NOT
+    checkpoint.parent / "config.yaml".
+
+    Resolution order:
+      1. <ckpt_dir>/../config.yaml       (normal current training layout)
+      2. <ckpt_dir>/config.yaml          (legacy layout)
+      3. checkpoint['args']['config']    (if stored and still exists)
+      4. --config                        (explicit/default fallback)
+
+    Every candidate is validated to contain
+    model.params.stable_diffusion_config.
+    """
+    ckpt_path = Path(args.ckpt_path).expanduser().resolve()
+    candidates = []
+
+    # Current trainer saves checkpoints under out_dir/checkpoints/ and config
+    # directly under out_dir/.
+    candidates.append(
+        ("checkpoint parent config", ckpt_path.parent.parent / "config.yaml")
+    )
+
+    # Legacy possibility.
+    candidates.append(
+        ("checkpoint directory config", ckpt_path.parent / "config.yaml")
+    )
+
+    # The training checkpoint stores vars(args).
+    if isinstance(checkpoint, dict):
+        saved_args = checkpoint.get("args", {})
+        if isinstance(saved_args, dict):
+            saved_cfg = saved_args.get("config")
+            if saved_cfg:
+                saved_cfg_path = Path(saved_cfg).expanduser()
+                if not saved_cfg_path.is_absolute():
+                    # First try relative to current working directory, then repo-ish
+                    # path near the checkpoint.
+                    candidates.append(
+                        ("checkpoint saved --config", Path.cwd() / saved_cfg_path)
+                    )
+                    candidates.append(
+                        (
+                            "checkpoint-relative saved --config",
+                            ckpt_path.parent.parent.parent / saved_cfg_path,
+                        )
+                    )
+                else:
+                    candidates.append(
+                        ("checkpoint saved --config", saved_cfg_path)
+                    )
+
+    candidates.append(
+        ("CLI --config", Path(args.config).expanduser())
+    )
+
+    tried = []
+    seen = set()
+
+    for source, path in candidates:
+        try:
+            path = path.resolve()
+        except Exception:
+            path = Path(path)
+
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        tried.append(f"{source}: {path}")
+
+        if not path.is_file():
+            continue
+
+        cfg = OmegaConf.load(path)
+        if _is_mind3d_pp_config(cfg):
+            print(f"[*] Using matched MinD-3D++ config ({source}): {path}")
+            print(
+                "[*] Config learning_rate:",
+                OmegaConf.select(cfg, "learning_rate", default="<missing>"),
+            )
+            return cfg, path
+
+        print(
+            f"[!] Ignoring incompatible config ({source}): {path}\n"
+            f"    top-level keys={list(cfg.keys()) if OmegaConf.is_dict(cfg) else '<non-dict>'}"
+        )
+
+    raise RuntimeError(
+        "Could not find a valid MinD-3D++ config for inference.\n"
+        "A valid config must contain:\n"
+        "  model.params.stable_diffusion_config\n\n"
+        "Tried:\n  - " + "\n  - ".join(tried) + "\n\n"
+        "Pass the correct file explicitly, e.g.:\n"
+        "  --config ./configs/mind3d_pp.yaml"
+    )
+
+
+def get_checkpoint_model_args(cfg, checkpoint):
+    """
+    MVDiffusion's first argument is used for `learning_rate`.
+
+    Prefer the checkpoint's saved training learning rate when available;
+    otherwise use the matched mind3d_pp.yaml value.
+    """
+    from types import SimpleNamespace
+
+    lr = None
+    if isinstance(checkpoint, dict):
+        saved_args = checkpoint.get("args", {})
+        if isinstance(saved_args, dict):
+            value = saved_args.get("learning_rate")
+            if value is not None:
+                lr = float(value)
+
+    if lr is None:
+        value = OmegaConf.select(cfg, "learning_rate", default=None)
+        if value is not None:
+            lr = float(value)
+
+    if lr is None:
+        raise KeyError(
+            "No learning_rate found in checkpoint args or matched MinD-3D++ config."
+        )
+
+    return SimpleNamespace(learning_rate=lr)
+
+
+
 @torch.no_grad()
 def main():
     args = parse_args()
@@ -498,20 +649,33 @@ def main():
     runtime_logdir = tempfile.mkdtemp(prefix="neural3d_infer_")
 
     # =========================================================================
-    # 🚀 [수정] 체크포인트가 위치한 폴더의 백업 config.yaml을 강제로 불러오도록 로직 변경
+    # 1) Load checkpoint FIRST, then resolve its matched MinD-3D++ config.
     # =========================================================================
-    ckpt_dir = os.path.dirname(args.ckpt_path)
-    backup_config_path = os.path.join(ckpt_dir, "config.yaml")
+    print(f"[*] Loading checkpoint metadata/weights from {args.ckpt_path}")
+    checkpoint = torch.load(args.ckpt_path, map_location="cpu")
 
-    if os.path.exists(backup_config_path):
-        print(f"[*] Loading matched training config from {backup_config_path}")
-        cfg = OmegaConf.load(backup_config_path)
-    else:
-        print(f"[*] Backup config not found. Falling back to {args.config}")
-        cfg = OmegaConf.load(args.config)
+    cfg, matched_config_path = resolve_inference_config(
+        args,
+        checkpoint=checkpoint,
+    )
+    model_args = get_checkpoint_model_args(
+        cfg,
+        checkpoint,
+    )
+
+    stable_cfg = OmegaConf.select(
+        cfg,
+        "model.params.stable_diffusion_config",
+    )
+    fmri_cfg = OmegaConf.select(
+        cfg,
+        "model.params.fmri_encoder_config",
+        default=None,
+    )
+
     # =========================================================================
-
-    # 2. 데이터셋 및 데이터로더 준비 (Validation/Test Set)
+    # 2) Test dataset: same 6-view dataset class used by training.
+    # =========================================================================
     print(f"[*] Preparing Test Dataset for subject {args.sub_id}")
     data_path = "/data/jionkim/neuro_3D/"
     test_dataset = AllDataFeatureTwoEEG(
@@ -519,24 +683,36 @@ def main():
         sub_list=[args.sub_id],
         train=False,
         num_frames=6,
-        rendered_view_path=args.rendered_view_path
+        rendered_view_path=args.rendered_view_path,
     )
-    test_loader = DataLoader(test_dataset, batch_size=args.batchsize, num_workers=4, drop_last=False)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batchsize,
+        num_workers=4,
+        drop_last=False,
+    )
 
-    # 3. 모델 초기화
-    print("[*] Initializing MVDiffusion Model...")
+    # =========================================================================
+    # 3) Model: MUST match train_neural3d_pp_semantic_cls.py.
+    # =========================================================================
+    print("[*] Initializing final fixed-prototype MVDiffusion...")
     model = MVDiffusion(
-        cfg,
-        cfg.model.params.stable_diffusion_config,
-        fmri_encoder_config=cfg.model.params.fmri_encoder_config,
-        logdir=runtime_logdir
+        model_args,
+        stable_cfg,
+        fmri_encoder_config=fmri_cfg,
+        logdir=runtime_logdir,
+        num_classes=72,
+        cls_label_smoothing=0.05,
     ).to(device)
 
-    # 4. 체크포인트 로드 (DDP의 'module.' 접두어 자동 처리)
-    print(f"[*] Loading weights from {args.ckpt_path}")
-    checkpoint = torch.load(args.ckpt_path, map_location="cpu")
-    state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    # =========================================================================
+    # 4) Load trained weights.
+    # =========================================================================
+    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+    state_dict = {
+        k.replace("module.", ""): v
+        for k, v in state_dict.items()
+    }
 
     # IMPORTANT:
     # This inference must use the exact same architecture as training.
@@ -545,6 +721,20 @@ def main():
     incompatible = model.load_state_dict(state_dict, strict=False)
     missing = list(incompatible.missing_keys)
     unexpected = list(incompatible.unexpected_keys)
+
+    required_prefixes = (
+        "semantic_to_clip.",
+        "fixed_text_prototypes",
+    )
+    missing_arch = [
+        prefix for prefix in required_prefixes
+        if not any(k.startswith(prefix) for k in state_dict.keys())
+    ]
+    if missing_arch:
+        raise RuntimeError(
+            "Checkpoint is not from the final fixed-prototype architecture. "
+            f"Missing architecture keys/prefixes: {missing_arch}"
+        )
 
     if missing or unexpected:
         print("\n[CHECKPOINT MISMATCH]")
@@ -556,8 +746,8 @@ def main():
             print(f"    UNEXPECTED {k}")
         raise RuntimeError(
             "Checkpoint/model architecture mismatch. "
-            "Use the checkpoint trained with "
-            "src.mvdiffusion_var_semvar_connected.MVDiffusion."
+            "Use a checkpoint trained with "
+            "src.mvdiffusion_var_protofinal.MVDiffusion."
         )
 
     print("[*] Checkpoint load verified: 0 missing / 0 unexpected keys")

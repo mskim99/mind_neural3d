@@ -17,9 +17,8 @@ try:
 except ImportError:
     rembg = None
 
-from src.mvdiffusion_var import MVDiffusion, unscale_image
-from src.data.egg_dataset_ext import AllDataFeatureTwoEEG
-
+from src.mvdiffusion_var_semantic_cls import MVDiffusion, unscale_image
+from src.data.egg_dataset_ext_el import AllDataFeatureTwoEEG
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Inference script for End-to-End EEG-to-3D')
@@ -78,6 +77,7 @@ def parse_args():
     return parser.parse_args()
 
 
+
 def _tensor_grid_to_pil(image_tensor):
     """
     [3,H,W] float tensor in [0,1] -> RGB PIL image.
@@ -102,6 +102,7 @@ def _save_exact_tensor_image(image_tensor, path):
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     _tensor_grid_to_pil(image_tensor).save(path)
+
 
 
 def _canonical_label_from_dataset_name(name):
@@ -183,15 +184,15 @@ def validate_gt_view_dir(gt_root, label):
 
 
 def save_sample_metadata(
-        out_dir,
-        sample_id,
-        dataset_name,
-        label,
-        gt_dir,
-        raw_view_dir,
-        clean_view_dir,
-        raw_grid_path,
-        clean_grid_path,
+    out_dir,
+    sample_id,
+    dataset_name,
+    label,
+    gt_dir,
+    raw_view_dir,
+    clean_view_dir,
+    raw_grid_path,
+    clean_grid_path,
 ):
     meta_dir = os.path.join(out_dir, "metadata")
     os.makedirs(meta_dir, exist_ok=True)
@@ -280,6 +281,8 @@ def write_evaluation_manifests(out_dir, records):
     return index_path, raw_path, clean_path
 
 
+
+
 def write_evaluation_pairs(out_dir, records):
     """
     Root-level 1:1 GT/prediction mapping for evaluation.
@@ -289,6 +292,11 @@ def write_evaluation_pairs(out_dir, records):
         "sample_id",
         "dataset_name",
         "label",
+        "class_prefix",
+        "cls_index",
+        "obj_index",
+        "trial_index",
+        "subject_index",
         "gt_dir",
         "pred_dir",
         "render_grid",
@@ -336,11 +344,12 @@ def prepare_output_layout(out_dir):
     return render_dir, views_dir
 
 
+
 def clean_generated_grid_background(
-        generated_grid,
-        rembg_session,
-        alpha_threshold=8,
-        binary_alpha=False,
+    generated_grid,
+    rembg_session,
+    alpha_threshold=8,
+    binary_alpha=False,
 ):
     """
     Experiment B.
@@ -431,11 +440,11 @@ def clean_generated_grid_background(
 
 
 def save_experiment_b_outputs(
-        out_dir,
-        sample_idx,
-        raw_grid,
-        clean_grid,
-        mask_grid=None,
+    out_dir,
+    sample_idx,
+    raw_grid,
+    clean_grid,
+    mask_grid=None,
 ):
     """
     Save files in paths that can be passed directly to InstantMesh.
@@ -555,7 +564,7 @@ def main():
     model.eval()
     scheduler = model.pipeline.scheduler
     dtype = next(model.pipeline.unet.parameters()).dtype
-
+    
     print(f"[*] Starting Inference (CFG Scale: {args.guidance_scale}, Steps: {args.num_steps})")
 
     img_idx = 0
@@ -618,7 +627,7 @@ def main():
         # ----------------------------------------------------------------
         with torch.autocast("cuda", dtype=torch.bfloat16):
             images_pred = \
-                model.pipeline.vae.decode(latents / model.pipeline.vae.config.scaling_factor, return_dict=False)[0]
+            model.pipeline.vae.decode(latents / model.pipeline.vae.config.scaling_factor, return_dict=False)[0]
             images_pred = unscale_image(images_pred)
             images_pred = (images_pred * 0.5 + 0.5).clamp(0, 1)
 
@@ -638,14 +647,37 @@ def main():
                 )
 
             dataset_name = str(batch['name'][i])
-            label = _canonical_label_from_dataset_name(dataset_name)
 
-            # Label comes from the SAME dataset item that supplies cond_eeg.
-            # This protects against index-based naming drift.
+            if 'label' not in batch:
+                raise KeyError(
+                    "Explicit `label` missing from dataset batch. "
+                    "Use src.data.egg_dataset_ext_explicit_label."
+                )
+
+            # IMPORTANT: do not infer the label from filename slicing here.
+            # The dataset item that supplied cond_eeg also supplies its label.
+            label = str(batch['label'][i])
+            class_prefix = str(batch['class_prefix'][i])
+            cls_index = int(batch['cls_index'][i])
+            obj_index = int(batch['obj_index'][i])
+            trial_index = int(batch['trial_index'][i])
+            subject_index = int(batch['subject_index'][i])
+
             print(
                 f"[MAP] batch={batch_idx} item={i} "
-                f"dataset_name={dataset_name} -> label={label}"
+                f"sub={subject_index} cls={cls_index} obj={obj_index} "
+                f"trial={trial_index} prefix={class_prefix} "
+                f"name={dataset_name} -> label={label}"
             )
+
+            # Internal consistency check: the explicit label must still equal
+            # the object key used by the dataset for CLIP / rendered-view lookup.
+            expected_label = dataset_name[3:]
+            if label != expected_label:
+                raise RuntimeError(
+                    f"Dataset mapping inconsistency: explicit label={label!r}, "
+                    f"name[3:]={expected_label!r}, name={dataset_name!r}"
+                )
 
             if label not in seen_labels:
                 sample_id = label
@@ -712,6 +744,11 @@ def main():
                 "sample_id": sample_id,
                 "dataset_name": dataset_name,
                 "label": label,
+                "class_prefix": class_prefix,
+                "cls_index": cls_index,
+                "obj_index": obj_index,
+                "trial_index": trial_index,
+                "subject_index": subject_index,
                 "gt_dir": gt_dir,
                 "pred_dir": pred_view_dir,
                 "render_grid": render_grid_path,
