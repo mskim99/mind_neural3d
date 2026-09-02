@@ -1,56 +1,62 @@
 #!/usr/bin/env python3
 """
-EEG Semantic Distillation (raw-EEG, no deprecated EEG checkpoint)
-=================================================================
+E2: Frozen E1-r semantic prior + fixed-scale EEG residual distillation
+=====================================================================
 
 Purpose
 -------
-Distill the generation effect of a frozen Oracle semantic generator into a
-small EEG semantic adapter WITHOUT using any previous EEG semantic checkpoint.
+Test whether continuous EEG information adds generation utility on top of the
+already-trained E1-r semantic prior.
 
-Strict DEV split
-----------------
+Strict DEV
+----------
 train  : object 00..05
 val    : object 06
 unused : object07
 final  : 08/09 NOT INSTANTIATED
 
-Teacher
--------
-GT category
-  -> fixed TRAIN-only category text prototype
-  -> frozen semantic_to_cross
-  -> frozen Oracle Zero123++/LoRA
-  -> v_teacher
+Frozen
+------
+- Oracle semantic generator (Zero123++ base + LoRA + semantic_to_cross)
+- E1-r raw-EEG -> PCA -> semantic student
+- PCA transform stored inside the E1-r student checkpoint
+- fixed TRAIN-only category text prototypes
 
-Student
--------
-raw EEG [64,600]
-  -> deterministic per-sample, per-channel z-normalization
-  -> flatten [38400]
-  -> STRICT train-only PCA [512]
-  -> small semantic adapter (LN -> 256 -> 72)
-  -> soft category distribution
-  -> mixture of fixed TRAIN-only category text prototypes
-  -> SAME frozen semantic_to_cross
-  -> SAME frozen Oracle Zero123++/LoRA
-  -> v_student
+Trainable
+---------
+- residual_head only:
+      PCA feature [512]
+        -> LayerNorm
+        -> Linear 512->64
+        -> GELU
+        -> Linear 64->1024
+        -> L2 normalize
+
+Condition
+---------
+base_semantic = normalize(p_EEG @ category_prototypes)
+residual      = normalize(residual_head(PCA_feature))
+E2_prior      = normalize(base_semantic + alpha * residual)
+
+alpha is FIXED (default 0.03). There is no learnable gate.
 
 Loss
 ----
-L = lambda_distill * MSE(v_student, stopgrad(v_teacher))
-  + lambda_soft_sem * KL(q_text_geometry || p_EEG)
+L = MSE(v_E2, stopgrad(v_oracle))
 
 No hard CE.
-No exact object CLIP regression.
-No InfoNCE.
-No learned EEG residual/gate.
-No spatial EEG cond_lat.
-No best_semantic.pt / V0 / V1 / V2 dependency.
+No soft semantic KL.
+No exact CLIP regression.
+No learnable gate.
+No spatial EEG condition.
+No deprecated EEG checkpoint.
 
-Required learned artifact
--------------------------
-Only the new Oracle generator checkpoint from train_oracle_semantic_generator.py.
+Validation reports BOTH:
+- E1 base condition (frozen semantic student only)
+- E2 residual condition
+against the same Oracle / unconditional generator using the same noisy latent,
+noise realization, and timestep. Therefore E2_gain_delta directly measures the
+added value of the residual branch.
 """
 
 import argparse
@@ -61,8 +67,6 @@ import random
 from pathlib import Path
 
 import numpy as np
-from sklearn.decomposition import PCA
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -76,7 +80,7 @@ from src.data.egg_dataset_ext_el import AllDataFeatureTwoEEG
 
 
 # =============================================================================
-# Reproducibility
+# Reproducibility / strict split
 # =============================================================================
 def seed_everything(seed: int):
     random.seed(seed)
@@ -86,9 +90,6 @@ def seed_everything(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-# =============================================================================
-# Strict split helpers
-# =============================================================================
 def object_suffix(name):
     key = str(name)[3:]
     if "_" in key and key.rsplit("_", 1)[-1].isdigit():
@@ -106,7 +107,6 @@ def category_from_name(name):
 def selected_object_columns(dataset, suffixes):
     wanted = set(suffixes)
     cols = []
-
     for o in range(int(dataset.obj_num)):
         seen = {
             object_suffix(dataset.name_list[c, o])
@@ -129,30 +129,27 @@ def selected_object_columns(dataset, suffixes):
 
 def full_dataset_indices(dataset, suffixes):
     cols = selected_object_columns(dataset, suffixes)
-
     S = int(dataset.eeg_data.shape[0])
     C = int(dataset.cls_num)
     O = int(dataset.obj_num)
     R = int(dataset.trails_num)
 
-    indices = []
+    out = []
     for s in range(S):
         for c in range(C):
             for o in cols:
                 for r in range(R):
-                    idx = s * (C * O * R) + c * (O * R) + o * R + r
-                    indices.append(idx)
-    return indices
+                    out.append(
+                        s * (C * O * R) + c * (O * R) + o * R + r
+                    )
+    return out
 
 
 class EEGOnlyDataset(Dataset):
-    """EEG-only view used for PCA and semantic validation."""
-
     def __init__(self, base, suffixes, mode="individual"):
         self.base = base
         self.mode = mode
         self.cols = selected_object_columns(base, suffixes)
-
         S = int(base.eeg_data.shape[0])
         C = int(base.cls_num)
         R = int(base.trails_num)
@@ -174,7 +171,6 @@ class EEGOnlyDataset(Dataset):
 
     def __getitem__(self, idx):
         s, c, o, r = self.items[idx]
-
         if r is None:
             eeg = np.asarray(
                 self.base.eeg_data[s, c, o, :], dtype=np.float32
@@ -196,7 +192,7 @@ class EEGOnlyDataset(Dataset):
 
 
 # =============================================================================
-# Fixed TRAIN-only category text geometry
+# TRAIN-only category text geometry
 # =============================================================================
 def to_flat_feature(x):
     if torch.is_tensor(x):
@@ -214,18 +210,15 @@ def build_fixed_category_text_prototypes(
 
     for c in range(int(base_dataset.cls_num)):
         feats, cats, objs = [], [], []
-
         for o in source_cols:
-            dataset_name = str(base_dataset.name_list[c, o])
-            key = dataset_name[3:]
-            cat = category_from_name(dataset_name)
-
+            name = str(base_dataset.name_list[c, o])
+            key = name[3:]
+            cat = category_from_name(name)
             feat = to_flat_feature(base_dataset.clip_features[key]["text"])
             if feat.numel() != expected_dim:
                 raise RuntimeError(
                     f"{key}: expected text dim {expected_dim}, got {feat.numel()}"
                 )
-
             feats.append(F.normalize(feat, dim=0))
             cats.append(cat)
             objs.append(key)
@@ -246,35 +239,14 @@ def build_fixed_category_text_prototypes(
         raise RuntimeError(
             f"Expected [72,{expected_dim}], got {tuple(prototypes.shape)}"
         )
-
     return prototypes, categories, source_objects
 
 
-def save_prototypes(out_dir, prototypes, categories, source_objects, suffixes):
-    torch.save(
-        {
-            "prototypes": prototypes.cpu(),
-            "categories": categories,
-            "source_objects": source_objects,
-            "source_suffixes": list(suffixes),
-            "construction": (
-                "normalize each TRAIN-object text feature -> category mean -> normalize"
-            ),
-        },
-        Path(out_dir) / "fixed_category_text_prototypes.pt",
-    )
-
-
 # =============================================================================
-# Raw EEG deterministic preprocessing + STRICT train-only PCA
+# Frozen E1-r semantic student
 # =============================================================================
 def preprocess_raw_eeg(eeg: torch.Tensor) -> torch.Tensor:
-    """
-    eeg: [B,64,600]
-
-    Deterministic per-sample, per-channel standardization.
-    No trainable parameters and no statistics from holdout objects.
-    """
+    """Per-sample, per-channel z-normalization, identical to E1-r."""
     eeg = eeg.float()
     mean = eeg.mean(dim=-1, keepdim=True)
     std = eeg.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
@@ -282,49 +254,7 @@ def preprocess_raw_eeg(eeg: torch.Tensor) -> torch.Tensor:
     return eeg.reshape(eeg.shape[0], -1)
 
 
-@torch.no_grad()
-def collect_raw_matrix(dataset, batch_size, num_workers):
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    rows = []
-    for batch in loader:
-        x = preprocess_raw_eeg(batch["eeg_data"])
-        rows.append(x.cpu())
-
-    return torch.cat(rows, dim=0).numpy().astype(np.float32)
-
-
-def fit_train_only_pca(dataset, pca_dim, batch_size, num_workers, seed):
-    x = collect_raw_matrix(dataset, batch_size, num_workers)
-
-    max_dim = min(x.shape[0] - 1, x.shape[1])
-    if int(pca_dim) > max_dim:
-        raise RuntimeError(
-            f"Requested PCA={pca_dim}, but strict train data supports {max_dim}."
-        )
-
-    pca = PCA(
-        n_components=int(pca_dim),
-        whiten=False,
-        svd_solver="randomized",
-        random_state=int(seed),
-    )
-    pca.fit(x)
-    return pca, x.shape
-
-
 class RawEEGSemanticStudent(nn.Module):
-    """
-    raw EEG -> deterministic normalization -> fixed train-only PCA -> small MLP -> 72 logits
-    """
-
     def __init__(
         self,
         pca_mean,
@@ -333,12 +263,10 @@ class RawEEGSemanticStudent(nn.Module):
         num_classes=72,
     ):
         super().__init__()
-
         pca_mean = torch.as_tensor(pca_mean, dtype=torch.float32).reshape(-1)
         pca_components = torch.as_tensor(
             pca_components, dtype=torch.float32
         )
-
         self.register_buffer("pca_mean", pca_mean, persistent=True)
         self.register_buffer(
             "pca_components", pca_components, persistent=True
@@ -346,7 +274,6 @@ class RawEEGSemanticStudent(nn.Module):
 
         pca_dim = int(pca_components.shape[0])
         raw_dim = int(pca_components.shape[1])
-
         if raw_dim != 64 * 600:
             raise RuntimeError(
                 f"Expected raw EEG dimension {64*600}, got {raw_dim}"
@@ -365,23 +292,108 @@ class RawEEGSemanticStudent(nn.Module):
         return centered @ self.pca_components.t()
 
     def forward(self, eeg, temperature=0.5):
-        if temperature <= 0:
-            raise ValueError("temperature must be > 0")
-
         feat = self.encode_pca(eeg)
         logits = self.adapter(feat)
         probs = F.softmax(logits / float(temperature), dim=-1)
         return logits, probs, feat
 
 
+def load_frozen_e1_student(path, device):
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"E1-r checkpoint not found: {path}")
+
+    pack = torch.load(path, map_location="cpu")
+    if not isinstance(pack, dict) or "student" not in pack:
+        raise RuntimeError(
+            "E1-r checkpoint must contain checkpoint['student']."
+        )
+
+    state = pack["student"]
+    if "pca_mean" not in state or "pca_components" not in state:
+        raise RuntimeError(
+            "E1-r student checkpoint does not contain PCA buffers."
+        )
+
+    pca_mean = state["pca_mean"]
+    pca_components = state["pca_components"]
+
+    # Infer architecture from stored tensors instead of trusting CLI defaults.
+    if "adapter.1.weight" not in state or "adapter.3.weight" not in state:
+        raise RuntimeError("Unexpected E1-r semantic-student state layout.")
+
+    hidden_dim = int(state["adapter.1.weight"].shape[0])
+    num_classes = int(state["adapter.3.weight"].shape[0])
+
+    student = RawEEGSemanticStudent(
+        pca_mean=pca_mean,
+        pca_components=pca_components,
+        hidden_dim=hidden_dim,
+        num_classes=num_classes,
+    )
+    student.load_state_dict(state, strict=True)
+    student.to(device)
+    student.requires_grad_(False)
+    student.eval()
+
+    if any(p.requires_grad for p in student.parameters()):
+        raise RuntimeError("Failed to freeze E1-r semantic student.")
+
+    e1_args = pack.get("args", {}) or {}
+    e1_holdout = str(e1_args.get("holdout_suffix", ""))
+    print(
+        f"[E1-r] loaded {path}; step={pack.get('step', 'unknown')}; "
+        f"PCA={tuple(pca_components.shape)} hidden={hidden_dim}"
+    )
+    return student, pack, e1_holdout
+
+
 # =============================================================================
-# Oracle generator loading
+# E2 fixed-scale residual head
+# =============================================================================
+class EEGResidualHead(nn.Module):
+    def __init__(self, pca_dim=512, rank=64, out_dim=1024, dropout=0.0):
+        super().__init__()
+        layers = [
+            nn.LayerNorm(int(pca_dim)),
+            nn.Linear(int(pca_dim), int(rank)),
+            nn.GELU(),
+        ]
+        if float(dropout) > 0:
+            layers.append(nn.Dropout(float(dropout)))
+        layers.append(nn.Linear(int(rank), int(out_dim)))
+        self.net = nn.Sequential(*layers)
+
+        # Small random initialization. Do NOT zero-initialize a vector that is
+        # immediately L2-normalized: the gradient around an exact zero vector
+        # is numerically ill-conditioned. E1 is evaluated separately as an
+        # explicit frozen baseline, so E2 does not need to start identically.
+        final = self.net[-1]
+        nn.init.normal_(final.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(final.bias)
+
+    def forward(self, pca_feat):
+        x = self.net(pca_feat.float())
+        return F.normalize(x, dim=-1, eps=1e-6)
+
+
+def combine_semantic_and_residual(base_prior, residual, alpha):
+    if alpha < 0:
+        raise ValueError("residual alpha must be >= 0")
+    return F.normalize(
+        base_prior.float() + float(alpha) * residual.float(),
+        dim=-1,
+    )
+
+
+# =============================================================================
+# Oracle generator
 # =============================================================================
 def build_generator_model(args, out_dir):
     config_path = Path(args.config).expanduser().resolve()
     cfg = OmegaConf.load(config_path)
 
-    # Constructor compatibility only. The old EEG prior modules are not used.
+    # Constructor compatibility only. Old EEG prior modules are unused.
     OmegaConf.update(cfg, "semantic_prior_pca_dim", 512, merge=False)
     OmegaConf.update(cfg, "semantic_prior_residual_rank", 64, merge=False)
     OmegaConf.update(cfg, "semantic_prior_residual_scale", 0.0, merge=False)
@@ -399,41 +411,35 @@ def build_generator_model(args, out_dir):
     fmri_cfg = OmegaConf.select(
         cfg, "model.params.fmri_encoder_config", default=None
     )
-
     if stable_cfg is None:
         raise KeyError(
             f"{config_path}: missing model.params.stable_diffusion_config"
         )
 
     OmegaConf.save(cfg, Path(out_dir) / "resolved_config.yaml")
-
-    model = MVDiffusion(
+    return MVDiffusion(
         cfg,
         stable_cfg,
         fmri_encoder_config=fmri_cfg,
         logdir=str(out_dir),
         num_classes=72,
     )
-    return model
 
 
-def load_oracle_checkpoint(model, oracle_ckpt):
-    path = Path(oracle_ckpt).expanduser().resolve()
+def load_oracle_checkpoint(model, path):
+    path = Path(path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Oracle checkpoint not found: {path}")
-
-    ckpt = torch.load(path, map_location="cpu")
-    if not isinstance(ckpt, dict) or "model" not in ckpt:
+    pack = torch.load(path, map_location="cpu")
+    if not isinstance(pack, dict) or "model" not in pack:
         raise RuntimeError("Oracle checkpoint must contain checkpoint['model'].")
-
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    missing, unexpected = model.load_state_dict(pack["model"], strict=False)
     if missing:
         print(f"[oracle load warning] missing={missing}")
     if unexpected:
         print(f"[oracle load warning] unexpected={unexpected}")
-
-    print(f"[oracle] loaded {path}; step={ckpt.get('step', 'unknown')}")
-    return ckpt
+    print(f"[oracle] loaded {path}; step={pack.get('step', 'unknown')}")
+    return pack
 
 
 def freeze_generator(model):
@@ -444,24 +450,26 @@ def freeze_generator(model):
     model.unet.eval()
     model.pipeline.vae.eval()
     model.pipeline.text_encoder.eval()
-
     if any(p.requires_grad for p in model.parameters()):
-        raise RuntimeError("Generator freeze failed: trainable parameter remains.")
-
+        raise RuntimeError("Generator freeze failed.")
     print("[generator] fully frozen")
 
 
 # =============================================================================
-# Conditioning and diffusion helpers
+# Conditioning / diffusion
 # =============================================================================
+def semantic_prior_from_probs(probs, prototypes):
+    return F.normalize(probs @ prototypes.float(), dim=-1)
+
+
 def build_oracle_condition(model, labels, unconditional=False):
     B = labels.shape[0]
-    unet_dtype = next(model.pipeline.unet.parameters()).dtype
+    dtype = next(model.pipeline.unet.parameters()).dtype
     empty_prompt = model.get_empty_text_embeds(B)
 
     if unconditional:
         spatial = torch.zeros(
-            B, 4, 64, 64, device=labels.device, dtype=unet_dtype
+            B, 4, 64, 64, device=labels.device, dtype=dtype
         )
         return empty_prompt, spatial
 
@@ -471,40 +479,32 @@ def build_oracle_condition(model, labels, unconditional=False):
         )
         semantic_cond = model.semantic_to_cross(prior).unsqueeze(1)
 
-    semantic_cond = semantic_cond.to(unet_dtype)
+    semantic_cond = semantic_cond.to(dtype)
     ramp = semantic_cond.new_tensor(
         model.pipeline.config.ramping_coefficients
     ).view(1, -1, 1)
-
     prompt = empty_prompt + semantic_cond * ramp
     spatial = torch.zeros(
-        B, 4, 64, 64, device=labels.device, dtype=unet_dtype
+        B, 4, 64, 64, device=labels.device, dtype=dtype
     )
     return prompt, spatial
 
 
-def build_student_condition(model, semantic_prior):
-    """
-    Frozen semantic_to_cross and frozen UNet still permit gradients to flow
-    back to semantic_prior / EEG student inputs.
-    """
-    B = semantic_prior.shape[0]
-    unet_dtype = next(model.pipeline.unet.parameters()).dtype
+def build_condition_from_prior(model, prior):
+    B = prior.shape[0]
+    dtype = next(model.pipeline.unet.parameters()).dtype
     empty_prompt = model.get_empty_text_embeds(B)
 
     with torch.autocast("cuda", enabled=False):
-        semantic_cond = model.semantic_to_cross(
-            semantic_prior.float()
-        ).unsqueeze(1)
+        semantic_cond = model.semantic_to_cross(prior.float()).unsqueeze(1)
 
-    semantic_cond = semantic_cond.to(unet_dtype)
+    semantic_cond = semantic_cond.to(dtype)
     ramp = semantic_cond.new_tensor(
         model.pipeline.config.ramping_coefficients
     ).view(1, -1, 1)
-
     prompt = empty_prompt + semantic_cond * ramp
     spatial = torch.zeros(
-        B, 4, 64, 64, device=semantic_prior.device, dtype=unet_dtype
+        B, 4, 64, 64, device=prior.device, dtype=dtype
     )
     return prompt, spatial
 
@@ -514,12 +514,8 @@ def prepare_noisy_latents(model, batch, device):
     labels = batch["cls_index"].to(
         device, dtype=torch.long, non_blocking=True
     )
-
     B = labels.shape[0]
-    t = torch.randint(
-        0, model.num_timesteps, (B,), device=device
-    ).long()
-
+    t = torch.randint(0, model.num_timesteps, (B,), device=device).long()
     latents = model.encode_target_images(target_imgs)
     noise = torch.randn_like(latents)
     noisy = model.train_scheduler.add_noise(latents, noise, t)
@@ -537,99 +533,13 @@ def gt_diffusion_loss(model, pred, target):
 
 
 # =============================================================================
-# Soft semantic target
+# Validation: E1 baseline vs E2 residual on identical noise/timestep
 # =============================================================================
-def build_soft_semantic_table(prototypes, temperature):
-    if temperature <= 0:
-        raise ValueError("teacher semantic temperature must be > 0")
-
-    p = F.normalize(prototypes.float(), dim=-1)
-    sim = p @ p.t()
-    return F.softmax(sim / float(temperature), dim=-1)
-
-
-def soft_semantic_kl(logits, labels, q_table, student_temperature):
-    target_q = q_table[labels]
-    log_p = F.log_softmax(
-        logits / float(student_temperature), dim=-1
-    )
-    return F.kl_div(log_p, target_q, reduction="batchmean")
-
-
-def semantic_prior_from_probs(probs, fixed_prototypes):
-    return F.normalize(
-        probs @ fixed_prototypes.float(), dim=-1
-    )
-
-
-# =============================================================================
-# Validation
-# =============================================================================
-@torch.no_grad()
-def evaluate_semantic(student, dataset, q_table, args, device):
-    loader = DataLoader(
-        dataset,
-        batch_size=max(1, args.semantic_eval_batch_size),
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    was_training = student.training
-    student.eval()
-
-    total = 0
-    top1_sum = 0
-    kl_sum = 0.0
-    entropy_sum = 0.0
-
-    for batch in loader:
-        eeg = batch["eeg_data"].to(
-            device, dtype=torch.float32, non_blocking=True
-        )
-        labels = batch["cls_index"].to(
-            device, dtype=torch.long, non_blocking=True
-        )
-
-        logits, probs, _ = student(
-            eeg, temperature=args.student_temperature
-        )
-        kl = soft_semantic_kl(
-            logits,
-            labels,
-            q_table,
-            args.student_temperature,
-        )
-
-        n = labels.shape[0]
-        total += n
-        top1_sum += int(
-            (logits.argmax(dim=-1) == labels).sum().item()
-        )
-        kl_sum += float(kl) * n
-
-        entropy = -(
-            probs.clamp_min(1e-8)
-            * probs.clamp_min(1e-8).log()
-        ).sum(dim=-1)
-        entropy_sum += float(entropy.sum())
-
-    if was_training:
-        student.train()
-
-    total = max(1, total)
-    return {
-        "top1": top1_sum / total,
-        "soft_kl": kl_sum / total,
-        "entropy": entropy_sum / total,
-    }
-
-
 @torch.no_grad()
 def evaluate_generation_effect(
     model,
-    student,
+    semantic_student,
+    residual_head,
     val_subset,
     args,
     device,
@@ -643,13 +553,15 @@ def evaluate_generation_effect(
         drop_last=False,
     )
 
-    was_training = student.training
-    student.eval()
+    semantic_student.eval()
+    residual_head.eval()
 
-    distill_values = []
-    student_gt_values = []
-    oracle_gt_values = []
-    uncond_gt_values = []
+    e1_distills = []
+    e2_distills = []
+    e1_gt = []
+    e2_gt = []
+    oracle_gt = []
+    uncond_gt = []
 
     with torch.random.fork_rng(
         devices=[0] if device.type == "cuda" else []
@@ -669,14 +581,23 @@ def evaluate_generation_effect(
                 model, batch, device
             )
 
-            logits, probs, _ = student(
+            _, probs, feat = semantic_student(
                 eeg, temperature=args.student_temperature
             )
-            prior = semantic_prior_from_probs(
+            base_prior = semantic_prior_from_probs(
                 probs, model.fixed_text_prototypes
             )
+            residual = residual_head(feat)
+            e2_prior = combine_semantic_and_residual(
+                base_prior, residual, args.residual_alpha
+            )
 
-            s_prompt, s_spatial = build_student_condition(model, prior)
+            e1_prompt, e1_spatial = build_condition_from_prior(
+                model, base_prior
+            )
+            e2_prompt, e2_spatial = build_condition_from_prior(
+                model, e2_prior
+            )
             o_prompt, o_spatial = build_oracle_condition(
                 model, labels, unconditional=False
             )
@@ -684,65 +605,61 @@ def evaluate_generation_effect(
                 model, labels, unconditional=True
             )
 
-            v_student = forward_unet(
-                model, noisy, t, s_prompt, s_spatial
-            )
-            v_oracle = forward_unet(
-                model, noisy, t, o_prompt, o_spatial
-            )
-            v_uncond = forward_unet(
-                model, noisy, t, u_prompt, u_spatial
-            )
+            v_e1 = forward_unet(model, noisy, t, e1_prompt, e1_spatial)
+            v_e2 = forward_unet(model, noisy, t, e2_prompt, e2_spatial)
+            v_oracle = forward_unet(model, noisy, t, o_prompt, o_spatial)
+            v_uncond = forward_unet(model, noisy, t, u_prompt, u_spatial)
 
-            distill_values.append(
-                float(
-                    F.mse_loss(
-                        v_student.float(), v_oracle.float()
-                    )
-                )
+            e1_distills.append(
+                float(F.mse_loss(v_e1.float(), v_oracle.float()))
             )
-            student_gt_values.append(
-                float(gt_diffusion_loss(model, v_student, v_target))
+            e2_distills.append(
+                float(F.mse_loss(v_e2.float(), v_oracle.float()))
             )
-            oracle_gt_values.append(
+            e1_gt.append(float(gt_diffusion_loss(model, v_e1, v_target)))
+            e2_gt.append(float(gt_diffusion_loss(model, v_e2, v_target)))
+            oracle_gt.append(
                 float(gt_diffusion_loss(model, v_oracle, v_target))
             )
-            uncond_gt_values.append(
+            uncond_gt.append(
                 float(gt_diffusion_loss(model, v_uncond, v_target))
             )
 
-    if was_training:
-        student.train()
-
-    if not distill_values:
+    if not e2_gt:
         raise RuntimeError("No validation diffusion batches evaluated.")
 
-    student_diff = float(np.mean(student_gt_values))
-    oracle_diff = float(np.mean(oracle_gt_values))
-    uncond_diff = float(np.mean(uncond_gt_values))
+    e1_diff = float(np.mean(e1_gt))
+    e2_diff = float(np.mean(e2_gt))
+    oracle_diff = float(np.mean(oracle_gt))
+    uncond_diff = float(np.mean(uncond_gt))
 
-    student_gain = uncond_diff - student_diff
+    e1_gain = uncond_diff - e1_diff
+    e2_gain = uncond_diff - e2_diff
     oracle_gain = uncond_diff - oracle_diff
 
-    if oracle_gain > 1e-8:
-        recovery = student_gain / oracle_gain
-    else:
-        recovery = float("nan")
+    e1_recovery = e1_gain / oracle_gain if oracle_gain > 1e-8 else float("nan")
+    e2_recovery = e2_gain / oracle_gain if oracle_gain > 1e-8 else float("nan")
 
     return {
-        "distill": float(np.mean(distill_values)),
-        "student_diff": student_diff,
+        "e1_distill": float(np.mean(e1_distills)),
+        "e2_distill": float(np.mean(e2_distills)),
+        "e1_diff": e1_diff,
+        "e2_diff": e2_diff,
         "oracle_diff": oracle_diff,
         "uncond_diff": uncond_diff,
-        "student_gain": student_gain,
+        "e1_gain": e1_gain,
+        "e2_gain": e2_gain,
         "oracle_gain": oracle_gain,
-        "oracle_gain_recovery": recovery,
-        "n_batches": len(distill_values),
+        "e1_recovery": e1_recovery,
+        "e2_recovery": e2_recovery,
+        "e2_gain_delta": e2_gain - e1_gain,
+        "e2_recovery_delta": e2_recovery - e1_recovery,
+        "n_batches": len(e2_gt),
     }
 
 
 # =============================================================================
-# Logging/checkpoint
+# Logging / checkpoint
 # =============================================================================
 def append_csv(path, row):
     path = Path(path)
@@ -754,9 +671,9 @@ def append_csv(path, row):
         writer.writerow(row)
 
 
-def save_student_checkpoint(
+def save_e2_checkpoint(
     path,
-    student,
+    residual_head,
     optimizer,
     scheduler,
     step,
@@ -765,11 +682,12 @@ def save_student_checkpoint(
 ):
     torch.save(
         {
-            "student": student.state_dict(),
+            "residual_head": residual_head.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "step": int(step),
             "args": vars(args),
+            "e1_ckpt": str(Path(args.e1_ckpt).expanduser().resolve()),
             "oracle_ckpt": str(
                 Path(args.oracle_ckpt).expanduser().resolve()
             ),
@@ -780,9 +698,7 @@ def save_student_checkpoint(
 
 
 def build_scheduler(optimizer, total_steps, warmup_steps):
-    warmup_steps = min(
-        int(warmup_steps), max(0, int(total_steps) - 1)
-    )
+    warmup_steps = min(int(warmup_steps), max(0, int(total_steps) - 1))
 
     def fn(step):
         if warmup_steps > 0 and step < warmup_steps:
@@ -805,11 +721,10 @@ def cycle_loader(loader):
 def parse_args():
     p = argparse.ArgumentParser(
         description=(
-            "Raw EEG -> strict train-only PCA -> soft semantic adapter -> "
-            "frozen Oracle generator distillation."
+            "E2: freeze E1-r semantic student and learn only a fixed-scale "
+            "continuous EEG residual against the frozen Oracle generator."
         )
     )
-
     p.add_argument("--config", default="./configs/mind3d_pp.yaml")
     p.add_argument("--data_path", default="/data/jionkim/neuro_3D/")
     p.add_argument(
@@ -819,34 +734,27 @@ def parse_args():
     p.add_argument("--sub_id", default="sub01")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--oracle_ckpt", required=True)
+    p.add_argument("--e1_ckpt", required=True)
 
     p.add_argument(
         "--holdout_suffix",
         default="06",
         choices=[f"{i:02d}" for i in range(7)],
     )
-
-    p.add_argument("--pca_dim", type=int, default=512)
-    p.add_argument("--student_hidden_dim", type=int, default=256)
-    p.add_argument("--pca_batch_size", type=int, default=64)
-    p.add_argument("--semantic_eval_batch_size", type=int, default=64)
-
-    p.add_argument(
-        "--teacher_semantic_temperature", type=float, default=0.10
-    )
     p.add_argument("--student_temperature", type=float, default=0.50)
 
-    p.add_argument("--lambda_distill", type=float, default=1.0)
-    p.add_argument("--lambda_soft_sem", type=float, default=0.10)
+    p.add_argument("--residual_rank", type=int, default=64)
+    p.add_argument("--residual_alpha", type=float, default=0.03)
+    p.add_argument("--residual_dropout", type=float, default=0.0)
 
-    p.add_argument("--max_steps", type=int, default=5000)
+    p.add_argument("--max_steps", type=int, default=2000)
     p.add_argument("--batchsize", type=int, default=1)
     p.add_argument("--accumulation_steps", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=4)
 
-    p.add_argument("--student_lr", type=float, default=2e-4)
+    p.add_argument("--residual_lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-3)
-    p.add_argument("--warmup_steps", type=int, default=200)
+    p.add_argument("--warmup_steps", type=int, default=100)
     p.add_argument("--grad_clip", type=float, default=1.0)
 
     p.add_argument("--print_every", type=int, default=20)
@@ -854,12 +762,6 @@ def parse_args():
     p.add_argument("--val_diff_batches", type=int, default=32)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--soft_sem_decay_steps",
-        type=int,
-        default=1000,
-    )
-
     return p.parse_args()
 
 
@@ -870,18 +772,16 @@ def main():
     args = parse_args()
     seed_everything(args.seed)
 
-    if args.pca_dim <= 0:
-        raise ValueError("--pca_dim must be > 0")
-    if args.student_temperature <= 0:
-        raise ValueError("--student_temperature must be > 0")
-    if args.teacher_semantic_temperature <= 0:
-        raise ValueError("--teacher_semantic_temperature must be > 0")
     if args.accumulation_steps <= 0:
         raise ValueError("--accumulation_steps must be > 0")
+    if args.residual_rank <= 0:
+        raise ValueError("--residual_rank must be > 0")
+    if not (0.0 < args.residual_alpha <= 0.25):
+        raise ValueError("Use --residual_alpha in (0,0.25].")
+    if args.student_temperature <= 0:
+        raise ValueError("--student_temperature must be > 0")
 
-    device = torch.device(
-        "cuda:0" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(
         f"[device] {device}; CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
     )
@@ -891,7 +791,6 @@ def main():
         s for s in universe if s != args.holdout_suffix
     )
     val_suffixes = (args.holdout_suffix,)
-
     print(
         f"[strict] train={train_suffixes}; holdout={val_suffixes}; "
         "object07=NOT_USED; final08_09=NOT_USED"
@@ -901,14 +800,11 @@ def main():
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "logs").mkdir(parents=True, exist_ok=True)
-
     (out_dir / "args.json").write_text(
         json.dumps(vars(args), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    # Only train=True dataset is instantiated; explicit subsets exclude object07.
-    # final08/09 are never instantiated.
     base = AllDataFeatureTwoEEG(
         data_path=args.data_path,
         sub_list=[args.sub_id],
@@ -920,97 +816,74 @@ def main():
         strict_rendered_views=True,
     )
 
-    train_full_subset = Subset(
+    train_subset = Subset(
         base, full_dataset_indices(base, train_suffixes)
     )
-    val_full_subset = Subset(
+    val_subset = Subset(
         base, full_dataset_indices(base, val_suffixes)
     )
-
-    train_eeg_ind = EEGOnlyDataset(
-        base, train_suffixes, mode="individual"
-    )
-    val_eeg_ind = EEGOnlyDataset(base, val_suffixes, mode="individual")
-    val_eeg_avg = EEGOnlyDataset(base, val_suffixes, mode="averaged")
-
     print(
-        f"[samples] generation_train={len(train_full_subset)} "
-        f"generation_val={len(val_full_subset)} "
-        f"PCA_train={len(train_eeg_ind)} "
-        f"val_ind={len(val_eeg_ind)} val_avg={len(val_eeg_avg)}"
+        f"[samples] generation_train={len(train_subset)} "
+        f"generation_val={len(val_subset)}"
     )
 
-    # -------------------------------------------------------------------------
-    # Strict train-only semantic geometry.
-    # -------------------------------------------------------------------------
+    # Strict TRAIN-only category geometry.
     prototypes, categories, source_objects = (
         build_fixed_category_text_prototypes(base, train_suffixes)
     )
-    save_prototypes(
-        out_dir,
-        prototypes,
-        categories,
-        source_objects,
-        train_suffixes,
+    torch.save(
+        {
+            "prototypes": prototypes.cpu(),
+            "categories": categories,
+            "source_objects": source_objects,
+            "source_suffixes": list(train_suffixes),
+        },
+        out_dir / "fixed_category_text_prototypes.pt",
     )
 
-    # -------------------------------------------------------------------------
-    # Load ONLY the new Oracle generator as learned teacher.
-    # -------------------------------------------------------------------------
+    # Frozen Oracle generator.
     model = build_generator_model(args, out_dir).to(device)
     oracle_pack = load_oracle_checkpoint(model, args.oracle_ckpt)
-
-    # Reinstall current strict train-only category geometry explicitly.
     model.set_fixed_prototypes(prototypes.to(device))
     freeze_generator(model)
 
-    # -------------------------------------------------------------------------
-    # Raw EEG -> deterministic preprocessing -> strict train-only PCA.
-    # -------------------------------------------------------------------------
-    pca, pca_train_shape = fit_train_only_pca(
-        dataset=train_eeg_ind,
-        pca_dim=args.pca_dim,
-        batch_size=args.pca_batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
+    # Frozen E1-r semantic student, including its exact train-only PCA buffers.
+    semantic_student, e1_pack, e1_holdout = load_frozen_e1_student(
+        args.e1_ckpt, device
     )
+    if e1_holdout and e1_holdout != str(args.holdout_suffix):
+        raise RuntimeError(
+            f"E1-r holdout={e1_holdout} but E2 requested holdout={args.holdout_suffix}."
+        )
 
-    pca_path = out_dir / "raw_eeg_pca_train_only.npz"
-    np.savez_compressed(
-        pca_path,
-        mean=pca.mean_.astype(np.float32),
-        components=pca.components_.astype(np.float32),
-        explained_variance_ratio=pca.explained_variance_ratio_.astype(
-            np.float32
-        ),
-        train_suffixes=np.asarray(train_suffixes),
-        preprocessing=np.asarray(
-            "per-sample per-channel z-normalize -> flatten"
-        ),
-    )
+    e1_oracle = str(e1_pack.get("oracle_ckpt", ""))
+    if e1_oracle:
+        e1_oracle_resolved = str(Path(e1_oracle).expanduser().resolve())
+        requested_oracle = str(Path(args.oracle_ckpt).expanduser().resolve())
+        if e1_oracle_resolved != requested_oracle:
+            raise RuntimeError(
+                "E1-r and E2 must use the same Oracle generator.\n"
+                f"E1-r oracle: {e1_oracle_resolved}\n"
+                f"E2 oracle   : {requested_oracle}"
+            )
 
-    print(
-        f"[PCA] train={pca_train_shape} -> {pca.n_components_}; "
-        f"explained_var={pca.explained_variance_ratio_.sum():.4f}"
-    )
-
-    student = RawEEGSemanticStudent(
-        pca_mean=pca.mean_,
-        pca_components=pca.components_,
-        hidden_dim=args.student_hidden_dim,
-        num_classes=72,
+    pca_dim = int(semantic_student.pca_components.shape[0])
+    residual_head = EEGResidualHead(
+        pca_dim=pca_dim,
+        rank=args.residual_rank,
+        out_dim=1024,
+        dropout=args.residual_dropout,
     ).to(device)
 
-    trainable = sum(p.numel() for p in student.parameters())
-    print(f"[student] trainable={trainable/1e6:.4f}M")
-
-    q_table = build_soft_semantic_table(
-        prototypes.to(device), args.teacher_semantic_temperature
-    ).detach()
+    n_res = sum(p.numel() for p in residual_head.parameters())
+    print(
+        f"[E2 residual] trainable={n_res/1e6:.4f}M "
+        f"alpha={args.residual_alpha:.4f} rank={args.residual_rank}"
+    )
 
     optimizer = torch.optim.AdamW(
-        student.parameters(),
-        lr=args.student_lr,
+        residual_head.parameters(),
+        lr=args.residual_lr,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
     )
@@ -1019,7 +892,7 @@ def main():
     )
 
     train_loader = DataLoader(
-        train_full_subset,
+        train_subset,
         batch_size=args.batchsize,
         shuffle=True,
         num_workers=args.num_workers,
@@ -1032,6 +905,25 @@ def main():
     writer = SummaryWriter(str(out_dir / "logs"))
     log_path = out_dir / "train_log.csv"
 
+    # Baseline validation BEFORE any E2 update. E1 is evaluated explicitly,
+    # so we can measure E2 gain delta even though the residual head has a small
+    # non-zero initialization for numerical stability.
+    baseline = evaluate_generation_effect(
+        model,
+        semantic_student,
+        residual_head,
+        val_subset,
+        args,
+        device,
+    )
+    print(
+        "[BASELINE] "
+        f"E1Gain={baseline['e1_gain']:+.5f} "
+        f"E1Recovery={baseline['e1_recovery']:+.3f} | "
+        f"E2Gain={baseline['e2_gain']:+.5f} "
+        f"Delta={baseline['e2_gain_delta']:+.5f}"
+    )
+
     optimizer.zero_grad(set_to_none=True)
     step = 0
     micro = 0
@@ -1040,73 +932,53 @@ def main():
 
     while step < args.max_steps:
         batch = next(train_iter)
-
         eeg = batch["eeg_data"].to(
             device, dtype=torch.float32, non_blocking=True
         )
         labels, t, noisy, _ = prepare_noisy_latents(model, batch, device)
 
-        # -------------------------------------------------------------
-        # Frozen Oracle teacher. Same noisy latent / timestep.
-        # -------------------------------------------------------------
+        # Frozen Oracle teacher.
         with torch.no_grad():
-            oracle_prompt, oracle_spatial = build_oracle_condition(
+            o_prompt, o_spatial = build_oracle_condition(
                 model, labels, unconditional=False
             )
             v_teacher = forward_unet(
-                model, noisy, t, oracle_prompt, oracle_spatial
+                model, noisy, t, o_prompt, o_spatial
             ).detach()
 
-        # -------------------------------------------------------------
-        # EEG student. Generator is frozen, but gradient flows through
-        # frozen semantic_to_cross + UNet to the student condition.
-        # -------------------------------------------------------------
-        logits, probs, _ = student(
-            eeg, temperature=args.student_temperature
-        )
-        prior = semantic_prior_from_probs(
-            probs, model.fixed_text_prototypes
-        )
-        student_prompt, student_spatial = build_student_condition(
-            model, prior
-        )
+            # Frozen E1-r semantic student and PCA feature.
+            _, probs, feat = semantic_student(
+                eeg, temperature=args.student_temperature
+            )
+            base_prior = semantic_prior_from_probs(
+                probs, model.fixed_text_prototypes
+            )
+            feat = feat.detach()
+            base_prior = base_prior.detach()
 
-        # Keep generator weights frozen while preserving input gradients.
+        # ONLY residual_head is trainable.
+        residual = residual_head(feat)
+        e2_prior = combine_semantic_and_residual(
+            base_prior, residual, args.residual_alpha
+        )
+        e2_prompt, e2_spatial = build_condition_from_prior(model, e2_prior)
+
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")
         ):
-            v_student = forward_unet(
-                model, noisy, t, student_prompt, student_spatial
+            v_e2 = forward_unet(
+                model, noisy, t, e2_prompt, e2_spatial
             )
 
-        loss_distill = F.mse_loss(
-            v_student.float(), v_teacher.float()
-        )
-        loss_soft = soft_semantic_kl(
-            logits,
-            labels,
-            q_table,
-            args.student_temperature,
-        )
-
-        soft_weight = args.lambda_soft_sem * max(
-            0.0,
-            1.0 - step / args.soft_sem_decay_steps,
-        )
-
-        total = (
-                args.lambda_distill * loss_distill
-                + soft_weight * loss_soft
-        )
-
-        (total / args.accumulation_steps).backward()
+        loss = F.mse_loss(v_e2.float(), v_teacher.float())
+        (loss / args.accumulation_steps).backward()
         micro += 1
 
         if micro % args.accumulation_steps != 0:
             continue
 
         if args.grad_clip > 0:
-            clip_grad_norm_(student.parameters(), args.grad_clip)
+            clip_grad_norm_(residual_head.parameters(), args.grad_clip)
 
         optimizer.step()
         scheduler.step()
@@ -1114,90 +986,60 @@ def main():
         step += 1
 
         if step == 1 or step % args.print_every == 0:
-            batch_top1 = float(
-                (logits.argmax(dim=-1) == labels).float().mean()
-            )
-            entropy = float(
-                -(
-                    probs.clamp_min(1e-8)
-                    * probs.clamp_min(1e-8).log()
-                ).sum(dim=-1).mean()
-            )
-
+            with torch.no_grad():
+                residual_cos = float(
+                    F.cosine_similarity(
+                        base_prior.float(), residual.float(), dim=-1
+                    ).mean()
+                )
             print(
                 f"[TRAIN] step={step:06d} "
-                f"L={total.item():.6f} "
-                f"Distill={loss_distill.item():.6f} "
-                f"SoftKL={loss_soft.item():.4f} "
-                f"Top1={batch_top1:.3f} H={entropy:.3f}"
+                f"Distill={loss.item():.6f} "
+                f"ResidualCos={residual_cos:+.4f}"
             )
+            writer.add_scalar("train/distill", loss.item(), step)
+            writer.add_scalar("train/residual_cos", residual_cos, step)
 
-            writer.add_scalar("train/total", total.item(), step)
-            writer.add_scalar("train/distill", loss_distill.item(), step)
-            writer.add_scalar("train/soft_kl", loss_soft.item(), step)
-
-        # ---------------------------------------------------------------------
-        # Strict holdout validation.
-        # ---------------------------------------------------------------------
         if step % args.validate_every == 0 or step == args.max_steps:
-            sem_ind = evaluate_semantic(
-                student, val_eeg_ind, q_table, args, device
-            )
-            sem_avg = evaluate_semantic(
-                student, val_eeg_avg, q_table, args, device
-            )
-            gen = evaluate_generation_effect(
-                model, student, val_full_subset, args, device
+            val = evaluate_generation_effect(
+                model,
+                semantic_student,
+                residual_head,
+                val_subset,
+                args,
+                device,
             )
 
             print(
                 f"[VAL] step={step:06d} "
-                f"Distill={gen['distill']:.6f} "
-                f"StudentDiff={gen['student_diff']:.5f} "
-                f"OracleDiff={gen['oracle_diff']:.5f} "
-                f"UncondDiff={gen['uncond_diff']:.5f} "
-                f"StudentGain={gen['student_gain']:+.5f} "
-                f"OracleGain={gen['oracle_gain']:+.5f} "
-                f"Recovery={gen['oracle_gain_recovery']:+.3f} | "
-                f"IndTop1={sem_ind['top1']:.4f} "
-                f"AvgTop1={sem_avg['top1']:.4f} "
-                f"AvgKL={sem_avg['soft_kl']:.4f} "
-                f"AvgH={sem_avg['entropy']:.3f}"
+                f"E1Diff={val['e1_diff']:.5f} "
+                f"E2Diff={val['e2_diff']:.5f} "
+                f"OracleDiff={val['oracle_diff']:.5f} "
+                f"UncondDiff={val['uncond_diff']:.5f} | "
+                f"E1Gain={val['e1_gain']:+.5f} "
+                f"E2Gain={val['e2_gain']:+.5f} "
+                f"Delta={val['e2_gain_delta']:+.5f} | "
+                f"E1Recovery={val['e1_recovery']:+.3f} "
+                f"E2Recovery={val['e2_recovery']:+.3f} "
+                f"DeltaRec={val['e2_recovery_delta']:+.3f} | "
+                f"E2Distill={val['e2_distill']:.6f}"
             )
 
-            row = {
-                "step": step,
-                "val_distill": gen["distill"],
-                "val_student_diff": gen["student_diff"],
-                "val_oracle_diff": gen["oracle_diff"],
-                "val_uncond_diff": gen["uncond_diff"],
-                "val_student_gain": gen["student_gain"],
-                "val_oracle_gain": gen["oracle_gain"],
-                "val_oracle_gain_recovery": gen[
-                    "oracle_gain_recovery"
-                ],
-                "val_ind_top1": sem_ind["top1"],
-                "val_ind_soft_kl": sem_ind["soft_kl"],
-                "val_ind_entropy": sem_ind["entropy"],
-                "val_avg_top1": sem_avg["top1"],
-                "val_avg_soft_kl": sem_avg["soft_kl"],
-                "val_avg_entropy": sem_avg["entropy"],
-            }
+            row = {"step": step, **val}
             append_csv(log_path, row)
-
             for k, v in row.items():
-                if k == "step" or not np.isfinite(v):
+                if k == "step" or not isinstance(v, (int, float)):
                     continue
-                writer.add_scalar(f"val/{k}", float(v), step)
+                if np.isfinite(v):
+                    writer.add_scalar(f"val/{k}", float(v), step)
 
-            # Generation utility is primary.
-            # 1) larger StudentGain over unconditional
-            # 2) closer to Oracle teacher
-            # 3) smaller averaged soft-semantic KL
+            # Primary: E2's ADDED utility over the frozen E1-r baseline.
+            # Secondary: absolute E2 utility over unconditional.
+            # Tertiary: closer Oracle-effect match.
             key = (
-                float(gen["student_gain"]),
-                -float(gen["distill"]),
-                -float(sem_avg["soft_kl"]),
+                float(val["e2_gain_delta"]),
+                float(val["e2_gain"]),
+                -float(val["e2_distill"]),
             )
 
             extra = {
@@ -1206,19 +1048,15 @@ def main():
                 "object07": "NOT_USED",
                 "final08_09": "NOT_USED",
                 "oracle_step": oracle_pack.get("step", None),
-                "pca_path": str(pca_path),
-                "pca_explained_variance_ratio_sum": float(
-                    pca.explained_variance_ratio_.sum()
-                ),
-                "raw_eeg_preprocessing": (
-                    "per-sample per-channel z-normalize -> flatten -> train-only PCA"
-                ),
+                "e1_step": e1_pack.get("step", None),
+                "residual_alpha": float(args.residual_alpha),
+                "residual_rank": int(args.residual_rank),
                 "val": row,
             }
 
-            save_student_checkpoint(
+            save_e2_checkpoint(
                 ckpt_dir / "last.pt",
-                student,
+                residual_head,
                 optimizer,
                 scheduler,
                 step,
@@ -1229,9 +1067,9 @@ def main():
             if best_key is None or key > best_key:
                 best_key = key
                 best_step = step
-                save_student_checkpoint(
+                save_e2_checkpoint(
                     ckpt_dir / "best.pt",
-                    student,
+                    residual_head,
                     optimizer,
                     scheduler,
                     step,
@@ -1240,14 +1078,15 @@ def main():
                 )
                 print(
                     f"[BEST] step={step} "
-                    f"StudentGain={gen['student_gain']:+.5f} "
-                    f"Distill={gen['distill']:.6f}"
+                    f"E2Gain={val['e2_gain']:+.5f} "
+                    f"GainDelta={val['e2_gain_delta']:+.5f} "
+                    f"Recovery={val['e2_recovery']:+.3f}"
                 )
 
         if step % args.save_every == 0:
-            save_student_checkpoint(
+            save_e2_checkpoint(
                 ckpt_dir / f"step_{step:06d}.pt",
-                student,
+                residual_head,
                 optimizer,
                 scheduler,
                 step,
@@ -1255,7 +1094,6 @@ def main():
                 {
                     "strict_train_suffixes": train_suffixes,
                     "strict_holdout_suffix": args.holdout_suffix,
-                    "pca_path": str(pca_path),
                 },
             )
 
@@ -1270,25 +1108,21 @@ def main():
         "oracle_checkpoint": str(
             Path(args.oracle_ckpt).expanduser().resolve()
         ),
+        "e1_checkpoint": str(Path(args.e1_ckpt).expanduser().resolve()),
         "deprecated_eeg_checkpoint_used": False,
-        "raw_eeg_preprocessing": (
-            "per-sample per-channel z-normalize -> flatten -> strict train-only PCA"
-        ),
-        "pca_dim": int(pca.n_components_),
-        "pca_explained_variance_ratio_sum": float(
-            pca.explained_variance_ratio_.sum()
-        ),
-        "best_student_checkpoint": str(ckpt_dir / "best.pt"),
+        "semantic_student_frozen": True,
+        "generator_frozen": True,
+        "trainable_component": "residual_head_only",
+        "residual_alpha": float(args.residual_alpha),
+        "residual_rank": int(args.residual_rank),
+        "best_checkpoint": str(ckpt_dir / "best.pt"),
     }
-
     (out_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-
     print(
-        f"[done] best_step={best_step}; "
-        f"best={ckpt_dir / 'best.pt'}"
+        f"[done] best_step={best_step}; best={ckpt_dir / 'best.pt'}"
     )
 
 
