@@ -243,10 +243,10 @@ def build_fixed_category_text_prototypes(
 
 
 # =============================================================================
-# Frozen E1-r semantic student
+# Frozen E1 semantic student (PCA E1-r OR temporal E1-T)
 # =============================================================================
 def preprocess_raw_eeg(eeg: torch.Tensor) -> torch.Tensor:
-    """Per-sample, per-channel z-normalization, identical to E1-r."""
+    """Per-sample, per-channel z-normalization, identical to PCA E1-r."""
     eeg = eeg.float()
     mean = eeg.mean(dim=-1, keepdim=True)
     std = eeg.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
@@ -254,7 +254,18 @@ def preprocess_raw_eeg(eeg: torch.Tensor) -> torch.Tensor:
     return eeg.reshape(eeg.shape[0], -1)
 
 
+def normalize_eeg_channels(eeg: torch.Tensor) -> torch.Tensor:
+    """EEG [B,64,600] -> deterministic per-sample/per-channel z-normalization."""
+    eeg = eeg.float()
+    if eeg.ndim != 3 or eeg.shape[1:] != (64, 600):
+        raise RuntimeError(f"Expected EEG [B,64,600], got {tuple(eeg.shape)}")
+    mean = eeg.mean(dim=-1, keepdim=True)
+    std = eeg.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
+    return (eeg - mean) / std
+
+
 class RawEEGSemanticStudent(nn.Module):
+    """Legacy PCA-based E1-r student."""
     def __init__(
         self,
         pca_mean,
@@ -298,36 +309,105 @@ class RawEEGSemanticStudent(nn.Module):
         return logits, probs, feat
 
 
+class TemporalEEGSemanticStudent(nn.Module):
+    """Low-capacity temporal E1-T student used by the revised E1."""
+    def __init__(self, feature_dim=512, hidden_dim=256, num_classes=72):
+        super().__init__()
+        if int(feature_dim) != 512:
+            raise ValueError(
+                "temporal_dwconv_v1 currently expects feature_dim=512"
+            )
+
+        self.temporal = nn.Sequential(
+            nn.Conv1d(
+                64, 64, kernel_size=15, stride=2, padding=7,
+                groups=64, bias=False,
+            ),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.Conv1d(64, 128, kernel_size=1, bias=False),
+            nn.GroupNorm(16, 128),
+            nn.GELU(),
+            nn.Conv1d(
+                128, 128, kernel_size=9, stride=2, padding=4,
+                groups=128, bias=False,
+            ),
+            nn.GroupNorm(16, 128),
+            nn.GELU(),
+            nn.Conv1d(128, 256, kernel_size=1, bias=False),
+            nn.GroupNorm(32, 256),
+            nn.GELU(),
+        )
+
+        self.feature_proj = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, 512),
+            nn.GELU(),
+        )
+        self.adapter = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), int(num_classes)),
+        )
+
+    def encode_temporal(self, eeg):
+        x = normalize_eeg_channels(eeg)
+        x = self.temporal(x)
+        mean = x.mean(dim=-1)
+        std = x.std(dim=-1, unbiased=False)
+        pooled = torch.cat([mean, std], dim=-1)
+        return self.feature_proj(pooled)
+
+    def forward(self, eeg, temperature=0.5):
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
+        feat = self.encode_temporal(eeg)
+        logits = self.adapter(feat)
+        probs = F.softmax(logits / float(temperature), dim=-1)
+        return logits, probs, feat
+
+
 def load_frozen_e1_student(path, device):
+    """Load ONLY the revised temporal E1-T checkpoint."""
     path = Path(path).expanduser().resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"E1-r checkpoint not found: {path}")
+        raise FileNotFoundError(f"E1 checkpoint not found: {path}")
 
     pack = torch.load(path, map_location="cpu")
     if not isinstance(pack, dict) or "student" not in pack:
         raise RuntimeError(
-            "E1-r checkpoint must contain checkpoint['student']."
+            "Temporal E1 checkpoint must contain checkpoint['student']."
         )
 
     state = pack["student"]
-    if "pca_mean" not in state or "pca_components" not in state:
+    stored_arch = str(pack.get("student_arch", "")).strip()
+    has_temporal_keys = any(k.startswith("temporal.") for k in state)
+
+    if stored_arch != "temporal_dwconv_v1" and not has_temporal_keys:
         raise RuntimeError(
-            "E1-r student checkpoint does not contain PCA buffers."
+            "This script requires the revised temporal E1-T checkpoint, not the "
+            "legacy PCA E1-r checkpoint. "
+            f"student_arch={stored_arch!r}; first_keys={list(state)[:8]}"
         )
 
-    pca_mean = state["pca_mean"]
-    pca_components = state["pca_components"]
+    required = [
+        "feature_proj.1.weight",
+        "adapter.1.weight",
+        "adapter.3.weight",
+    ]
+    missing = [k for k in required if k not in state]
+    if missing:
+        raise RuntimeError(
+            f"Unexpected temporal E1-T checkpoint layout; missing={missing}"
+        )
 
-    # Infer architecture from stored tensors instead of trusting CLI defaults.
-    if "adapter.1.weight" not in state or "adapter.3.weight" not in state:
-        raise RuntimeError("Unexpected E1-r semantic-student state layout.")
-
+    feature_dim = int(state["feature_proj.1.weight"].shape[0])
     hidden_dim = int(state["adapter.1.weight"].shape[0])
     num_classes = int(state["adapter.3.weight"].shape[0])
 
-    student = RawEEGSemanticStudent(
-        pca_mean=pca_mean,
-        pca_components=pca_components,
+    student = TemporalEEGSemanticStudent(
+        feature_dim=feature_dim,
         hidden_dim=hidden_dim,
         num_classes=num_classes,
     )
@@ -336,27 +416,25 @@ def load_frozen_e1_student(path, device):
     student.requires_grad_(False)
     student.eval()
 
-    if any(p.requires_grad for p in student.parameters()):
-        raise RuntimeError("Failed to freeze E1-r semantic student.")
-
     e1_args = pack.get("args", {}) or {}
     e1_holdout = str(e1_args.get("holdout_suffix", ""))
     print(
-        f"[E1-r] loaded {path}; step={pack.get('step', 'unknown')}; "
-        f"PCA={tuple(pca_components.shape)} hidden={hidden_dim}"
+        f"[E1-T] loaded {path}; step={pack.get('step', 'unknown')}; "
+        f"arch=temporal_dwconv_v1; feature_dim={feature_dim}; "
+        f"hidden={hidden_dim}; classes={num_classes}"
     )
-    return student, pack, e1_holdout
+    return student, pack, e1_holdout, feature_dim, "temporal_dwconv_v1"
 
 
 # =============================================================================
 # E2 fixed-scale residual head
 # =============================================================================
 class EEGResidualHead(nn.Module):
-    def __init__(self, pca_dim=512, rank=64, out_dim=1024, dropout=0.0):
+    def __init__(self, feature_dim=512, rank=64, out_dim=1024, dropout=0.0):
         super().__init__()
         layers = [
-            nn.LayerNorm(int(pca_dim)),
-            nn.Linear(int(pca_dim), int(rank)),
+            nn.LayerNorm(int(feature_dim)),
+            nn.Linear(int(feature_dim), int(rank)),
             nn.GELU(),
         ]
         if float(dropout) > 0:
@@ -372,8 +450,8 @@ class EEGResidualHead(nn.Module):
         nn.init.normal_(final.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(final.bias)
 
-    def forward(self, pca_feat):
-        x = self.net(pca_feat.float())
+    def forward(self, eeg_feat):
+        x = self.net(eeg_feat.float())
         return F.normalize(x, dim=-1, eps=1e-6)
 
 
@@ -770,6 +848,7 @@ def parse_args():
 # =============================================================================
 def main():
     args = parse_args()
+    print(f"[code] E2-T temporal-only v2 | file={Path(__file__).resolve()}")
     seed_everything(args.seed)
 
     if args.accumulation_steps <= 0:
@@ -847,13 +926,13 @@ def main():
     model.set_fixed_prototypes(prototypes.to(device))
     freeze_generator(model)
 
-    # Frozen E1-r semantic student, including its exact train-only PCA buffers.
-    semantic_student, e1_pack, e1_holdout = load_frozen_e1_student(
-        args.e1_ckpt, device
+    # Frozen E1 semantic student: supports legacy PCA E1-r and revised temporal E1-T.
+    semantic_student, e1_pack, e1_holdout, e1_feature_dim, e1_arch = (
+        load_frozen_e1_student(args.e1_ckpt, device)
     )
     if e1_holdout and e1_holdout != str(args.holdout_suffix):
         raise RuntimeError(
-            f"E1-r holdout={e1_holdout} but E2 requested holdout={args.holdout_suffix}."
+            f"E1 holdout={e1_holdout} but E2 requested holdout={args.holdout_suffix}."
         )
 
     e1_oracle = str(e1_pack.get("oracle_ckpt", ""))
@@ -862,14 +941,13 @@ def main():
         requested_oracle = str(Path(args.oracle_ckpt).expanduser().resolve())
         if e1_oracle_resolved != requested_oracle:
             raise RuntimeError(
-                "E1-r and E2 must use the same Oracle generator.\n"
-                f"E1-r oracle: {e1_oracle_resolved}\n"
+                "E1 and E2 must use the same Oracle generator.\n"
+                f"E1 oracle: {e1_oracle_resolved}\n"
                 f"E2 oracle   : {requested_oracle}"
             )
 
-    pca_dim = int(semantic_student.pca_components.shape[0])
     residual_head = EEGResidualHead(
-        pca_dim=pca_dim,
+        feature_dim=e1_feature_dim,
         rank=args.residual_rank,
         out_dim=1024,
         dropout=args.residual_dropout,
@@ -946,7 +1024,7 @@ def main():
                 model, noisy, t, o_prompt, o_spatial
             ).detach()
 
-            # Frozen E1-r semantic student and PCA feature.
+            # Frozen E1 semantic student and its 512-D EEG feature.
             _, probs, feat = semantic_student(
                 eeg, temperature=args.student_temperature
             )
@@ -1049,6 +1127,8 @@ def main():
                 "final08_09": "NOT_USED",
                 "oracle_step": oracle_pack.get("step", None),
                 "e1_step": e1_pack.get("step", None),
+                "e1_student_arch": e1_arch,
+                "e1_feature_dim": int(e1_feature_dim),
                 "residual_alpha": float(args.residual_alpha),
                 "residual_rank": int(args.residual_rank),
                 "val": row,
@@ -1111,6 +1191,8 @@ def main():
         "e1_checkpoint": str(Path(args.e1_ckpt).expanduser().resolve()),
         "deprecated_eeg_checkpoint_used": False,
         "semantic_student_frozen": True,
+        "e1_student_arch": e1_arch,
+        "e1_feature_dim": int(e1_feature_dim),
         "generator_frozen": True,
         "trainable_component": "residual_head_only",
         "residual_alpha": float(args.residual_alpha),
