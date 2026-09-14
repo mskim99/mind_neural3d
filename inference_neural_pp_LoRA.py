@@ -56,7 +56,7 @@ from src.data.egg_dataset_ext_el import (
 DEFAULT_SDXL_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 DEFAULT_ZERO123_MODEL = "sudo-ai/zero123plus-v1.1"
 DEFAULT_SDXL_NEGATIVE_PROMPT = (
-    "multiple objects, duplicate object, extra object, "
+    "multiple objects, duplicate object, extra object, group, collection, cluster, "
     "cluttered background, complex background, perspective distortion, "
     "text, watermark, logo, cropped object, partial object, "
     "deformed geometry, distorted geometry, blurry, noisy, low quality"
@@ -351,8 +351,9 @@ def load_pipelines(args, device):
 
 @torch.inference_mode()
 def run_sdxl_base_image(pipe, prompt, args, seed):
+    # 단일 객체 외에 다른 요소가 섞이지 않도록 프롬프트 정밀 제어
     effective_prompt = (
-        f"A single, isolated {prompt}, only one object, "
+        f"A standalone solo object, a single isolated {prompt}, only one object, "
         "orthographic side profile view, flat shading, strict symmetry, "
         "zero perspective distortion, perfectly centered, "
         "isolated on a pure solid white background, high quality 3D asset"
