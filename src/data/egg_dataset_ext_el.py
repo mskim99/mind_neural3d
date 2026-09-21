@@ -69,7 +69,7 @@ class AllDataFeatureTwoEEG(Dataset):
             rendered_view_path = os.path.join(self.data_path, 'eeg3d_instantmesh_views')
         self.rendered_view_path = Path(rendered_view_path).expanduser()
 
-        all_name_list = sorted(os.listdir(self.data_path + 'video_new/'))
+        all_name_list = sorted(os.listdir(self.data_path + '/video_new/'))
         self.name_list = []
         if train:
             remove_name = ['08', '09']

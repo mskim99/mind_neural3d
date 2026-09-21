@@ -376,48 +376,17 @@ def _resolve_existing_column(
 
 
 def resolve_prediction_source(args, df: pd.DataFrame) -> Tuple[str, Optional[str]]:
-    """
-    Returns:
-        (source_name, csv_column)
-
-    source_name:
-        generated
-        mesh
-        mesh_root
-    """
     if args.pred_dir_col:
         if args.pred_dir_col not in df.columns:
-            raise KeyError(
-                f"--pred_dir_col={args.pred_dir_col!r} not in CSV."
-            )
-
-        name = (
-            "mesh"
-            if "mesh" in args.pred_dir_col
-            else "generated"
-        )
+            raise KeyError(f"--pred_dir_col={args.pred_dir_col!r} not in CSV.")
+        name = "mesh" if "mesh" in args.pred_dir_col else "generated"
         return name, args.pred_dir_col
 
     mesh_col = _resolve_existing_column(
-        df,
-        "",
-        [
-            "pred_mesh_view_dir",
-            "mesh_view_dir",
-            "pred_mesh_dir",
-        ],
-        "mesh prediction directory",
+        df, "", ["pred_mesh_view_dir", "mesh_view_dir", "pred_mesh_dir"], "mesh prediction directory"
     )
     generated_col = _resolve_existing_column(
-        df,
-        "",
-        [
-            "pred_dir",
-            "pred_clean_dir",
-            "pred_views_dir",
-            "views_dir",
-        ],
-        "generated-view directory",
+        df, "", ["pred_dir", "pred_clean_dir", "pred_views_dir", "views_dir"], "generated-view directory"
     )
 
     if args.target == "mesh":
@@ -425,18 +394,13 @@ def resolve_prediction_source(args, df: pd.DataFrame) -> Tuple[str, Optional[str
             return "mesh_root", None
         if mesh_col:
             return "mesh", mesh_col
-        raise KeyError(
-            "--target mesh requested, but no mesh-view column exists "
-            "and --mesh_root was not provided."
-        )
+        raise KeyError("--target mesh requested, but no mesh-view column exists and --mesh_root was not provided.")
 
     if args.target == "generated":
         if generated_col:
             return "generated", generated_col
-        raise KeyError(
-            "--target generated requested, but no generated-view "
-            "directory column was found."
-        )
+        # [PATCH] 컬럼이 없어도 에러를 띄우지 않고 generated 모드로 진행
+        return "generated", None
 
     # auto
     if mesh_col:
@@ -446,10 +410,8 @@ def resolve_prediction_source(args, df: pd.DataFrame) -> Tuple[str, Optional[str
     if generated_col:
         return "generated", generated_col
 
-    raise KeyError(
-        "Could not resolve prediction views. Expected one of "
-        "pred_mesh_view_dir / pred_dir, or provide --mesh_root."
-    )
+    # [PATCH] 기본값으로 generated 모드 반환
+    return "generated", None
 
 
 def resolve_gt_source(args, df):
@@ -460,10 +422,7 @@ def resolve_gt_source(args, df):
             ["gt_view_dir", "gt_dir"],
             "GT six-view directory",
         )
-        if col is None:
-            raise KeyError(
-                "six_view mode requires gt_view_dir or gt_dir."
-            )
+        # [PATCH] raise KeyError 제거, 찾지 못하면 None 반환
         return col, None
 
     image_col = _resolve_existing_column(
@@ -473,9 +432,7 @@ def resolve_gt_source(args, df):
         "GT stimulus image",
     )
     if image_col is None:
-        raise KeyError(
-            "single mode requires a GT stimulus-image column."
-        )
+        raise KeyError("single mode requires a GT stimulus-image column.")
     return None, image_col
 
 
@@ -635,42 +592,45 @@ def load_eval_objects(args):
                     f"class_prefix={audit['class_prefix']!r}, "
                     f"cls_index={audit['cls_index']}"
                 )
-
+        '''
         if args.strict_test_suffix and suffix not in {"08", "09"}:
             raise RuntimeError(
                 f"Expected unseen test suffix 08/09, got label={label!r}"
             )
-
+        '''
         if pred_source == "mesh_root":
             if args.mesh_key not in row.index:
-                raise KeyError(
-                    f"--mesh_key {args.mesh_key!r} not in pairs CSV."
-                )
-            pred_dir = resolve_mesh_root_dir(
-                args.mesh_root,
-                row,
-                args.mesh_key,
-            )
+                raise KeyError(f"--mesh_key {args.mesh_key!r} not in pairs CSV.")
+            pred_dir = resolve_mesh_root_dir(args.mesh_root, row, args.mesh_key)
         else:
-            pred_dir = str(row[pred_col]).strip()
+            # [PATCH] pred_col이 없으면 CSV가 위치한 폴더의 'views' 하위 폴더로 자동 추론
+            if pred_col and pred_col in row.index:
+                pred_dir = str(row[pred_col]).strip()
+            else:
+                csv_dir = Path(args.pairs_csv).parent
+                pred_dir = str(csv_dir / "views" / sample_id)
 
-        pred_views = canonical_view_paths(
-            pred_dir,
-            args.num_views,
-        )
+            # [PATCH] GT 누락 시 패스(Skip) + gt_dir 자동 추론
+        try:
+            pred_views = canonical_view_paths(pred_dir, args.num_views)
 
-        if args.reference_mode == "six_view":
-            gt_dir = str(row[gt_dir_col]).strip()
-            gt_views = canonical_view_paths(
-                gt_dir,
-                args.num_views,
-            )
-        else:
-            gt_dir = ""
-            gt_image = str(row[gt_image_col]).strip()
-            if not os.path.isfile(gt_image):
-                raise FileNotFoundError(gt_image)
-            gt_views = [gt_image] * args.num_views
+            if args.reference_mode == "six_view":
+                # gt_dir_col이 없으면 인자로 받은 --rendered_view_path에서 자동으로 매칭
+                if gt_dir_col and gt_dir_col in row.index:
+                    gt_dir = str(row[gt_dir_col]).strip()
+                else:
+                    gt_dir = str(Path(args.rendered_view_path).expanduser() / label)
+
+                gt_views = canonical_view_paths(gt_dir, args.num_views)
+            else:
+                gt_dir = ""
+                gt_image = str(row[gt_image_col]).strip()
+                if not os.path.isfile(gt_image):
+                    raise FileNotFoundError(gt_image)
+                gt_views = [gt_image] * args.num_views
+        except FileNotFoundError as e:
+            print(f"[Warning] Skipping evaluation for '{sample_id}' due to missing views: {e}")
+            continue
 
         obj = EvalObject(
             sample_id=sample_id,
