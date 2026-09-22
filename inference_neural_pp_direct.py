@@ -370,7 +370,7 @@ def main():
 
     # Load EEG-CLIP Aligner Model
     aligner_model = EEGCLIPAligner(input_dim=128, hidden_dim=1024, clip_dim=512).to(device)
-    aligner_model.load_state_dict(torch.load(args.aligner_ckpt, map_location=device))
+    aligner_model.load_state_dict(torch.load(args.aligner_ckpt, map_location=device), strict=False)
     aligner_model.eval()
 
     test_loader = DataLoader(test_dataset, batch_size=args.batchsize, num_workers=4, drop_last=False)
@@ -404,8 +404,8 @@ def main():
         logits = eeg_embeds @ CLIP_TEXT_EMBEDS_72.t()  # [Batch, 72]
         weights = F.softmax(logits * args.temperature, dim=-1)  # [Batch, 72]
 
-        batch_prompt_embeds = torch.einsum("bc,csl->bsl", weights, SDXL_PROMPT_EMBEDS_72)  # [Batch, 77, 2048]
-        batch_pooled_embeds = torch.einsum("bc,cl->bl", weights, SDXL_POOLED_EMBEDS_72)  # [Batch, 1280]
+        batch_prompt_embeds = torch.einsum("bc,csl->bsl", weights.to(SDXL_PROMPT_EMBEDS_72.dtype), SDXL_PROMPT_EMBEDS_72)
+        batch_pooled_embeds = torch.einsum("bc,cl->bl", weights.to(SDXL_POOLED_EMBEDS_72.dtype), SDXL_POOLED_EMBEDS_72)
 
         # Evaluations (Argmax for reference)
         semantic_pred_cls = logits.argmax(dim=1).cpu().tolist()

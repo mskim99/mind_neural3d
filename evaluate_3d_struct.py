@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Evaluation aligned to the CURRENT Neuro-3D training + inference pipeline.
-Includes Textural-Level (PSNR, SSIM) and Structure-Level (CD, EMD) metrics.
+Includes Textural-Level (PSNR, SSIM) and Structure-Level (FPD, CD, EMD) metrics.
 """
-
 import argparse
 import json
 import os
@@ -20,6 +19,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.hub import download_url_to_file
 from PIL import Image
 from tqdm import tqdm
 from torchvision.transforms import functional as TF
@@ -114,7 +114,15 @@ def parse_args():
     p.add_argument("--skip_3d_metrics", action="store_true",
                    help="Skip CD, EMD, FPD calculation if GT meshes are missing.")
     p.add_argument("--num_mesh_samples", type=int, default=2048,
-                   help="Number of points to sample from mesh for CD/EMD.")
+                   help="Number of points to sample from each mesh for FPD/CD/EMD.")
+    p.add_argument("--fpd_pointnet_ckpt", default="",
+                   help="Pretrained TreeGAN PointNet checkpoint. If omitted, the default checkpoint is downloaded.")
+    p.add_argument("--fpd_pointnet_url", default=(
+        "https://github.com/junzhezhang/shape-inversion/raw/"
+        "a1176778330e22546ee81dc01e93c0b1e9e7a37d/evaluation/cls_model_39.pth"
+    ))
+    p.add_argument("--fpd_batch_size", type=int, default=32,
+                   help="Batch size used for PointNet feature extraction.")
 
     p.add_argument("--num_views", type=int, default=6)
     p.add_argument("--device", default="cuda")
@@ -323,43 +331,340 @@ def chamfer_distance_pytorch(p1, p2):
     return (dist1 + dist2).mean()
 
 
+# ============================================================================
+# FPD (Fréchet Point Cloud Distance) Core
+# ============================================================================
+class STN3d(nn.Module):
+    """Input spatial transformer used by the original TreeGAN FPD PointNet."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 9)
+        self.relu = nn.ReLU()
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = torch.max(x, 2, keepdim=True)[0].view(batch_size, 1024)
+        x = F.relu(self.bn4(self.fc1(x)))
+        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.fc3(x)
+        identity = torch.eye(3, dtype=x.dtype, device=x.device).reshape(1, 9).repeat(batch_size, 1)
+        return (x + identity).view(-1, 3, 3)
+
+
+class PointNetFeat(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stn = STN3d()
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+
+    def forward(self, x):
+        trans = self.stn(x)
+        x = torch.bmm(x.transpose(2, 1), trans).transpose(2, 1)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.bn3(self.conv3(x))
+        return torch.max(x, 2, keepdim=False)[0], trans
+
+
+class PointNetFPD(nn.Module):
+    """PointNet classifier returning the concatenated activation used by FPD."""
+
+    def __init__(self, num_classes=16):
+        super().__init__()
+        self.feat = PointNetFeat()
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, num_classes)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.bn2 = nn.BatchNorm1d(256)
+
+    def forward(self, x):
+        x1, trans = self.feat(x)
+        x2 = F.relu(self.bn1(self.fc1(x1)))
+        x3 = F.relu(self.bn2(self.fc2(x2)))
+        logits = self.fc3(x3)
+        activation = torch.cat((x1, x2, x3, logits), dim=1)
+        return logits, trans, activation
+
+
+def _checkpoint_state_dict(checkpoint):
+    if isinstance(checkpoint, nn.Module):
+        checkpoint = checkpoint.state_dict()
+    elif isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "pointnet", "model"):
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                checkpoint = checkpoint[key]
+                break
+    if not isinstance(checkpoint, dict) or not checkpoint:
+        raise ValueError("The FPD checkpoint does not contain a state_dict.")
+
+    state_dict = dict(checkpoint)
+    for prefix in ("module.", "model.", "pointnet."):
+        if state_dict and all(key.startswith(prefix) for key in state_dict):
+            state_dict = {key[len(prefix):]: value for key, value in state_dict.items()}
+    return state_dict
+
+
+def load_fpd_pointnet(checkpoint_path, device):
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError:  # PyTorch < 2.0
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _checkpoint_state_dict(checkpoint)
+
+    fc3_weight = state_dict.get("fc3.weight")
+    if fc3_weight is None or fc3_weight.ndim != 2:
+        raise ValueError("Incompatible FPD checkpoint: missing fc3.weight.")
+    num_classes = int(fc3_weight.shape[0])
+    model = PointNetFPD(num_classes=num_classes)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "The checkpoint does not match the TreeGAN PointNet architecture; "
+            "FPD cannot be compared with the reference score."
+        ) from exc
+    return model.to(device).eval(), 1024 + 512 + 256 + num_classes
+
+
+def normalize_pointclouds_unit_sphere(pointclouds):
+    pointclouds = np.asarray(pointclouds, dtype=np.float32)
+    centered = pointclouds - pointclouds.mean(axis=1, keepdims=True)
+    radius = np.linalg.norm(centered, axis=2).max(axis=1, keepdims=True)
+    if np.any(~np.isfinite(radius)) or np.any(radius <= 0):
+        raise ValueError("FPD received a degenerate point cloud.")
+    return centered / radius[..., None]
+
+
+@torch.no_grad()
+def extract_pointnet_features(model, pointclouds, device, batch_size=32):
+    """Extract one global TreeGAN PointNet activation per point cloud."""
+    points = torch.as_tensor(pointclouds, dtype=torch.float32)
+    features = []
+    for start in range(0, len(points), batch_size):
+        batch = points[start:start + batch_size].to(device).transpose(1, 2).contiguous()
+        _, _, activation = model(batch)
+        features.append(activation.detach().cpu())
+    return torch.cat(features, dim=0)
+
+
+def compute_mean_cov(features):
+    features = features.double()
+    if features.ndim != 2 or features.shape[0] < 2:
+        raise ValueError("FPD requires at least two feature vectors per distribution.")
+    mean = features.mean(dim=0)
+    centered = features - mean
+    covariance = centered.T @ centered / (features.shape[0] - 1)
+    return mean, covariance
+
+
+def matrix_sqrt_psd(matrix, eps=1e-10):
+    matrix = (matrix + matrix.T) * 0.5
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    eigenvalues = torch.clamp(eigenvalues, min=0.0)
+    return (eigenvectors * torch.sqrt(eigenvalues + eps).unsqueeze(0)) @ eigenvectors.T
+
+
+def frechet_pointcloud_distance(real_features, generated_features, eps=1e-10):
+    """Compute one distribution-level FPD from all GT and predicted objects."""
+    real = real_features.double()
+    generated = generated_features.double()
+    if real.ndim != 2 or generated.ndim != 2 or real.shape[1] != generated.shape[1]:
+        raise ValueError("GT and predicted features must be [N, D] with an identical D.")
+    if real.shape[0] < 2 or generated.shape[0] < 2:
+        raise ValueError("FPD requires at least two GT and two predicted objects.")
+
+    real_mean = real.mean(dim=0)
+    generated_mean = generated.mean(dim=0)
+    real_scaled = (real - real_mean) / np.sqrt(real.shape[0] - 1)
+    generated_scaled = (generated - generated_mean) / np.sqrt(generated.shape[0] - 1)
+
+    # Exact low-rank form of the covariance square-root trace. For the usual
+    # case N << D, this replaces a costly D x D eigendecomposition by an
+    # N_real x N_generated SVD without changing the Fréchet distance.
+    trace_covmean = torch.linalg.svdvals(real_scaled @ generated_scaled.T).sum()
+    value = (
+        (real_mean - generated_mean).square().sum()
+        + real_scaled.square().sum()
+        + generated_scaled.square().sum()
+        - 2.0 * trace_covmean
+    )
+    if value < 0 and value > -eps:
+        value = value.new_zeros(())
+    return float(value.item())
+
+
+def resolve_fpd_checkpoint(args):
+    if args.fpd_pointnet_ckpt:
+        path = Path(args.fpd_pointnet_ckpt).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"FPD checkpoint not found: {path}")
+        return path
+
+    path = Path(args.out_dir).expanduser() / "cls_model_39.pth"
+    if not path.is_file():
+        print(f"[*] Downloading the pretrained FPD PointNet checkpoint to {path}...")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        download_url_to_file(args.fpd_pointnet_url, str(path), progress=True)
+    return path
+
+
 def compute_3d_metrics(pred_mesh_path, gt_mesh_path, num_samples):
     if not (pred_mesh_path and gt_mesh_path and os.path.exists(pred_mesh_path) and os.path.exists(gt_mesh_path)):
-        return float('nan'), float('nan')
+        return float('nan'), float('nan'), None, None
 
     try:
-        # [PATCH] .glb 파일을 안전하게 병합하여 로드
         pred_mesh = load_as_single_mesh(pred_mesh_path)
         gt_mesh = load_as_single_mesh(gt_mesh_path)
 
-        # Sample points
-        pred_pts, _ = trimesh.sample.sample_surface(pred_mesh, num_samples)
-        gt_pts, _ = trimesh.sample.sample_surface(gt_mesh, num_samples)
+        pred_pts_raw, _ = trimesh.sample.sample_surface(pred_mesh, num_samples)
+        gt_pts_raw, _ = trimesh.sample.sample_surface(gt_mesh, num_samples)
 
-        # Min-Max Normalization to bounding box [0, 1] for fair comparison
-        pred_pts = (pred_pts - pred_pts.min(axis=0)) / (pred_pts.max(axis=0) - pred_pts.min(axis=0) + 1e-6)
-        gt_pts = (gt_pts - gt_pts.min(axis=0)) / (gt_pts.max(axis=0) - gt_pts.min(axis=0) + 1e-6)
+        # CD/EMD preprocessing is kept unchanged for compatibility with the
+        # existing reported values. FPD receives the raw samples and applies
+        # PointNet's zero-mean/unit-sphere normalization separately.
+        pred_pts = (pred_pts_raw - pred_pts_raw.min(axis=0)) / (
+            pred_pts_raw.max(axis=0) - pred_pts_raw.min(axis=0) + 1e-6
+        )
+        gt_pts = (gt_pts_raw - gt_pts_raw.min(axis=0)) / (
+            gt_pts_raw.max(axis=0) - gt_pts_raw.min(axis=0) + 1e-6
+        )
 
-        # Chamfer Distance
         t_p1 = torch.tensor(pred_pts, dtype=torch.float32).unsqueeze(0)
         t_p2 = torch.tensor(gt_pts, dtype=torch.float32).unsqueeze(0)
         cd_val = chamfer_distance_pytorch(t_p1, t_p2).item() * 100.0
 
-        # Earth Mover's Distance (EMD) using POT
         M = ot.dist(pred_pts, gt_pts, metric='euclidean')
         a, b = np.ones((len(pred_pts),)) / len(pred_pts), np.ones((len(gt_pts),)) / len(gt_pts)
         emd_val = ot.emd2(a, b, M) * 100.0
 
-        return cd_val, emd_val
+        return cd_val, emd_val, pred_pts_raw, gt_pts_raw
     except Exception as e:
         print(f"[Warning] Failed computing 3D metrics for {pred_mesh_path}: {e}")
-        return float('nan'), float('nan')
+        return float('nan'), float('nan'), None, None
 
 
-# ... (기존 LPIPS, N-way 등 모델 코드 유지) ...
+# ============================================================================
+# Image metrics & LPIPS
+# ============================================================================
+def image_to_unit_tensor(image: Image.Image, size: Tuple[int, int] = None) -> torch.Tensor:
+    x = TF.to_tensor(image.convert("RGB"))
+    if size is not None and tuple(x.shape[-2:]) != tuple(size):
+        x = TF.resize(x, list(size), interpolation=TF.InterpolationMode.BICUBIC, antialias=True)
+    return x.clamp(0, 1)
+
+class LPIPSScorer:
+    def __init__(self, device):
+        self.device = device
+        self.model = lpips.LPIPS(net="alex").to(device).eval()
+
+    @torch.no_grad()
+    def pair_scores(self, gt_paths, pred_paths, batch_size):
+        values = []
+        for s in range(0, len(gt_paths), batch_size):
+            gb, pb = [], []
+            for gp, pp in zip(gt_paths[s:s + batch_size], pred_paths[s:s + batch_size]):
+                gi = load_rgb(gp)
+                pi = load_rgb(pp)
+                target_hw = (gi.height, gi.width)
+                g = image_to_unit_tensor(gi)
+                p = image_to_unit_tensor(pi, target_hw)
+                gb.append(g * 2 - 1)
+                pb.append(p * 2 - 1)
+            g = torch.stack(gb).to(self.device)
+            p = torch.stack(pb).to(self.device)
+            values.extend(self.model(g, p).reshape(-1).float().cpu().tolist())
+        return np.asarray(values, dtype=np.float64)
+
+# ============================================================================
+# Brain3D N-way (Classifier)
+# ============================================================================
+def build_classifier(name: str, device):
+    if name == "resnet50":
+        weights = ResNet50_Weights.IMAGENET1K_V2
+        model = resnet50(weights=weights)
+    elif name == "resnet18":
+        weights = ResNet18_Weights.IMAGENET1K_V1
+        model = resnet18(weights=weights)
+    else:
+        weights = ViT_B_16_Weights.IMAGENET1K_V1
+        model = vit_b_16(weights=weights)
+    return model.to(device).eval(), weights.transforms(), weights.meta["categories"]
+
+@torch.no_grad()
+def classifier_probabilities(paths, model, preprocess, device, batch_size):
+    out = []
+    for s in range(0, len(paths), batch_size):
+        x = torch.stack([preprocess(load_rgb(p)) for p in paths[s:s + batch_size]]).to(device)
+        out.append(torch.softmax(model(x).float(), dim=-1).cpu())
+    return torch.cat(out, dim=0).numpy()
+
+def nway_trials_for_pair(pred_prob, positive_class, n_way, top_k, trials, rng):
+    K = pred_prob.shape[0]
+    neg_pool = np.concatenate([np.arange(0, positive_class, dtype=np.int64), np.arange(positive_class + 1, K, dtype=np.int64)])
+    success = np.zeros(trials, dtype=np.float64)
+    for t in range(trials):
+        neg = rng.choice(neg_pool, size=n_way - 1, replace=False)
+        candidates = np.concatenate([[positive_class], neg])
+        scores = pred_prob[candidates]
+        rank = np.argsort(-scores)
+        positive_rank = int(np.where(rank == 0)[0][0])
+        success[t] = float(positive_rank < top_k)
+    return success
+
+def compute_all_nway(gt_probs, pred_probs, object_index, num_objects, trials, seed):
+    settings = [("2way_top1", 2, 1), ("10way_top1", 10, 1), ("10way_top2", 10, 2), ("50way_top1", 50, 1), ("50way_top2", 50, 2)]
+    positive = gt_probs.argmax(axis=1)
+    summary, per_object, trial_rows = {}, {}, []
+    for setting_idx, (name, n_way, top_k) in enumerate(settings):
+        pair_trial = np.zeros((len(pred_probs), trials), dtype=np.float64)
+        for pair_idx in range(len(pred_probs)):
+            rng = np.random.default_rng(seed + setting_idx * 1_000_003 + pair_idx * 9_973)
+            pair_trial[pair_idx] = nway_trials_for_pair(pred_probs[pair_idx], int(positive[pair_idx]), n_way, top_k, trials, rng)
+        obj_scores = np.zeros(num_objects, dtype=np.float64)
+        for oi in range(num_objects):
+            obj_scores[oi] = pair_trial[object_index == oi].mean()
+        per_object[name] = obj_scores
+        global_trials = []
+        for t in range(trials):
+            vals = [pair_trial[object_index == oi, t].mean() for oi in range(num_objects)]
+            v = float(np.mean(vals))
+            global_trials.append(v)
+            trial_rows.append({"metric": name, "trial": t, "value": v})
+        global_trials = np.asarray(global_trials)
+        summary[name] = {"mean": float(global_trials.mean()), "std": float(global_trials.std(ddof=0))}
+    return summary, per_object, trial_rows, positive
+
 
 def main():
     args = parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable.")
+
     device = torch.device(args.device)
 
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -375,13 +680,10 @@ def main():
             obj_idx.append(oi)
             view_idx.append(vi)
 
-    # ... (기존 CLIP, LPIPS 연산 생략 - 기존 로직과 동일하게 실행됨) ...
-    # [PATCH] LPIPS 점수(기존 로직 사용했다고 가정)를 0으로 초기화 처리 (본 데모용)
-    lpips_pair = np.zeros(len(gt_paths))
-    clip_pair = np.zeros(len(gt_paths))
+    obj_idx = np.asarray(obj_idx, dtype=np.int64)
 
     # ------------------------------------------------------------------
-    # [NEW] Textural-Level (PSNR, SSIM)
+    # [1] Textural-Level (PSNR, SSIM)
     # ------------------------------------------------------------------
     print("\n[*] Computing Textural-Level Metrics (PSNR, SSIM)...")
     psnr_pair = np.zeros(len(gt_paths))
@@ -392,61 +694,105 @@ def main():
         ssim_pair[i] = s
 
     # ------------------------------------------------------------------
-    # [NEW] Structure-Level (CD, EMD)
+    # [2] Structure-Level (CD, EMD, FPD)
     # ------------------------------------------------------------------
-    print("[*] Computing Structure-Level Metrics (CD, EMD)...")
+    print("\n[*] Computing Structure-Level Metrics (CD, EMD, FPD)...")
     cd_scores = np.full(len(objects), np.nan)
     emd_scores = np.full(len(objects), np.nan)
+    final_fpd = float('nan')
+
+    pred_pts_list, gt_pts_list = [], []
 
     if not args.skip_3d_metrics and args.gt_mesh_root:
-        # [PATCH] 매칭되는 예측(Pred) 및 정답(GT) glb 파일이 모두 존재하는 객체만 필터링
         valid_3d_pairs = [obj for obj in objects if obj.mesh_path and obj.gt_mesh_path]
-
         if len(valid_3d_pairs) == 0:
-            print("[Warning] 매칭되는 .glb 메쉬 파일 쌍이 0개입니다. 3D 구조 평가를 조기 종료(Skip)합니다.")
+            print("[Warning] 매칭되는 .glb 메쉬 쌍이 0개입니다. 3D 구조 평가를 스킵합니다.")
         else:
-            print(f"[*] 유효한 3D 메쉬 매칭 쌍: {len(valid_3d_pairs)}개 발견. 평가를 진행합니다.")
+            print(f"[*] 유효한 3D 메쉬 매칭 쌍: {len(valid_3d_pairs)}개 발견.")
             for oi, obj in enumerate(tqdm(objects, desc="CD/EMD")):
-                cd, emd = compute_3d_metrics(obj.mesh_path, obj.gt_mesh_path, args.num_mesh_samples)
+                cd, emd, p_pts, g_pts = compute_3d_metrics(obj.mesh_path, obj.gt_mesh_path, args.num_mesh_samples)
                 cd_scores[oi] = cd
                 emd_scores[oi] = emd
+                if p_pts is not None and g_pts is not None:
+                    pred_pts_list.append(p_pts)
+                    gt_pts_list.append(g_pts)
+
+            # FPD is computed once from the complete GT/prediction feature sets.
+            if len(pred_pts_list) > 1:
+                try:
+                    print("[*] Calculating distribution-level FPD...")
+                    fpd_checkpoint = resolve_fpd_checkpoint(args)
+                    pointnet, feature_dim = load_fpd_pointnet(fpd_checkpoint, device)
+
+                    pred_clouds = normalize_pointclouds_unit_sphere(np.stack(pred_pts_list))
+                    gt_clouds = normalize_pointclouds_unit_sphere(np.stack(gt_pts_list))
+                    feat_pred = extract_pointnet_features(
+                        pointnet, pred_clouds, device, batch_size=args.fpd_batch_size
+                    )
+                    feat_gt = extract_pointnet_features(
+                        pointnet, gt_clouds, device, batch_size=args.fpd_batch_size
+                    )
+                    final_fpd = frechet_pointcloud_distance(feat_gt, feat_pred)
+                    print(
+                        f"[*] Computed FPD: {final_fpd:.3f} "
+                        f"(objects={len(pred_pts_list)}, feature_dim={feature_dim})"
+                    )
+                    del pointnet, feat_pred, feat_gt
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                except Exception as e:
+                    print(f"[Warning] FPD calculation failed: {e}")
+                    print("Provide the reference PointNet checkpoint explicitly with --fpd_pointnet_ckpt.")
+            else:
+                print("[Warning] FPD requires at least two valid GT/predicted mesh pairs.")
     else:
-        print("[Warning] Skipping CD, EMD (No --gt_mesh_root provided or skipped).")
+        print("[Warning] Skipping CD, EMD, FPD (No --gt_mesh_root provided or skipped).")
 
     # ------------------------------------------------------------------
-    # Console summary.
+    # [3] Image Perceptual Metric (LPIPS)
     # ------------------------------------------------------------------
-    final_psnr = np.nanmean(psnr_pair)
-    final_ssim = np.nanmean(ssim_pair)
-    final_cd = np.nanmean(cd_scores)
-    final_emd = np.nanmean(emd_scores)
+    print("\n[*] Computing LPIPS...")
+    lpips_model = LPIPSScorer(device)
+    lpips_pair = lpips_model.pair_scores(gt_paths, pred_paths, args.batch_size)
 
-    print("\n" + "=" * 130)
-    print(
-        f"{'Method':<10}"
-        f"{'2w-T1':>9}"
-        f"{'10w-T1':>10}"
-        f"{'CD(↓)':>10}"
-        f"{'EMD(↓)':>10}"
-        f"{'FPD(↓)':>10}"
-        f"{'LPIPS(↓)':>10}"
-        f"{'PSNR(↑)':>10}"
-        f"{'SSIM(↑)':>10}"
+    del lpips_model
+    if device.type == "cuda": torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # [4] Semantic N-Way Classification (2w-T1, 10w-T1, etc.)
+    # ------------------------------------------------------------------
+    print(f"\n[*] Computing N-way Classification ({args.classifier}, {args.nway_trials} trials)...")
+    clf, clf_pre, classifier_categories = build_classifier(args.classifier, device)
+
+    gt_probs = classifier_probabilities(gt_paths, clf, clf_pre, device, args.batch_size)
+    pred_probs = classifier_probabilities(pred_paths, clf, clf_pre, device, args.batch_size)
+
+    nway, nway_obj, trial_rows, gt_positive = compute_all_nway(
+        gt_probs, pred_probs, obj_idx, len(objects), args.nway_trials, args.seed
     )
-    print("-" * 130)
+
+    del clf
+    if device.type == "cuda": torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Console summary
+    # ------------------------------------------------------------------
+    final_psnr = np.nanmean(psnr_pair) if not np.isnan(psnr_pair).all() else float('nan')
+    final_ssim = np.nanmean(ssim_pair) if not np.isnan(ssim_pair).all() else float('nan')
+    final_cd = np.nanmean(cd_scores) if not np.isnan(cd_scores).all() else float('nan')
+    final_emd = np.nanmean(emd_scores) if not np.isnan(emd_scores).all() else float('nan')
+    final_lpips = float(np.mean(lpips_pair))
+
+    val_2w_t1 = nway["2way_top1"]["mean"]
+    val_10w_t1 = nway["10way_top1"]["mean"]
+
+    print("\n" + "=" * 115)
     print(
-        f"{'Ours':<10}"
-        f"{0.000:>9.3f}"  # Placeholder for N-way logic
-        f"{0.000:>10.3f}"
-        f"{final_cd:>10.3f}"
-        f"{final_emd:>10.3f}"
-        f"{'N/A':>10}"  # FPD requires specific PointNet weights
-        f"{0.000:>10.3f}"  # Placeholder for LPIPS logic
-        f"{final_psnr:>10.3f}"
-        f"{final_ssim:>10.3f}"
-    )
-    print("=" * 130)
-    print("* Note: FPD requires pre-trained PointNet weights which are strictly environment-dependent.")
+        f"{'Method':<10}{'2w-T1':>9}{'10w-T1':>10}{'CD(↓)':>10}{'EMD(↓)':>10}{'FPD(↓)':>10}{'LPIPS(↓)':>10}{'PSNR(↑)':>10}{'SSIM(↑)':>10}")
+    print("-" * 115)
+    print(
+        f"{'Ours':<10}{val_2w_t1:>9.3f}{val_10w_t1:>10.3f}{final_cd:>10.3f}{final_emd:>10.3f}{final_fpd:>10.3f}{final_lpips:>10.3f}{final_psnr:>10.3f}{final_ssim:>10.3f}")
+    print("=" * 115)
 
 
 if __name__ == "__main__":

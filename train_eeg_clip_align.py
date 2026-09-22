@@ -52,7 +52,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=300, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
-    parser.add_argument("--out_dir", type=str, default="./checkpoints", help="Directory to save the model .pt files")
+    parser.add_argument("--out_dir", type=str, default="./checkpoints", help="Directory to save the model and logs")
     return parser.parse_args()
 
 
@@ -64,6 +64,12 @@ def main():
 
     # 저장 폴더 안전 생성
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+
+    # [PATCH] 로그 파일 초기화 (CSV 헤더 작성)
+    log_path = os.path.join(args.out_dir, "training_log.csv")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("Epoch,Loss,Train_Acc,LR\n")
+    print(f"[*] Training log will be saved to: {log_path}")
 
     print("[*] Loading OpenCLIP model...")
     clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
@@ -94,7 +100,6 @@ def main():
 
     model = EEGCLIPAligner(input_dim=input_dim, hidden_dim=1024, clip_dim=512).to(device)
 
-    # Optimizer 및 CosineAnnealingLR 스케줄러 적용
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
@@ -138,21 +143,22 @@ def main():
             correct += (logits.argmax(dim=1) == labels).sum().item()
             total += len(labels)
 
-        # 스케줄러 업데이트 (에폭 종료 시점)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
+        avg_loss = total_loss / len(train_loader)
         acc = correct / total
-        print(
-            f"Epoch {epoch + 1} | Loss: {total_loss / len(train_loader):.4f} | Train Acc: {acc:.4f} | LR: {current_lr:.6f}")
+        print(f"Epoch {epoch + 1} | Loss: {avg_loss:.4f} | Train Acc: {acc:.4f} | LR: {current_lr:.6f}")
 
-        # 최고 정확도 갱신 시 안전하게 모델 저장
+        # [PATCH] 매 에폭마다 로그 파일에 기록 추가
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{epoch + 1},{avg_loss:.6f},{acc:.6f},{current_lr:.6f}\n")
+
         if acc > best_acc:
             best_acc = acc
             torch.save(model.state_dict(), best_model_path)
             print(f"[*] Best model saved to {best_model_path} (Acc: {best_acc:.4f})")
 
-    # 학습 종료 후 최종 에폭 모델 저장 (선택 사항)
     last_model_path = os.path.join(args.out_dir, "eeg_clip_aligner_last.pt")
     torch.save(model.state_dict(), last_model_path)
     print(f"[*] Training complete. Final model saved to {last_model_path}")
