@@ -62,6 +62,20 @@ contrastive-loss criterion.
 
 The official test_list.txt is disabled by default and can be evaluated once
 with --eval_test after the validation rule/model has been fixed.
+
+Semantic N-way evaluation
+-------------------------
+In addition to full 271-way object retrieval, the script reports deterministic
+expected 2-way and 10-way Top-1 object-identification accuracy. Each N-way task
+contains the correct UID-caption plus N-1 distractor objects sampled uniformly
+without replacement. The exact expectation over all possible distractor sets is
+computed, avoiding Monte-Carlo variance.
+
+Note: MinD-3D++ reports N-way semantic accuracy by comparing reconstructed
+rendered images against GT rendered images. This script applies the same N-way
+candidate-identification logic in the fMRI-to-Cap3D CLIP embedding space, so it
+is a representation-level analogue rather than a numerically identical image-
+reconstruction metric.
 """
 
 import argparse
@@ -770,6 +784,86 @@ def topk_accuracy(
         result[k] = float(correct.float().mean().item())
     return result
 
+def expected_nway_top1(
+    similarities: torch.Tensor,
+    targets: torch.Tensor,
+    n_way: int,
+) -> float:
+    """
+    Deterministic expected N-way Top-1 accuracy.
+
+    For each query, the candidate set contains:
+      - the ground-truth object
+      - n_way - 1 distractors sampled uniformly without replacement
+        from all other candidates.
+
+    Rather than Monte-Carlo sampling many candidate sets, this function
+    computes the exact expectation over all possible distractor sets.
+
+    Ties are handled by random tie-breaking in expectation:
+    if j sampled distractors tie the positive score for the maximum,
+    the positive receives probability 1/(j+1).
+
+    This is the embedding-space counterpart of the standard N-way
+    identification protocol. For MinD-3D++, the published semantic metric
+    is applied to reconstructed-vs-GT rendered images; here it is applied
+    to fMRI embeddings vs object-specific Cap3D text embeddings.
+    """
+    if similarities.ndim != 2:
+        raise ValueError(
+            f"similarities must be [N,C], got {tuple(similarities.shape)}"
+        )
+
+    num_queries, num_candidates = similarities.shape
+    if not (2 <= n_way <= num_candidates):
+        raise ValueError(
+            f"n_way must be in [2,{num_candidates}], got {n_way}"
+        )
+
+    sims = similarities.detach().cpu().double()
+    targets = targets.detach().cpu().long()
+    k = n_way - 1
+    denom = math.comb(num_candidates - 1, k)
+
+    probs = []
+
+    for i in range(num_queries):
+        target_idx = int(targets[i].item())
+        pos = float(sims[i, target_idx].item())
+
+        row = sims[i]
+        other_mask = torch.ones(
+            num_candidates, dtype=torch.bool
+        )
+        other_mask[target_idx] = False
+        others = row[other_mask]
+
+        # Use a very small tolerance only for numerical equality.
+        tol = 1e-12
+        higher = int((others > pos + tol).sum().item())
+        equal = int((torch.abs(others - pos) <= tol).sum().item())
+        lower = (num_candidates - 1) - higher - equal
+
+        # To win, no strictly-higher distractor may be sampled.
+        # If j equal-score distractors are sampled, expected tie-break
+        # probability is 1/(j+1).
+        p_win_num = 0.0
+
+        j_min = max(0, k - lower)
+        j_max = min(equal, k)
+
+        for j in range(j_min, j_max + 1):
+            remaining = k - j
+            if remaining > lower:
+                continue
+
+            ways = math.comb(equal, j) * math.comb(lower, remaining)
+            p_win_num += ways / (j + 1)
+
+        probs.append(p_win_num / denom)
+
+    return float(np.mean(probs))
+
 
 @torch.no_grad()
 def evaluate_retrieval(
@@ -848,6 +942,21 @@ def evaluate_retrieval(
         ks=(1, 5),
     )
 
+    # MinD-3D++-style N-way semantic identification counterpart.
+    # Each query is compared with its correct object plus randomly
+    # selected distractor objects. We compute the exact expected
+    # accuracy over all possible distractor sets.
+    object_2way_top1 = expected_nway_top1(
+        object_logits,
+        object_targets,
+        n_way=2,
+    )
+    object_10way_top1 = expected_nway_top1(
+        object_logits,
+        object_targets,
+        n_way=10,
+    )
+
     # -------------------------------------------------------------
     # Category retrieval over the full category vocabulary.
     # -------------------------------------------------------------
@@ -879,6 +988,8 @@ def evaluate_retrieval(
     return {
         "object_ce": object_ce,
         "category_ce": category_ce,
+        "object_2way_top1": object_2way_top1,
+        "object_10way_top1": object_10way_top1,
         "object_top1": object_acc[1],
         "object_top5": object_acc[5],
         "category_top1": category_acc[1],
@@ -1411,6 +1522,8 @@ def main():
                 "Train_Batch_Retrieval_Acc",
                 "Val_Full_Object_CE",
                 "Val_Full_Category_CE",
+                "Val_2Way_Top1",
+                "Val_10Way_Top1",
                 "Val_Object_Top1",
                 "Val_Object_Top5",
                 "Val_Category_Top1",
@@ -1524,6 +1637,8 @@ def main():
             f"TrainBatchAcc={train_acc:.4f} | "
             f"ValObjCE={val_object_ce:.4f} | "
             f"ValCatCE={val_category_ce:.4f} | "
+            f"Val2Way={val_metrics['object_2way_top1']:.4f} | "
+            f"Val10Way={val_metrics['object_10way_top1']:.4f} | "
             f"ValObj@1={val_metrics['object_top1']:.4f} | "
             f"ValObj@5={val_metrics['object_top5']:.4f} | "
             f"ValCat@1={val_metrics['category_top1']:.4f} | "
@@ -1543,6 +1658,8 @@ def main():
                     f"{train_acc:.8f}",
                     f"{val_object_ce:.8f}",
                     f"{val_category_ce:.8f}",
+                    f"{val_metrics['object_2way_top1']:.8f}",
+                    f"{val_metrics['object_10way_top1']:.8f}",
                     f"{val_metrics['object_top1']:.8f}",
                     f"{val_metrics['object_top5']:.8f}",
                     f"{val_metrics['category_top1']:.8f}",
@@ -1641,6 +1758,8 @@ def main():
     print(
         "[TRAIN full] "
         f"ObjCE={best_train_metrics['object_ce']:.4f} "
+        f"2Way={best_train_metrics['object_2way_top1']:.4%} "
+        f"10Way={best_train_metrics['object_10way_top1']:.4%} "
         f"Obj@1={best_train_metrics['object_top1']:.4%} "
         f"Obj@5={best_train_metrics['object_top5']:.4%} "
         f"Cat@1={best_train_metrics['category_top1']:.4%} "
@@ -1653,6 +1772,8 @@ def main():
         f"epoch={best['epoch']} "
         f"ObjCE={best_val_metrics['object_ce']:.4f} "
         f"CatCE={best_val_metrics['category_ce']:.4f} "
+        f"2Way={best_val_metrics['object_2way_top1']:.4%} "
+        f"10Way={best_val_metrics['object_10way_top1']:.4%} "
         f"Obj@1={best_val_metrics['object_top1']:.4%} "
         f"Obj@5={best_val_metrics['object_top5']:.4%} "
         f"Cat@1={best_val_metrics['category_top1']:.4%} "
@@ -1676,6 +1797,8 @@ def main():
             "[TEST final] "
             f"ObjCE={test_metrics['object_ce']:.4f} "
             f"CatCE={test_metrics['category_ce']:.4f} "
+            f"2Way={test_metrics['object_2way_top1']:.4%} "
+            f"10Way={test_metrics['object_10way_top1']:.4%} "
             f"Obj@1={test_metrics['object_top1']:.4%} "
             f"Obj@5={test_metrics['object_top5']:.4%} "
             f"Cat@1={test_metrics['category_top1']:.4%} "

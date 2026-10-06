@@ -4,9 +4,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import mne
-import sys
-import open3d as o3d
+# import mne
+# import sys
+# import open3d as o3d
 import pandas as pd
 from PIL import Image
 

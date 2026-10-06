@@ -15,6 +15,8 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from huggingface_hub import hf_hub_download
+
 # Static EEG semantic decoder trained by train_static_eeg_mlp.py.
 from train_static_eeg_mlp import (
     StaticMLP,
@@ -54,12 +56,10 @@ from src.data.egg_dataset_ext_el import (
 DEFAULT_SDXL_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 DEFAULT_ZERO123_MODEL = "sudo-ai/zero123plus-v1.1"
 DEFAULT_SDXL_NEGATIVE_PROMPT = (
-    "multiple objects, duplicate object, extra object, "
-    "cluttered background, complex background, "
+    "multiple objects, duplicate object, extra object, group, collection, cluster, "
+    "cluttered background, complex background, perspective distortion, "
     "text, watermark, logo, cropped object, partial object, "
-    "deformed geometry, distorted geometry, "
-    "incorrect proportions, inconsistent shape, "
-    "blurry, noisy, low quality"
+    "deformed geometry, distorted geometry, blurry, noisy, low quality"
 )
 
 TRIAL_SUFFIX_PATTERN = re.compile(r"__trial\d+$", flags=re.IGNORECASE)
@@ -70,12 +70,12 @@ TRIAL_SUFFIX_PATTERN = re.compile(r"__trial\d+$", flags=re.IGNORECASE)
 # ============================================================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="EEG -> MLP Decoder -> SDXL (Base Image) -> Zero123++ (6-View 3D) Pipeline"
+        description="EEG -> MLP Decoder -> SDXL + Auto-Downloaded LoRA -> Zero123++ Pipeline"
     )
 
     parser.add_argument("--semantic_ckpt", type=str, required=True)
     parser.add_argument("--data_path", type=str, default="/data/jionkim/neuro_3D/")
-    parser.add_argument("--out_dir", type=str, default="./inference_results_zero123")
+    parser.add_argument("--out_dir", type=str, default="./inference_results_sdxl_lora_download")
     parser.add_argument("--sub_id", type=str, default="sub01")
     parser.add_argument("--rendered_view_path", type=str, default="/data/jionkim/neuro_3D/eeg3d_training")
     parser.add_argument("--batchsize", type=int, default=2)
@@ -91,10 +91,15 @@ def parse_args():
     parser.add_argument("--bg_clean_alpha_threshold", type=int, default=8)
     parser.add_argument("--bg_clean_binary_alpha", action="store_true")
 
-    # SDXL (Base Image Generation)
+    # SDXL & LoRA Hub Download Options
     parser.add_argument("--sdxl_model", type=str, default=DEFAULT_SDXL_MODEL)
+    parser.add_argument("--sdxl_lora_path", type=str, default="", help="Local path to LoRA weights (optional)")
+    parser.add_argument("--sdxl_lora_repo_id", type=str, default="",
+                        help="Hugging Face Hub Repo ID for LoRA (e.g., username/repo-name)")
+    parser.add_argument("--sdxl_lora_filename", type=str, default="", help="Filename of the LoRA weights on HF Hub")
+    parser.add_argument("--sdxl_lora_scale", type=float, default=0.7, help="Scale for SDXL LoRA")
     parser.add_argument("--sdxl_steps", type=int, default=30)
-    parser.add_argument("--sdxl_cfg", type=float, default=7.5)
+    parser.add_argument("--sdxl_cfg", type=float, default=6.0)
     parser.add_argument("--sdxl_negative_prompt", type=str, default=DEFAULT_SDXL_NEGATIVE_PROMPT)
 
     # Zero123++ (Multi-view Generation)
@@ -287,11 +292,11 @@ def save_six_individual_views(grid_tensor, output_dir):
 
 
 # ============================================================
-# SDXL & Zero123++ Pipelines
+# SDXL (with Auto-downloaded LoRA) & Zero123++ Pipelines
 # ============================================================
 def load_pipelines(args, device):
     print("\n" + "=" * 70)
-    print("[SDXL (Base Image) + Zero123++ (6-View) Pipelines]")
+    print("[SDXL + LoRA (Auto-downloaded) + Zero123++]")
     print("SDXL Model     :", args.sdxl_model)
     print("Zero123++ Model:", args.zero123_model)
     print("=" * 70)
@@ -302,13 +307,31 @@ def load_pipelines(args, device):
     sdxl_pipe = StableDiffusionXLPipeline.from_pretrained(
         args.sdxl_model, torch_dtype=dtype, use_safetensors=True
     )
+
+    # 2. LoRA 자동 다운로드 및 적용 처리
+    lora_path_to_load = args.sdxl_lora_path
+    if args.sdxl_lora_repo_id and args.sdxl_lora_filename:
+        print(f"[*] Downloading LoRA from Hugging Face Hub: {args.sdxl_lora_repo_id} ({args.sdxl_lora_filename})...")
+        downloaded_path = hf_hub_download(
+            repo_id=args.sdxl_lora_repo_id,
+            filename=args.sdxl_lora_filename
+        )
+        lora_path_to_load = downloaded_path
+        print(f"[*] LoRA successfully downloaded to: {lora_path_to_load}")
+
+    if lora_path_to_load:
+        if not os.path.isfile(lora_path_to_load):
+            raise FileNotFoundError(f"LoRA weights file not found at: {lora_path_to_load}")
+        sdxl_pipe.load_lora_weights(lora_path_to_load)
+        print(f"[*] Loaded SDXL LoRA weights with scale {args.sdxl_lora_scale}")
+
     if args.cpu_offload and device.type == "cuda":
         sdxl_pipe.enable_model_cpu_offload()
     else:
         sdxl_pipe = sdxl_pipe.to(device)
     sdxl_pipe.set_progress_bar_config(disable=True)
 
-    # 2. Zero123++ Pipeline
+    # 3. Zero123++ Pipeline
     zero123_pipe = DiffusionPipeline.from_pretrained(
         args.zero123_model,
         custom_pipeline="sudo-ai/zero123plus-pipeline",
@@ -328,12 +351,9 @@ def load_pipelines(args, device):
 
 @torch.inference_mode()
 def run_sdxl_base_image(pipe, prompt, args, seed):
-    # 단일 객체 생성을 위한 프롬프트 엔지니어링 (Zero123++ 입력 최적화)
-    # effective_prompt = f"a 3D render of a {prompt}, perfectly centered, isolated on a solid white background, highly detailed"
-
-    # 오직 하나의 객체만 생성하도록 강제하는 키워드(A single, only one object) 추가 및 원근감 제거
+    # 단일 객체 외에 다른 요소가 섞이지 않도록 프롬프트 정밀 제어
     effective_prompt = (
-        f"A single, isolated {prompt}, only one object, "
+        f"A standalone solo object, a single isolated {prompt}, only one object, "
         "orthographic side profile view, flat shading, strict symmetry, "
         "zero perspective distortion, perfectly centered, "
         "isolated on a pure solid white background, high quality 3D asset"
@@ -342,20 +362,23 @@ def run_sdxl_base_image(pipe, prompt, args, seed):
     generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu")
     generator.manual_seed(int(seed))
 
+    has_lora = bool(args.sdxl_lora_path or (args.sdxl_lora_repo_id and args.sdxl_lora_filename))
+    cross_attention_kwargs = {"scale": args.sdxl_lora_scale} if has_lora else None
+
     result = pipe(
         prompt=effective_prompt,
         negative_prompt=args.sdxl_negative_prompt,
-        height=1024,  # 정사각형 단일 이미지
+        height=1024,
         width=1024,
         num_inference_steps=args.sdxl_steps,
         guidance_scale=args.sdxl_cfg,
+        cross_attention_kwargs=cross_attention_kwargs,
         generator=generator,
     )
     return result.images[0].convert("RGB")
 
 
 def prepare_zero123_input(image: Image.Image, rembg_session) -> Image.Image:
-    # Zero123++는 피사체가 중앙에 위치하고 배경이 회색(127,127,127)인 이미지를 선호합니다.
     rgba = rembg.remove(image, session=rembg_session, alpha_matting=False)
     if not isinstance(rgba, Image.Image):
         rgba = Image.open(rgba)
@@ -371,7 +394,6 @@ def run_zero123plus(pipe, image: Image.Image, args, seed):
     generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu")
     generator.manual_seed(int(seed))
 
-    # Zero123++는 자동으로 3x2 (960x640) 그리드를 출력합니다.
     result = pipe(
         image,
         num_inference_steps=args.zero123_steps,
@@ -443,7 +465,7 @@ def main():
     evaluation_records = []
     seen_sample_ids = set()
 
-    for batch_idx, batch in enumerate(tqdm(test_loader, desc="EEG -> SDXL -> Zero123++")):
+    for batch_idx, batch in enumerate(tqdm(test_loader, desc="EEG -> SDXL+LoRA(Hub) -> Zero123++")):
         batch_size = len(batch["cls_index"])
 
         semantic_features = static_eeg_batch_features(
@@ -482,7 +504,7 @@ def main():
             sdxl_prompt = derive_prompt_from_sample_id(semantic_prompt_id)
             sample_seed = args.seed + img_idx
 
-            # 1. SDXL 기반 정면 단일 이미지 생성 (1024x1024)
+            # 1. SDXL + 다운로드된 LoRA 기반 단일 이미지 생성
             base_image_pil = run_sdxl_base_image(sdxl_pipe, sdxl_prompt, args, sample_seed)
             base_image_path = os.path.join(base_root, f"{sample_id}_base.png")
             base_image_pil.save(base_image_path)
@@ -490,7 +512,7 @@ def main():
             # 2. 배경 제거 및 Zero123++ 입력용 회색 배경 합성
             cond_image_pil = prepare_zero123_input(base_image_pil, rembg_session)
 
-            # 3. Zero123++ 구동 (단일 이미지 -> 3x2 다중 시점 그리드)
+            # 3. Zero123++ 구동
             grid_pil = run_zero123plus(zero123_pipe, cond_image_pil, args, sample_seed)
 
             # 4. 그리드 분할 및 최종 배경 제거
