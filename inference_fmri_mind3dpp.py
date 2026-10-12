@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MinD-3D++ fMRI inference matched to train_fmri_clip_align_mind3dpp.py
+MinD-3D++ fMRI inference with E3-compatible object identification metrics.
 
 Pipeline
 --------
@@ -10,6 +10,8 @@ MinD-3D++ fMRI (.npy)
        * train_caption: nearest caption among TRAIN UIDs only (default)
        * category: nearest training-category prompt
        * hybrid: predicted category + nearest TRAIN caption
+    -> Embedding-space object identification evaluation (GT captions;
+       held-out split only; evaluation-only, never generation prompting)
     -> SDXL
     -> rembg
     -> Zero123++
@@ -23,6 +25,13 @@ Important
   checkpoint directory's split.json).
 - fMRI frame selection and normalization are read from the training checkpoint
   config to keep train/inference preprocessing identical.
+- Object 2-way/10-way uses the SAME expected-N-way counting method as
+  train_fmri_clip_align_mind3dpp_dual.py, not the paper's rendered-image metric.
+- split.json is REQUIRED to prevent validation objects from entering the
+  train-caption generation bank.
+- For reproducibility, the N-way candidate pool is the complete requested
+  evaluation split (271 validation or 432 official test objects), even if only
+  a subset of queries is processed with --max_samples / --start_index.
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ import csv
 import gc
 import io
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -113,10 +123,13 @@ def read_object_list(path: Path) -> List[ObjectRecord]:
             if not line or line.startswith("#"):
                 continue
 
-            parts = line.split()
-            if len(parts) < 2 and "," in line:
+            # Match the E3 training parser: commas must take precedence over
+            # whitespace, otherwise "chair, 000-035/uid.glb" becomes "chair,".
+            if "," in line:
                 parts = next(csv.reader([line]))
                 parts = [p.strip() for p in parts if p.strip()]
+            else:
+                parts = line.split()
 
             if len(parts) < 2:
                 raise ValueError(
@@ -135,6 +148,8 @@ def read_object_list(path: Path) -> List[ObjectRecord]:
                     continue
 
             uid = normalize_uid(object_path)
+            if not uid:
+                raise ValueError(f"{path}:{line_no}: empty UID")
             records.append(
                 ObjectRecord(
                     category=category,
@@ -147,6 +162,141 @@ def read_object_list(path: Path) -> List[ObjectRecord]:
         raise ValueError(f"No records found in {path}")
 
     return records
+
+
+def build_eval_object_caption_candidates(
+    records: Sequence[ObjectRecord],
+    caption_map: Dict[str, str],
+    text_source: str = "caption",
+):
+    """Reference candidate pool for *evaluation*, NOT generation.
+
+    Mirrors training `build_texts()` with the saved text_source option:
+    captions with category fallback, or category prompts for all objects.
+    The caller must pass ALL records of the requested split, not only queried
+    records, and train-caption generation must use a different candidate bank.
+    """
+    if text_source not in ("caption", "category"):
+        raise ValueError(f"Unexpected checkpoint text_source: {text_source!r}")
+    candidates = []
+    texts = []
+    seen = set()
+    missing = []
+    for r in records:
+        if r.uid in seen:
+            continue
+        seen.add(r.uid)
+        candidates.append(r)
+        caption = caption_map.get(r.uid) if text_source == "caption" else None
+        if not caption:
+            if text_source == "caption":
+                missing.append(r.uid)
+            caption = f"a 3D object of {pretty_category(r.category)}"
+        texts.append(caption)
+
+    if not candidates:
+        raise RuntimeError("Object identification candidate bank is empty")
+    if missing:
+        print(
+            f"[Warning] {len(missing)} evaluation UIDs lack Cap3D captions; "
+            "using E3 training's category-prompt fallback. Examples: "
+            f"{missing[:5]}", flush=True,
+        )
+    return candidates, texts
+
+
+def expected_nway_top1_per_query(
+    similarities: torch.Tensor,
+    targets: torch.Tensor,
+    n_way: int,
+) -> np.ndarray:
+    """Exact E3 expected N-way accuracy per query (uniform distractors).
+
+    Every candidate set contains the ground-truth object and `n_way - 1`
+    distinct distractors drawn uniformly from the OTHER objects in the same
+    evaluation split. This computes the expectation over all candidate sets
+    rather than randomly sampling candidate sets. Equal scores are resolved
+    by uniform random tie-breaking in expectation.
+
+    The counting logic is deliberately kept identical to E3 training's
+    `expected_nway_top1` to make validation results comparable.
+    """
+    if similarities.ndim != 2:
+        raise ValueError(f"Expected similarities [N,C], got {tuple(similarities.shape)}")
+    num_queries, num_candidates = similarities.shape
+    if targets.ndim != 1 or len(targets) != num_queries:
+        raise ValueError("Object target count does not match the number of queries")
+    if not (2 <= n_way <= num_candidates):
+        raise ValueError(f"n_way must be in [2,{num_candidates}], got {n_way}")
+
+    sims = similarities.detach().cpu().double()
+    targets = targets.detach().cpu().long()
+    k = n_way - 1
+    denom = math.comb(num_candidates - 1, k)
+    probs = []
+
+    for i in range(num_queries):
+        target_idx = int(targets[i].item())
+        if not (0 <= target_idx < num_candidates):
+            raise ValueError(f"Target index out of range: {target_idx}")
+        pos = float(sims[i, target_idx].item())
+        row = sims[i]
+        other_mask = torch.ones(num_candidates, dtype=torch.bool)
+        other_mask[target_idx] = False
+        others = row[other_mask]
+
+        tol = 1e-12
+        higher = int((others > pos + tol).sum().item())
+        equal = int((torch.abs(others - pos) <= tol).sum().item())
+        lower = (num_candidates - 1) - higher - equal
+
+        p_win_num = 0.0
+        j_min = max(0, k - lower)
+        j_max = min(equal, k)
+        for j in range(j_min, j_max + 1):
+            remaining = k - j
+            if remaining > lower:
+                continue
+            ways = math.comb(equal, j) * math.comb(lower, remaining)
+            p_win_num += ways / (j + 1)
+        probs.append(p_win_num / denom)
+
+    return np.asarray(probs, dtype=np.float64)
+
+
+def compute_object_identification_metrics(
+    object_logits: torch.Tensor,
+    object_targets: torch.Tensor,
+):
+    """Return split-level metrics plus per-query N-way expectations and ranks."""
+    logits = object_logits.detach().cpu().float()
+    targets = object_targets.detach().cpu().long()
+    if not torch.isfinite(logits).all():
+        raise ValueError("Object logits contain non-finite values")
+
+    n, c = logits.shape
+    if n == 0 or c < 2:
+        raise ValueError("Object identification requires queries and >=2 candidates")
+
+    ranks = (torch.argsort(logits, dim=1, descending=True)
+             == targets[:, None]).nonzero(as_tuple=False)
+    if ranks.shape[0] != n:
+        raise RuntimeError("Every evaluation query must have exactly one positive UID")
+    ranks = (ranks[:, 1] + 1).cpu().numpy()
+
+    p2 = expected_nway_top1_per_query(logits, targets, n_way=2)
+    p10 = (expected_nway_top1_per_query(logits, targets, n_way=10)
+           if c >= 10 else None)
+    metrics = {
+        "object_ce": float(F.cross_entropy(logits, targets).item()),
+        "object_top1": float((ranks == 1).mean()),
+        "object_top5": float((ranks <= min(5, c)).mean()),
+        "object_2way_top1": float(np.mean(p2)),
+        "object_10way_top1": float(np.mean(p10)) if p10 is not None else None,
+        "num_object_candidates": int(c),
+        "num_queries": int(n),
+    }
+    return metrics, ranks, p2, p10
 
 
 def load_caption_map(csv_path: Path) -> Dict[str, str]:
@@ -507,23 +657,38 @@ def build_train_caption_candidates(
     caption_map: Dict[str, str],
     split_json,
 ):
-    if split_json is not None and split_json.get("train_uids"):
-        allowed = set(split_json["train_uids"])
-        source = "split.json train_uids"
-    else:
-        allowed = {r.uid for r in full_train_records}
-        source = "all train_list UIDs"
+    # Fail closed: fMRI E3 uses UID-level train/val splitting within train_list.
+    # Falling back to the whole train_list would leak held-out validation UIDs
+    # into the generation prompt bank.
+    if not split_json or not split_json.get("train_uids"):
+        raise ValueError("A non-empty split.json train_uids list is required")
+    allowed = set(split_json["train_uids"])
+    available = {r.uid for r in full_train_records}
+    missing_uids = allowed - available
+    if missing_uids:
+        raise ValueError(
+            "split.json includes training UIDs absent from train_list.txt: "
+            f"{sorted(missing_uids)[:5]}"
+        )
 
-    records = [
-        r for r in full_train_records
-        if r.uid in allowed and r.uid in caption_map
-    ]
-
+    records = [r for r in full_train_records if r.uid in allowed]
     if not records:
         raise RuntimeError("No train-caption candidates were found")
 
-    texts = [caption_map[r.uid] for r in records]
-    return records, texts, source
+    # Match the E3 training text bank: missing Cap3D captions fall back to
+    # category prompts, without ever adding non-training UIDs.
+    texts = [
+        caption_map.get(r.uid) or f"a 3D object of {pretty_category(r.category)}"
+        for r in records
+    ]
+    missing_captions = sum(r.uid not in caption_map for r in records)
+    if missing_captions:
+        print(
+            f"[Warning] {missing_captions} train UIDs lack Cap3D captions; "
+            "using category prompts as in E3 training.",
+            flush=True,
+        )
+    return records, texts, "split.json train_uids"
 
 
 def build_category_candidates(
@@ -946,6 +1111,13 @@ def parse_args():
         action="store_true",
         help="Only decode fMRI semantics and write CSV; skip SDXL/Zero123++.",
     )
+    p.add_argument(
+        "--no_object_metrics", action="store_true",
+        help=(
+            "Disable GT-caption object identification (default: enabled). "
+            "Evaluation GT captions are never used as generation prompts."
+        ),
+    )
 
     p.add_argument(
         "--out_dir",
@@ -1119,17 +1291,21 @@ def main():
         split_json_path
     )
 
-    if split_json is not None:
-        print("[*] Using split metadata:", split_json_path)
-    else:
-        print(
-            "[Warning] split.json not found. "
-            "train_caption candidates will use all train_list UIDs."
+    if split_json is None:
+        raise FileNotFoundError(
+            "The E3 training split.json is required to restrict generation "
+            "caption retrieval to training UIDs only. Place split.json next "
+            "to --semantic_ckpt or pass --split_json explicitly: "
+            f"{split_json_path}"
         )
+    if not split_json.get("train_uids"):
+        raise ValueError("split.json must contain a non-empty train_uids list")
+    print("[*] Using split metadata:", split_json_path)
 
-    # Select inference records.
+    # Select evaluation split. Keep the COMPLETE split for evaluation object
+    # candidates even if only a subset of fMRI queries is being generated.
     if args.eval_split == "test":
-        eval_records = test_records
+        full_eval_records = test_records
 
     elif args.eval_split in ("train", "val"):
         if split_json is None:
@@ -1144,10 +1320,14 @@ def main():
         )
         uid_set = set(split_json[key])
 
-        eval_records = [
+        full_eval_records = [
             r for r in full_train_records
             if r.uid in uid_set
         ]
+        if {r.uid for r in full_eval_records} != uid_set:
+            raise RuntimeError(
+                f"split.json {key} and train_list.txt contain different UID sets"
+            )
 
     else:
         raise ValueError(args.eval_split)
@@ -1155,7 +1335,7 @@ def main():
     if args.start_index < 0:
         raise ValueError("--start_index must be >= 0")
 
-    eval_records = eval_records[
+    eval_records = full_eval_records[
         args.start_index:
     ]
 
@@ -1166,6 +1346,21 @@ def main():
 
     if not eval_records:
         raise RuntimeError("No inference records remain")
+
+    if split_json is not None:
+        train_uid_set = set(split_json.get("train_uids", []))
+        val_uid_set = set(split_json.get("val_uids", []))
+        test_uid_set = {r.uid for r in test_records}
+        if train_uid_set & val_uid_set:
+            raise RuntimeError("train and validation UID lists overlap")
+        if (train_uid_set | val_uid_set) & test_uid_set:
+            raise RuntimeError("Official test UIDs overlap train/val split")
+
+    print(
+        f"[*] fMRI evaluation split={args.eval_split}: "
+        f"queries={len(eval_records)} / full_split={len(full_eval_records)}",
+        flush=True,
+    )
 
     # Same deterministic evaluation preprocessing as training validation/test.
     dataset = FMRIEvalDataset(
@@ -1217,7 +1412,9 @@ def main():
 
     category_names, category_prompts = (
         build_category_candidates(
-            full_train_records
+            # Training constructs its global category vocabulary from BOTH
+            # train_list and test_list for stable category indices/prompts.
+            full_train_records + test_records
         )
     )
     category_embeddings = encode_texts(
@@ -1243,6 +1440,49 @@ def main():
         tokenizer,
         device,
     )
+
+    # This is deliberately a SECOND, evaluation-only bank.  The GT caption of
+    # an unseen val/test UID MUST NOT enter train_caption_embeddings or the
+    # prompt branch below.  Metrics use all distinct UIDs of the requested
+    # split, exactly like evaluate_retrieval() in E3 training.
+    object_eval_candidates = []
+    object_eval_embeddings = None
+    object_eval_uid_to_index = {}
+    if not args.no_object_metrics:
+        object_eval_candidates, object_eval_texts = (
+            build_eval_object_caption_candidates(
+                full_eval_records, caption_map,
+                text_source=str(config.get("text_source", "caption")),
+            )
+        )
+        object_eval_uid_to_index = {
+            r.uid: i for i, r in enumerate(object_eval_candidates)
+        }
+        missing = [r.uid for r in eval_records if r.uid not in object_eval_uid_to_index]
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} evaluation query UIDs are absent from the "
+                f"{args.eval_split} object-candidate bank: {missing[:5]}"
+            )
+        # Sanity check: held-out GT captions must not leak into prompt bank.
+        if args.eval_split in ("val", "test"):
+            candidate_uids = {r.uid for r in object_eval_candidates}
+            prompt_uids = {r.uid for r in train_caption_records}
+            overlapping = candidate_uids & prompt_uids
+            if overlapping:
+                raise RuntimeError(
+                    "Evaluation objects entered the generation prompt bank: "
+                    f"{sorted(overlapping)[:5]}. Check split.json."
+                )
+        object_eval_embeddings = encode_texts(
+            object_eval_texts, clip_model, tokenizer, device,
+        )
+        print(
+            f"[*] Object {args.eval_split} evaluation: "
+            f"{len(object_eval_candidates)} distinct GT-caption candidates "
+            "(metrics ONLY; never used for generation)",
+            flush=True,
+        )
 
     print(
         f"[*] Train-caption candidate pool: "
@@ -1277,6 +1517,10 @@ def main():
     records_out = []
     category_correct = 0
     category_top5_correct = 0
+    train_caption_category_correct = 0
+    train_caption_category_top5_correct = 0
+    object_logits_rows = []
+    object_target_rows = []
     total = 0
     global_idx = args.start_index
 
@@ -1284,6 +1528,8 @@ def main():
     train_caption_embeddings = (
         train_caption_embeddings.to(device)
     )
+    if object_eval_embeddings is not None:
+        object_eval_embeddings = object_eval_embeddings.to(device)
 
     for batch in tqdm(
         loader,
@@ -1313,6 +1559,15 @@ def main():
             * brain
             @ train_caption_embeddings.T
         )
+        if object_eval_embeddings is not None:
+            eval_object_logits = (
+                scale * (brain @ object_eval_embeddings.T)
+            )
+            object_logits_rows.append(eval_object_logits.float().cpu())
+            object_target_rows.extend(
+                object_eval_uid_to_index[str(uid)]
+                for uid in batch["uid"]
+            )
 
         cat_top5 = (
             category_logits
@@ -1401,9 +1656,21 @@ def main():
             is_category_top5 = int(
                 true_category in top5_categories
             )
+            top5_caption_categories = [
+                train_caption_records[int(j)].category
+                for j in cap_top5[i]
+            ]
+            is_train_caption_category_correct = int(
+                pred_caption_record.category == true_category
+            )
+            is_train_caption_category_top5 = int(
+                true_category in top5_caption_categories
+            )
 
             category_correct += is_category_correct
             category_top5_correct += is_category_top5
+            train_caption_category_correct += is_train_caption_category_correct
+            train_caption_category_top5_correct += is_train_caption_category_top5
             total += 1
 
             if args.prompt_source == "category":
@@ -1519,6 +1786,8 @@ def main():
                     ),
                     "category_correct": is_category_correct,
                     "category_top5_correct": is_category_top5,
+                    "train_caption_category_correct": is_train_caption_category_correct,
+                    "train_caption_category_top5_correct": is_train_caption_category_top5,
                     "pred_train_uid": pred_caption_record.uid,
                     "pred_train_category": pred_caption_record.category,
                     "pred_train_caption": pred_caption,
@@ -1537,6 +1806,25 @@ def main():
             )
 
             global_idx += 1
+
+    # Object identification uses ONLY the held-out GT candidate bank, not
+    # train-caption generation results.  It is therefore meaningful even when
+    # the generation prompt was retrieved from a disjoint training UID.
+    object_metrics = None
+    if object_eval_embeddings is not None:
+        object_logits = torch.cat(object_logits_rows, dim=0)
+        object_targets = torch.tensor(object_target_rows, dtype=torch.long)
+        object_metrics, object_ranks, object_p2, object_p10 = (
+            compute_object_identification_metrics(object_logits, object_targets)
+        )
+        if len(records_out) != len(object_ranks):
+            raise RuntimeError("Object metric rows do not match saved inference records")
+        for i, record in enumerate(records_out):
+            record["object_gt_caption_rank"] = int(object_ranks[i])
+            record["object_2way_expected"] = float(object_p2[i])
+            record["object_10way_expected"] = (
+                float(object_p10[i]) if object_p10 is not None else None
+            )
 
     csv_path = out_dir / "inference_records.csv"
 
@@ -1575,6 +1863,21 @@ def main():
             if total
             else None
         ),
+        "train_caption_category_top1": (
+            train_caption_category_correct / total if total else None
+        ),
+        "train_caption_category_top5": (
+            train_caption_category_top5_correct / total if total else None
+        ),
+        "object_metrics": object_metrics,
+        "object_metric_definition": (
+            "embedding-space exact expected N-way identification; "
+            "fMRI semantic embedding vs GT Cap3D caption embedding, "
+            "positive + uniformly selected distinct negative UIDs "
+            "from the COMPLETE evaluation split; reference captions "
+            "are never generation candidates"
+            if object_metrics is not None else None
+        ),
         "num_train_caption_candidates": len(
             train_caption_records
         ),
@@ -1600,6 +1903,36 @@ def main():
     print("=" * 72)
     print("[INFERENCE COMPLETE]")
     print("samples        :", total)
+    print("eval split     :", args.eval_split)
+    if object_metrics is not None:
+        print(
+            "object GT pool :",
+            object_metrics["num_object_candidates"],
+            f"({args.eval_split} UIDs; eval only)",
+        )
+        print(
+            "object 2-way  :",
+            f"{object_metrics['object_2way_top1']:.4%}",
+            "(exact expectation)",
+        )
+        print(
+            "object 10-way :",
+            f"{object_metrics['object_10way_top1']:.4%}"
+            if object_metrics["object_10way_top1"] is not None else "N/A",
+            "(exact expectation)",
+        )
+        print(
+            "object Top-1  :",
+            f"{object_metrics['object_top1']:.4%}",
+        )
+        print(
+            "object Top-5  :",
+            f"{object_metrics['object_top5']:.4%}",
+        )
+        print(
+            "object CE     :",
+            f"{object_metrics['object_ce']:.4f}",
+        )
     print(
         "category Top-1:",
         f"{category_correct / total:.4%}"
@@ -1608,6 +1941,16 @@ def main():
     print(
         "category Top-5:",
         f"{category_top5_correct / total:.4%}"
+        if total else "N/A",
+    )
+    print(
+        "train caption category Top-1:",
+        f"{train_caption_category_correct / total:.4%}"
+        if total else "N/A",
+    )
+    print(
+        "train caption category Top-5:",
+        f"{train_caption_category_top5_correct / total:.4%}"
         if total else "N/A",
     )
     print(
