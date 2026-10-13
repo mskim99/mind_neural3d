@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_ROOT="${DATA_ROOT:-/data/jionkim/mind3d++/fmri_objaverse}"
-VIS_ROOT="${VIS_ROOT:-/data/jionkim/mind3dpp_gt_views}"
+VIS_ROOT="${VIS_ROOT:-/data/jionkim/mind3d++/GTmeshes/objaverse/gt_views}"
 GT_ROOT="${GT_ROOT:-/data/jionkim/mind3d++/GTmeshes/objaverse/glbs}"
 E3_ROOT="${E3_ROOT:-/data/jionkim/mind_3d_output/fmri_dual_alignment}"
 OUT_ROOT="${OUT_ROOT:-/data/jionkim/mind_3d_output/fmri_classification_experiments}"
