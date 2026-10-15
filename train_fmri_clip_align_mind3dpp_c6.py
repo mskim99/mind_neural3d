@@ -2,7 +2,26 @@
 """
 Train an fMRI -> CLIP text aligner on the MinD-3D++ / fMRI-Objaverse dataset.
 
-This script is a replacement for the EEG-specific train_eeg_clip_align.py.
+Semantic-Visual Dual Alignment (E3) on top of the E1-B objective.
+Preserves original fMRI frame CNN/temporal encoder, semantic-text forward, split,
+and checkpoint['model'] key compatibility with inference_fmri_mind3dpp.py.
+Adds a visual head supervised by frozen multi-view GT CLIP image embeddings.
+Optional coarse 3D shape histogram regression uses TRAIN GT GLBs only for training.
+Validation GT teachers are used solely for diagnostic metrics, never gradients.
+
+Loss:
+  batch_nce_weight * symmetric_batch_NCE
+  + full_ce_weight * train_UID_full_object_CE
+  + category_ce_weight * train_category_CE
+
+Checkpoints (always saved):
+  fmri_clip_aligner_best_objce.pt : minimum validation full-object CE
+  fmri_clip_aligner_best_10way.pt : maximum validation 10-way accuracy
+  fmri_clip_aligner_best.pt       : legacy inference alias (CE by default)
+  fmri_clip_aligner_last.pt       : final epoch
+
+For complete 100-epoch curves, set --patience 0. Official test stays disabled.
+
 
 Expected fMRI-Objaverse root
 ----------------------------
@@ -20,10 +39,9 @@ Expected fMRI-Objaverse root
   train_list.txt
   test_list.txt
 
-The official MinD-3D++ fMRI-Objaverse loader stores each object's fMRI as
-<subject>/<uid>.npy. During training it randomly selects 6 fMRI frames;
-during evaluation it uses the middle 6 frames. This script follows that
-sampling rule.
+The baseline fMRI-Objaverse loader stores each object's fMRI as
+<subject>/<uid>.npy. C6 adds a train-only sampling ablation (random/center/uniform).
+Evaluation ALWAYS uses the middle 6 frames to match legacy E3 inference.
 
 The GLB files are not required for CLIP-text alignment. If --gt_mesh_root is
 provided, the script only validates that the object path from train/test list
@@ -81,6 +99,7 @@ reconstruction metric.
 import argparse
 import csv
 import json
+import hashlib
 import math
 import os
 import random
@@ -98,6 +117,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import open_clip
+from PIL import Image
 
 
 
@@ -154,13 +174,14 @@ def read_object_list(path: Path) -> List[ObjectRecord]:
             if not line or line.startswith("#"):
                 continue
 
-            # First try whitespace-separated official format.
-            parts = line.split()
-
-            # Also accept CSV-like list files.
-            if len(parts) < 2 and "," in line:
+            # Parse comma-delimited MinD-3D++ lines before whitespace splitting.
+            # E.g. "computer_monitor, 000-035/<uid>.glb" is otherwise parsed
+            # as category="computer_monitor," rather than "computer_monitor".
+            if "," in line:
                 parts = next(csv.reader([line]))
                 parts = [p.strip() for p in parts if p.strip()]
+            else:
+                parts = line.split()
 
             if len(parts) < 2:
                 raise ValueError(
@@ -381,7 +402,7 @@ class FMRIObjaverseDataset(Dataset):
     Each item = one (subject, object) pair.
 
     train_mode=True:
-      randomly choose num_frames from all fMRI frames.
+      C6-configurable random / center / uniform selection of num_frames.
 
     train_mode=False:
       use the middle num_frames, matching the official evaluation convention.
@@ -397,8 +418,13 @@ class FMRIObjaverseDataset(Dataset):
         train_mode: bool,
         num_frames: int = 6,
         fmri_norm: str = "none",
+        train_frame_sampling: str = "random",
         strict_files: bool = True,
+        visual_embeddings: Optional[Dict[str, torch.Tensor]] = None,
+        geometry_targets: Optional[Dict[str, torch.Tensor]] = None,
     ):
+        self.visual_embeddings = visual_embeddings
+        self.geometry_targets = geometry_targets
         self.data_root = Path(data_root)
         self.subjects = list(subjects)
         self.records = list(records)
@@ -407,6 +433,9 @@ class FMRIObjaverseDataset(Dataset):
         self.train_mode = bool(train_mode)
         self.num_frames = int(num_frames)
         self.fmri_norm = fmri_norm
+        self.train_frame_sampling = str(train_frame_sampling)
+        if self.train_frame_sampling not in ("random", "center", "uniform"):
+            raise ValueError("Unknown train_frame_sampling: " + self.train_frame_sampling)
 
         index = []
         missing = []
@@ -456,15 +485,21 @@ class FMRIObjaverseDataset(Dataset):
                 f"Need >= {self.num_frames} fMRI frames, got {n}"
             )
 
-        if self.train_mode:
-            ids = np.random.choice(
-                n, size=self.num_frames, replace=False
-            )
-            ids.sort()
-        else:
+        # Only the training sampler varies in the C6 ablation.
+        # Validation / test / deterministic train diagnostics always use center.
+        sampling = self.train_frame_sampling if self.train_mode else "center"
+        if sampling == "random":
+            ids = np.random.choice(n, size=self.num_frames, replace=False)
+            ids.sort()  # Preserve the chronological ordering (original E3 behavior).
+        elif sampling == "center":
             start = (n - self.num_frames) // 2
             ids = np.arange(start, start + self.num_frames)
-
+        elif sampling == "uniform":
+            ids = np.rint(np.linspace(0, n - 1, self.num_frames)).astype(np.int64)
+            if len(np.unique(ids)) != self.num_frames:
+                raise RuntimeError(f"Uniform frame sampling returned duplicates: {ids}")
+        else:
+            raise AssertionError(sampling)
         return fmri[ids]
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
@@ -494,7 +529,7 @@ class FMRIObjaverseDataset(Dataset):
         )
         fmri = self._normalize(fmri)
 
-        return {
+        output = {
             "fmri": fmri,  # [F,H,W]
             "text_embedding": self.text_embeddings[record.uid].clone(),
             "uid": record.uid,
@@ -505,6 +540,11 @@ class FMRIObjaverseDataset(Dataset):
             "subject_index": torch.tensor(subject_idx, dtype=torch.long),
             "record_index": torch.tensor(record_idx, dtype=torch.long),
         }
+        if self.visual_embeddings is not None:
+            output["visual_embedding"] = self.visual_embeddings[record.uid]
+        if self.geometry_targets is not None:
+            output["geometry_target"] = self.geometry_targets[record.uid]
+        return output
 
 
 # -----------------------------------------------------------------------------
@@ -608,7 +648,7 @@ class FMRIClipAligner(nn.Module):
             torch.ones([]) * math.log(1.0 / 0.07)
         )
 
-    def forward(self, fmri):
+    def encode_pooled(self, fmri):
         # fmri: [B,F,H,W]
         if fmri.ndim != 4:
             raise ValueError(
@@ -632,8 +672,55 @@ class FMRIClipAligner(nn.Module):
         pooled, _ = self.pool_attn(q, x, x, need_weights=False)
         pooled = pooled[:, 0]
 
-        features = self.net(pooled)
-        return F.normalize(features, dim=-1)
+        return pooled
+
+    def forward(self, fmri):
+        # Identical semantic embedding and state_dict keys to E1-B.
+        return F.normalize(self.net(self.encode_pooled(fmri)), dim=-1)
+
+
+class DualFMRIClipAligner(FMRIClipAligner):
+    """Shared fMRI features with separate semantic and visual predictions.
+
+    Inference forward() remains the original semantic CLIP embedding.
+    The visual and optional geometry heads are for auxiliary supervision.
+    """
+    def __init__(self, *args, visual_hidden_dim=512, geometry_dim=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        d = self.pos_embed.shape[-1]
+        clip_dim = self.net[-1].out_features
+        self.visual_net = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, visual_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(kwargs.get("dropout", 0.2)),
+            nn.Linear(visual_hidden_dim, clip_dim),
+        )
+        self.visual_logit_scale = nn.Parameter(torch.ones([]) * math.log(1.0 / 0.07))
+        self.geometry_head = (
+            nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 256), nn.GELU(),
+                          nn.Linear(256, geometry_dim), nn.Sigmoid())
+            if geometry_dim > 0 else None
+        )
+
+    def forward_dual(self, fmri):
+        pooled = self.encode_pooled(fmri)
+        z_text = F.normalize(self.net(pooled), dim=-1)
+        z_visual = F.normalize(self.visual_net(pooled), dim=-1)
+        z_geometry = self.geometry_head(pooled) if self.geometry_head is not None else None
+        return z_text, z_visual, z_geometry
+
+
+def semantic_only_state_dict(model):
+    """Exact legacy FMRIClipAligner keys for inference_fmri_mind3dpp.py."""
+    return {k: v for k, v in model.state_dict().items()
+            if not (k.startswith("visual_net.") or k.startswith("geometry_head.")
+                    or k == "visual_logit_scale")}
+
+
+def checkpoint_state(model):
+    return {"model": semantic_only_state_dict(model),
+            "dual_model": model.state_dict()}
 
 
 # -----------------------------------------------------------------------------
@@ -742,6 +829,106 @@ def symmetric_multi_positive_clip_loss(
         retrieval_acc = top1_positive.float().mean()
 
     return 0.5 * (loss_b2t + loss_t2b), retrieval_acc
+
+
+# -----------------------------------------------------------------------------
+# E1: full-training-candidate object CE + category CE
+# -----------------------------------------------------------------------------
+
+def prepare_e1_candidate_banks(
+    train_records: Sequence[ObjectRecord],
+    text_embeddings: Dict[str, torch.Tensor],
+    category_names: Sequence[str],
+    category_embeddings: torch.Tensor,
+    device,
+):
+    """Build frozen banks from TRAIN records only (never val/test objects).
+
+    Repeated objects across subjects share the same positive UID index.
+    Category negatives are also restricted to categories represented in TRAIN.
+    """
+    unique_uids = list(dict.fromkeys(r.uid for r in train_records))
+    if not unique_uids:
+        raise ValueError("E1 training object bank is empty")
+    uid_to_index = {uid: i for i, uid in enumerate(unique_uids)}
+    object_bank = torch.stack(
+        [text_embeddings[uid] for uid in unique_uids], dim=0
+    ).float().to(device)
+    object_bank = F.normalize(object_bank, dim=-1).detach()
+
+    train_category_names = sorted({r.category for r in train_records})
+    train_category_to_index = {
+        name: i for i, name in enumerate(train_category_names)
+    }
+    global_category_to_index = {
+        name: i for i, name in enumerate(category_names)
+    }
+    category_indices = [
+        global_category_to_index[name] for name in train_category_names
+    ]
+    category_bank = category_embeddings[category_indices].float().to(device)
+    category_bank = F.normalize(category_bank, dim=-1).detach()
+    return (
+        object_bank,
+        uid_to_index,
+        category_bank,
+        train_category_to_index,
+    )
+
+
+def full_candidate_object_category_loss(
+    brain_embeddings: torch.Tensor,
+    uids: Sequence[str],
+    categories: Sequence[str],
+    object_bank: torch.Tensor,
+    uid_to_index: Dict[str, int],
+    category_bank: torch.Tensor,
+    category_to_index: Dict[str, int],
+    logit_scale: torch.Tensor,
+    category_loss_weight: float = 0.2,
+):
+    """Object CE over ALL unique train UIDs + weighted TRAIN-category CE.
+
+    The full candidate table is fixed/frozen. Gradients flow through the fMRI
+    encoder and logit_scale only. Validation and test UIDs are never negatives
+    in this training loss.
+    """
+    device = brain_embeddings.device
+    targets_obj = torch.tensor(
+        [uid_to_index[uid] for uid in uids],
+        dtype=torch.long, device=device,
+    )
+    targets_cat = torch.tensor(
+        [category_to_index[c] for c in categories],
+        dtype=torch.long, device=device,
+    )
+    scale = logit_scale.exp().clamp(max=100.0)
+    logits_obj = scale * (brain_embeddings.float() @ object_bank.T)
+    logits_cat = scale * (brain_embeddings.float() @ category_bank.T)
+    loss_obj = F.cross_entropy(logits_obj, targets_obj)
+    loss_cat = F.cross_entropy(logits_cat, targets_cat)
+    loss = loss_obj + float(category_loss_weight) * loss_cat
+
+    with torch.no_grad():
+        acc_obj = logits_obj.argmax(dim=1).eq(targets_obj).float().mean()
+        acc_cat = logits_cat.argmax(dim=1).eq(targets_cat).float().mean()
+    return loss, loss_obj, loss_cat, acc_obj, acc_cat
+
+
+@torch.no_grad()
+def batch_positive_retrieval_accuracy(
+    brain_embeddings: torch.Tensor,
+    target_text: torch.Tensor,
+    uids: Sequence[str],
+    logit_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Keep Train_Batch_Retrieval_Acc comparable with the old baseline."""
+    logits = logit_scale.exp().clamp(max=100.0) * (brain_embeddings @ target_text.T)
+    positive_mask = build_positive_mask(uids, brain_embeddings.device)
+    predicted = logits.argmax(dim=1)
+    return positive_mask[
+        torch.arange(len(uids), device=brain_embeddings.device), predicted
+    ].float().mean()
 
 
 # -----------------------------------------------------------------------------
@@ -1001,6 +1188,230 @@ def evaluate_retrieval(
     }
 
 # -----------------------------------------------------------------------------
+# Frozen GT multi-view and optional coarse 3D-shape teachers
+# -----------------------------------------------------------------------------
+
+VISUAL_CACHE_VERSION = "multi_view_CLIP_mean_v1"
+GEOMETRY_CACHE_VERSION = "rot_invariant_surface_hist_v1"
+GEOMETRY_DIM = 30  # radial hist 12 + pair hist 12 + eigenvalues 3 + bbox ratios 3
+
+
+def _unique_records(*groups):
+    records = {}
+    for g in groups:
+        for r in g:
+            if r.uid in records and records[r.uid].object_path != r.object_path:
+                raise ValueError(f"Conflicting object_path for UID {r.uid}")
+            records[r.uid] = r
+    return records
+
+
+def _load_cache(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _checked_cache(path, metadata, uid_list):
+    if not path.is_file():
+        return None
+    obj = _load_cache(path)
+    if not isinstance(obj, dict) or obj.get("metadata") != metadata:
+        raise ValueError(
+            f"Cached teacher features at {path} have different settings. "
+            "Use a new --visual_cache_path / --geometry_cache_path or delete the old cache."
+        )
+    features = obj.get("embeddings")
+    if not isinstance(features, dict):
+        raise ValueError(f"Malformed teacher cache: {path}")
+    missing = [u for u in uid_list if u not in features]
+    if missing:
+        raise ValueError(f"Teacher cache is missing {len(missing)} required UIDs, e.g. {missing[:3]}")
+    return {u: features[u].float() for u in uid_list}
+
+
+@torch.no_grad()
+def prepare_multiview_clip_targets(
+    records, views_root, clip_model, clip_preprocess, device,
+    view_count=6, batch_size=48, cache_path=None,
+    clip_name="ViT-B-32", clip_weights="openai",
+):
+    """Create normalized per-object CLIP image targets from GT rendered views.
+
+    A strictly disjoint held-out validation UID set may be encoded for evaluation
+    but gradients use only records from the training split (enforced downstream).
+    """
+    items = _unique_records(records)
+    uid_list = sorted(items)
+    views_root = Path(views_root).expanduser().resolve()
+    if not views_root.is_dir():
+        raise FileNotFoundError(
+            f"GT view root does not exist: {views_root}. "
+            "Render train_list.txt GT meshes before running E3."
+        )
+    metadata = {
+        "version": VISUAL_CACHE_VERSION, "views_root": str(views_root),
+        "clip_model": clip_name, "clip_pretrained": clip_weights,
+        "view_count": view_count, "uids": uid_list,
+    }
+    cache_path = Path(cache_path).expanduser().resolve() if cache_path else None
+    if cache_path is not None:
+        cached = _checked_cache(cache_path, metadata, uid_list)
+        if cached is not None:
+            print(f"[*] Loaded GT CLIP multi-view cache: {cache_path} ({len(cached)} UIDs)", flush=True)
+            return cached
+
+    files = []
+    for uid in uid_list:
+        for j in range(view_count):
+            files.append((uid, views_root / uid / f"{j:02d}.png"))
+    missing = [str(p) for _, p in files if not p.is_file()]
+    if missing:
+        examples = "\n".join(missing[:6])
+        raise FileNotFoundError(
+            f"Missing {len(missing)} GT view files for E3 visual targets. "
+            f"First missing:\n{examples}\n"
+            "The GT renderer must process train_list.txt, not only test_list.txt."
+        )
+
+    totals, counts = {}, {}
+    clip_model.eval()
+    for start in tqdm(range(0, len(files), batch_size), desc="Encoding GT 6-view CLIP"):
+        block = files[start:start + batch_size]
+        tensors = []
+        for _, path in block:
+            with Image.open(path) as img:
+                tensors.append(clip_preprocess(img.convert("RGB")))
+        x = torch.stack(tensors).to(device)
+        embeddings = F.normalize(clip_model.encode_image(x).float(), dim=-1).cpu()
+        for (uid, _), emb in zip(block, embeddings):
+            totals[uid] = totals.get(uid, torch.zeros_like(emb)) + emb
+            counts[uid] = counts.get(uid, 0) + 1
+    output = {}
+    for uid in uid_list:
+        if counts.get(uid, 0) != view_count:
+            raise RuntimeError(f"Unexpected view count for {uid}")
+        output[uid] = F.normalize(totals[uid], dim=-1)
+    dim = output[uid_list[0]].numel()
+    print(f"[*] Multi-view visual teachers: {len(output)} UIDs, CLIP dimension={dim}", flush=True)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"metadata": metadata, "embeddings": output}, cache_path)
+        print(f"[*] Saved GT CLIP cache to {cache_path}", flush=True)
+    return output
+
+
+def _shape_descriptor_from_glb(mesh_path, uid, points_count=2048):
+    """Coarse rotation-invariant shape histogram (not a pretrained 3D encoder)."""
+    import trimesh
+    scene = trimesh.load(str(mesh_path), process=False, force="scene")
+    if isinstance(scene, trimesh.Scene):
+        if hasattr(scene, "to_mesh"):
+            mesh = scene.to_mesh()
+        else:
+            mesh = scene.dump(concatenate=True)
+        if isinstance(mesh, list):
+            mesh = trimesh.util.concatenate(mesh)
+    else:
+        mesh = scene
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if len(vertices) < 3 or len(faces) == 0:
+        raise ValueError(f"No valid mesh triangles: {mesh_path}")
+    tri = vertices[faces]
+    weights = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    weights = np.maximum(weights, 0)
+    if not np.isfinite(weights).all() or weights.sum() < 1e-12:
+        raise ValueError(f"Degenerate mesh faces: {mesh_path}")
+    rng = np.random.default_rng(int.from_bytes(hashlib.sha256(uid.encode()).digest()[:8], "little"))
+    face_idx = rng.choice(len(faces), size=points_count, replace=True, p=weights/weights.sum())
+    v = tri[face_idx]
+    u, w = rng.random(points_count), rng.random(points_count)
+    a = np.sqrt(u)
+    p = (1-a)[:, None]*v[:, 0] + (a*(1-w))[:, None]*v[:, 1] + (a*w)[:, None]*v[:, 2]
+    extent = np.ptp(vertices, axis=0)
+    bbox_diag = max(float(np.linalg.norm(extent)), 1e-8)
+    center = (vertices.min(axis=0) + vertices.max(axis=0))*0.5
+    p = (p - center) / bbox_diag
+    radial = np.linalg.norm(p, axis=1)
+    radial_hist = np.histogram(radial, bins=12, range=(0, 0.75))[0].astype(np.float32)
+    radial_hist /= max(radial_hist.sum(), 1.)
+    a_idx = rng.integers(0, points_count, size=points_count)
+    b_idx = rng.integers(0, points_count, size=points_count)
+    pair_dist = np.linalg.norm(p[a_idx] - p[b_idx], axis=1)
+    pair_hist = np.histogram(pair_dist, bins=12, range=(0, 1.5))[0].astype(np.float32)
+    pair_hist /= max(pair_hist.sum(), 1.)
+    cov = np.cov(p, rowvar=False)
+    eigs = np.sort(np.maximum(np.linalg.eigvalsh(cov), 0))[::-1]
+    eigs /= max(float(eigs.sum()), 1e-12)
+    ratios = np.sort(extent)[::-1] / max(float(extent.max()), 1e-8)
+    feat = np.concatenate([radial_hist, pair_hist, eigs.astype(np.float32),
+                           ratios.astype(np.float32)]).astype(np.float32)
+    if feat.size != GEOMETRY_DIM or not np.isfinite(feat).all():
+        raise RuntimeError(f"Invalid GT geometry descriptor for {uid}: {feat}")
+    return torch.from_numpy(feat)
+
+
+def prepare_shape_targets(records, gt_mesh_root, cache_path=None):
+    """Build coarse shape descriptor targets from GT GLBs (train/val only)."""
+    items = _unique_records(records)
+    uids = sorted(items)
+    root = Path(gt_mesh_root).expanduser().resolve()
+    meta = {"version": GEOMETRY_CACHE_VERSION, "gt_mesh_root": str(root), "uids": uids}
+    cache_path = Path(cache_path).expanduser().resolve() if cache_path else None
+    if cache_path is not None:
+        cached = _checked_cache(cache_path, meta, uids)
+        if cached is not None:
+            print(f"[*] Loaded GT shape cache: {cache_path} ({len(cached)} UIDs)", flush=True)
+            return cached
+    result = {}
+    for uid in tqdm(uids, desc="GT geometry descriptors"):
+        mesh = root / items[uid].object_path
+        if not mesh.is_file():
+            raise FileNotFoundError(f"Missing GT mesh required for geometry loss: {mesh}")
+        result[uid] = _shape_descriptor_from_glb(mesh, uid)
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"metadata": meta, "embeddings": result}, cache_path)
+    return result
+
+
+@torch.no_grad()
+def evaluate_dual_visual(model, loader, records, visual_targets, geometry_targets, device):
+    model.eval()
+    embeddings, uids, geometry_preds = [], [], []
+    for batch in loader:
+        fmri = batch["fmri"].to(device).float()
+        _, zvisual, zgeometry = model.forward_dual(fmri)
+        embeddings.append(zvisual.cpu())
+        if zgeometry is not None:
+            geometry_preds.append(zgeometry.cpu())
+        uids.extend(batch["uid"])
+    zvisual = F.normalize(torch.cat(embeddings).float(), dim=-1)
+    candidate_uids = list(dict.fromkeys(r.uid for r in records))
+    bank = F.normalize(torch.stack([visual_targets[uid] for uid in candidate_uids]), dim=-1)
+    targets = torch.tensor([candidate_uids.index(uid) for uid in uids], dtype=torch.long)
+    scale = float(model.visual_logit_scale.detach().exp().clamp(max=100).item())
+    logits = scale * (zvisual @ bank.T)
+    pos = bank[targets]
+    metrics = {
+        "visual_ce": float(F.cross_entropy(logits, targets).item()),
+        "visual_2way": expected_nway_top1(logits, targets, 2),
+        "visual_10way": expected_nway_top1(logits, targets, min(10, len(candidate_uids)))
+                         if len(candidate_uids) >= 2 else float("nan"),
+        "visual_top1": topk_accuracy(logits, targets)[1],
+        "visual_top5": topk_accuracy(logits, targets)[5],
+        "visual_cos": float((zvisual*pos).sum(dim=-1).mean().item()),
+    }
+    if geometry_targets is not None:
+        pred_geo = torch.cat(geometry_preds)
+        gt_geo = torch.stack([geometry_targets[u] for u in uids])
+        metrics["geometry_mae"] = float(F.l1_loss(pred_geo, gt_geo).item())
+    return metrics
+
+
+# -----------------------------------------------------------------------------
 # Split / mesh checks
 # -----------------------------------------------------------------------------
 
@@ -1123,6 +1534,13 @@ def parse_args():
     )
     p.add_argument("--num_frames", type=int, default=6)
     p.add_argument(
+        "--train_frame_sampling",
+        choices=["random", "center", "uniform"],
+        default="random",
+        help=("C6 train-only sampling ablation. Validation/test ALWAYS use the "
+              "middle num_frames to match existing inference preprocessing."),
+    )
+    p.add_argument(
         "--fmri_norm",
         choices=["none", "sample_zscore", "frame_zscore"],
         default="none",
@@ -1157,6 +1575,61 @@ def parse_args():
     )
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--min_delta", type=float, default=1e-4)
+
+    # E1 changes only the training loss; architecture / split / validation stay
+    # unchanged. --objective batch_nce reproduces the original training loss.
+    p.add_argument(
+        "--objective", choices=["full_ce", "batch_nce"], default="full_ce",
+        help="E1 full-training-bank CE or original symmetric batch NCE.",
+    )
+    p.add_argument(
+        "--category_loss_weight", type=float, default=0.2,
+        help="Coefficient of TRAIN-category CE for --objective full_ce.",
+    )
+    p.add_argument(
+        "--batch_nce_weight", type=float, default=None,
+        help=("Symmetric in-batch CLIP NCE coefficient. Supplying any of the "
+              "three new weights activates explicit weighted-loss mode; "
+              "unspecified weights become zero."),
+    )
+    p.add_argument(
+        "--full_ce_weight", type=float, default=None,
+        help="Full train-UID caption-bank cross entropy coefficient.",
+    )
+    p.add_argument(
+        "--category_ce_weight", type=float, default=None,
+        help="Train-category CLIP-text cross entropy coefficient.",
+    )
+    p.add_argument(
+        "--checkpoint_metric", choices=["both", "objce", "10way"],
+        default="both",
+        help=("Always save best_objce.pt and best_10way.pt. "
+              "For the legacy best.pt alias, '10way' selects 10-way; "
+              "'both' and 'objce' select object CE."),
+    )
+    p.add_argument(
+        "--nway_min_delta", type=float, default=0.0,
+        help="Minimum validation 10-way improvement for updating best_10way.",
+    )
+
+    p.add_argument("--init_semantic_ckpt", type=str, default="",
+                   help="Optional E1-B checkpoint for warm-start of semantic branch. "
+                        "Only for a separate fine-tuning experiment.")
+    p.add_argument(
+        "--visual_views_root", type=str, default="",
+        help="GT 6-view image root: <root>/<uid>/00.png ... 05.png. Required for visual loss.",
+    )
+    p.add_argument("--visual_cache_path", type=str, default="",
+                   help="Reusable per-UID frozen CLIP image target cache across seeds.")
+    p.add_argument("--visual_batch_size", type=int, default=48)
+    p.add_argument("--visual_view_count", type=int, default=6)
+    p.add_argument("--visual_hidden_dim", type=int, default=512)
+    p.add_argument("--visual_loss_weight", type=float, default=0.25)
+    p.add_argument("--visual_nce_weight", type=float, default=1.0)
+    p.add_argument("--visual_cos_weight", type=float, default=0.5)
+    p.add_argument("--geometry_loss_weight", type=float, default=0.0,
+                   help="Optional GT-GLB coarse shape descriptor regression; requires --gt_mesh_root")
+    p.add_argument("--geometry_cache_path", type=str, default="")
 
     p.add_argument("--frame_dim", type=int, default=256)
     p.add_argument("--hidden_dim", type=int, default=1024)
@@ -1207,6 +1680,68 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not math.isfinite(args.category_loss_weight) or args.category_loss_weight < 0:
+        raise ValueError("--category_loss_weight must be finite and nonnegative")
+
+    explicit = any(
+        x is not None for x in (
+            args.batch_nce_weight, args.full_ce_weight, args.category_ce_weight
+        )
+    )
+    if explicit:
+        # Explicit weights take precedence over --objective/--category_loss_weight.
+        weight_nce = float(args.batch_nce_weight or 0.0)
+        weight_full = float(args.full_ce_weight or 0.0)
+        weight_cat = float(args.category_ce_weight or 0.0)
+    elif args.objective == "batch_nce":
+        weight_nce, weight_full, weight_cat = 1.0, 0.0, 0.0
+    else:
+        weight_nce, weight_full = 0.0, 1.0
+        weight_cat = float(args.category_loss_weight)
+
+    for name, value in (
+        ("batch_nce_weight", weight_nce),
+        ("full_ce_weight", weight_full),
+        ("category_ce_weight", weight_cat),
+        ("nway_min_delta", args.nway_min_delta),
+        ("visual_loss_weight", args.visual_loss_weight),
+        ("visual_nce_weight", args.visual_nce_weight),
+        ("visual_cos_weight", args.visual_cos_weight),
+        ("geometry_loss_weight", args.geometry_loss_weight),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"--{name} must be finite and nonnegative")
+    if (weight_nce + weight_full + weight_cat) <= 0:
+        raise ValueError("At least one training-loss coefficient must be positive")
+    if weight_full > 0 and args.text_source != "caption":
+        raise ValueError(
+            "Nonzero --full_ce_weight requires --text_source caption; "
+            "category-only texts produce duplicated object candidates."
+        )
+    if args.geometry_loss_weight > 0 and args.visual_loss_weight <= 0:
+        raise ValueError("Geometry auxiliary branch requires visual supervision in E3")
+    if args.visual_loss_weight > 0 and not args.visual_views_root:
+        raise ValueError("Set --visual_views_root for Semantic-Visual Dual Alignment")
+    if args.visual_loss_weight > 0 and (args.visual_nce_weight + args.visual_cos_weight) <= 0:
+        raise ValueError("At least one visual objective component must be nonzero")
+    if args.geometry_loss_weight > 0 and not args.gt_mesh_root:
+        raise ValueError("--geometry_loss_weight requires --gt_mesh_root")
+    if args.visual_view_count < 2 or args.visual_batch_size < 1:
+        raise ValueError("--visual_view_count >= 2 and --visual_batch_size >= 1 required")
+    if args.patience < 0:
+        raise ValueError("--patience must be >= 0 (0 disables early stopping)")
+
+    # Save the RESOLVED weights, not None, so the checkpoint unambiguously
+    # identifies which loss was actually trained.
+    args.batch_nce_weight = weight_nce
+    args.full_ce_weight = weight_full
+    args.category_ce_weight = weight_cat
+    print(
+        f"[*] Objective weights: BatchNCE={weight_nce:g}, "
+        f"FullObjectCE={weight_full:g}, CategoryCE={weight_cat:g}; "
+        f"checkpoint_metric={args.checkpoint_metric}",
+        flush=True,
+    )
     seed_everything(args.seed)
 
     data_root = Path(args.data_path).expanduser().resolve()
@@ -1324,7 +1859,7 @@ def main():
         f"({args.clip_pretrained})...",
         flush=True,
     )
-    clip_model, _, _ = open_clip.create_model_and_transforms(
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
         args.clip_model,
         pretrained=args.clip_pretrained,
     )
@@ -1357,6 +1892,22 @@ def main():
         flush=True,
     )
 
+    # Obtain frozen GT visual targets once (UID-only, no subject duplication).
+    # Validation features are allowed as metric reference only, NEVER training bank.
+    visual_targets = None
+    if args.visual_loss_weight > 0:
+        visual_targets = prepare_multiview_clip_targets(
+            train_records + val_records,
+            args.visual_views_root, clip_model, clip_preprocess, device,
+            view_count=args.visual_view_count,
+            batch_size=args.visual_batch_size,
+            cache_path=args.visual_cache_path or None,
+            clip_name=args.clip_model,
+            clip_weights=args.clip_pretrained,
+        )
+        if any(u in {r.uid for r in test_records} for u in visual_targets):
+            raise RuntimeError("Official test UID leaked into visual target features")
+
     # Free frozen CLIP GPU memory before fMRI model training.
     clip_model = clip_model.cpu()
     del clip_model
@@ -1364,8 +1915,53 @@ def main():
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
+    # Frozen candidate banks use strictly train-list UIDs only. For E0 these
+    # banks are diagnostics and do not affect training gradients.
+    # ------------------------------------------------------------------
+    (
+        train_object_bank,
+        train_uid_to_index,
+        train_category_bank,
+        train_category_to_index,
+    ) = prepare_e1_candidate_banks(
+        train_records, text_embeddings, category_names,
+        category_embeddings, device,
+    )
+    train_uid_set = set(train_uid_to_index)
+    if train_uid_set.intersection(r.uid for r in val_records):
+        raise RuntimeError("Validation UID leaked into training caption bank")
+    if train_uid_set.intersection(r.uid for r in test_records):
+        raise RuntimeError("Test UID leaked into training caption bank")
+    print(
+        f"[*] Training banks: objects={len(train_uid_to_index)}, "
+        f"categories={len(train_category_to_index)} "
+        "(validation/test UIDs excluded)",
+        flush=True,
+    )
+
+    geometry_targets = None
+    if args.geometry_loss_weight > 0:
+        geometry_targets = prepare_shape_targets(
+            train_records + val_records, args.gt_mesh_root,
+            cache_path=args.geometry_cache_path or None,
+        )
+        if any(u in {r.uid for r in test_records} for u in geometry_targets):
+            raise RuntimeError("Official test UID leaked into geometry teacher")
+    # Train targets MUST be indexed using the actual training UIDs only.
+    train_visual_targets = ({r.uid: visual_targets[r.uid] for r in train_records}
+                            if visual_targets is not None else None)
+    train_geometry_targets = ({r.uid: geometry_targets[r.uid] for r in train_records}
+                              if geometry_targets is not None else None)
+
+    # ------------------------------------------------------------------
     # Datasets
     # ------------------------------------------------------------------
+    print(
+        f"[*] C6: train sampling={args.train_frame_sampling}; "
+        f"eval sampling=center; fmri_norm={args.fmri_norm}; "
+        f"dropout={args.dropout:g}; weight_decay={args.weight_decay:g}",
+        flush=True,
+    )
     train_dataset = FMRIObjaverseDataset(
         data_root=data_root,
         subjects=subjects,
@@ -1373,8 +1969,11 @@ def main():
         text_embeddings=text_embeddings,
         category_to_index=category_to_index,
         train_mode=True,
+        visual_embeddings=train_visual_targets,
+        geometry_targets=train_geometry_targets,
         num_frames=args.num_frames,
         fmri_norm=args.fmri_norm,
+        train_frame_sampling=args.train_frame_sampling,
         strict_files=args.strict_files,
     )
     val_dataset = FMRIObjaverseDataset(
@@ -1384,6 +1983,8 @@ def main():
         text_embeddings=text_embeddings,
         category_to_index=category_to_index,
         train_mode=False,
+        visual_embeddings=visual_targets,
+        geometry_targets=geometry_targets,
         num_frames=args.num_frames,
         fmri_norm=args.fmri_norm,
         strict_files=args.strict_files,
@@ -1478,7 +2079,7 @@ def main():
     # ------------------------------------------------------------------
     # Model / optimizer
     # ------------------------------------------------------------------
-    model = FMRIClipAligner(
+    model = DualFMRIClipAligner(
         clip_dim=clip_dim,
         num_frames=args.num_frames,
         frame_dim=args.frame_dim,
@@ -1486,7 +2087,28 @@ def main():
         temporal_layers=args.temporal_layers,
         temporal_heads=args.temporal_heads,
         dropout=args.dropout,
+        visual_hidden_dim=args.visual_hidden_dim,
+        geometry_dim=GEOMETRY_DIM if args.geometry_loss_weight > 0 else 0,
     ).to(device)
+
+    # Optional E1-B warm-start; visual/geometry heads remain newly initialized.
+    if args.init_semantic_ckpt:
+        init_path = Path(args.init_semantic_ckpt).expanduser().resolve()
+        if not init_path.is_file():
+            raise FileNotFoundError(init_path)
+        init_ckpt = _load_cache(init_path)
+        init_state = init_ckpt.get("model", init_ckpt)
+        old_keys = set(semantic_only_state_dict(model))
+        if set(init_state) != old_keys:
+            raise ValueError("Warm-start checkpoint semantic weights don't match "
+                             "the E1-B architecture (check all model dimensions).")
+        incompatible = model.load_state_dict(init_state, strict=False)
+        if incompatible.unexpected_keys or any(
+            not k.startswith(("visual_", "geometry_")) for k in incompatible.missing_keys
+        ):
+            raise RuntimeError(f"Unexpected warm-start key mismatch: {incompatible}")
+        print(f"[*] E1-B semantic warm-start from {init_path}; "
+              "visual/geometry heads are randomly initialized.", flush=True)
 
     optimizer = optim.AdamW(
         model.parameters(),
@@ -1511,26 +2133,22 @@ def main():
     # Logging
     # ------------------------------------------------------------------
     log_path = out_dir / "training_log.csv"
-    with log_path.open(
-        "w", encoding="utf-8", newline=""
-    ) as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "Epoch",
-                "Loss",
-                "Train_Batch_Retrieval_Acc",
-                "Val_Full_Object_CE",
-                "Val_Full_Category_CE",
-                "Val_2Way_Top1",
-                "Val_10Way_Top1",
-                "Val_Object_Top1",
-                "Val_Object_Top5",
-                "Val_Category_Top1",
-                "Val_Category_Top5",
-                "LR",
-            ]
-        )
+    log_headers = [
+        "Epoch", "Loss", "Train_Batch_Retrieval_Acc",
+        "Val_Full_Object_CE", "Val_Full_Category_CE",
+        "Val_2Way_Top1", "Val_10Way_Top1",
+        "Val_Object_Top1", "Val_Object_Top5",
+        "Val_Category_Top1", "Val_Category_Top5", "LR",
+        "Train_Full_Object_CE", "Train_Full_Category_CE",
+        "Train_Full_Object_Top1", "Train_Full_Category_Top1",
+        "Train_Batch_NCE", "Train_Logit_Scale",
+        "Train_Visual_NCE", "Train_Visual_Cos_Loss", "Train_Geometry_Loss",
+        "Val_Visual_CE", "Val_Visual_2Way", "Val_Visual_10Way",
+        "Val_Visual_Top1", "Val_Visual_Top5", "Val_Visual_Cos",
+        "Val_Geometry_MAE", "Visual_Logit_Scale",
+    ]
+    with log_path.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerow(log_headers)
 
     config = vars(args).copy()
     config.update(
@@ -1564,8 +2182,14 @@ def main():
     # Train
     # ------------------------------------------------------------------
     best_val_object_ce = float("inf")
-    best_epoch = 0
+    best_val_10way = float("-inf")
+    best_objce_epoch = 0
+    best_10way_epoch = 0
     stale = 0
+
+    best_objce_path = out_dir / "fmri_clip_aligner_best_objce.pt"
+    best_10way_path = out_dir / "fmri_clip_aligner_best_10way.pt"
+    # Keep the original checkpoint name usable by the existing inference code.
     best_model_path = out_dir / "fmri_clip_aligner_best.pt"
 
     for epoch in range(1, args.epochs + 1):
@@ -1573,6 +2197,14 @@ def main():
 
         total_loss = 0.0
         total_acc = 0.0
+        total_train_nce = 0.0
+        total_train_object_ce = 0.0
+        total_train_category_ce = 0.0
+        total_train_object_acc = 0.0
+        total_train_category_acc = 0.0
+        total_visual_nce = 0.0
+        total_visual_cos_loss = 0.0
+        total_geometry_loss = 0.0
         batches = 0
 
         for batch in tqdm(
@@ -1581,136 +2213,240 @@ def main():
         ):
             optimizer.zero_grad(set_to_none=True)
 
-            fmri = batch["fmri"].to(
+            fmri = batch["fmri"].to(device, non_blocking=True).float()
+            target_text = batch["text_embedding"].to(
                 device, non_blocking=True
             ).float()
-            target_text = batch[
-                "text_embedding"
-            ].to(device, non_blocking=True).float()
-            target_text = F.normalize(
-                target_text, dim=-1
-            )
+            target_text = F.normalize(target_text, dim=-1)
             uids = list(batch["uid"])
+            categories = list(batch["category"])
 
-            fmri_embeds = model(fmri)
+            fmri_embeds, visual_embeds, geometry_pred = model.forward_dual(fmri)
 
-            loss, batch_acc = (
-                symmetric_multi_positive_clip_loss(
-                    fmri_embeds,
-                    target_text,
-                    uids,
-                    model.logit_scale,
+            # Match E0 exactly when batch NCE is the only active objective.
+            if weight_nce > 0:
+                loss_nce, batch_acc = symmetric_multi_positive_clip_loss(
+                    fmri_embeds, target_text, uids, model.logit_scale,
                 )
-            )
+            else:
+                with torch.no_grad():
+                    loss_nce, batch_acc = symmetric_multi_positive_clip_loss(
+                        fmri_embeds, target_text, uids, model.logit_scale,
+                    )
+
+            # Object/category losses are evaluated for every experiment to
+            # obtain comparable training diagnostics. For pure E0, this pass is
+            # no-grad and does not modify the baseline objective.
+            if weight_full > 0 or weight_cat > 0:
+                (_, loss_obj, loss_cat, acc_obj, acc_cat) = (
+                    full_candidate_object_category_loss(
+                        brain_embeddings=fmri_embeds,
+                        uids=uids,
+                        categories=categories,
+                        object_bank=train_object_bank,
+                        uid_to_index=train_uid_to_index,
+                        category_bank=train_category_bank,
+                        category_to_index=train_category_to_index,
+                        logit_scale=model.logit_scale,
+                        category_loss_weight=0.0,
+                    )
+                )
+            else:
+                with torch.no_grad():
+                    (_, loss_obj, loss_cat, acc_obj, acc_cat) = (
+                        full_candidate_object_category_loss(
+                            brain_embeddings=fmri_embeds,
+                            uids=uids,
+                            categories=categories,
+                            object_bank=train_object_bank,
+                            uid_to_index=train_uid_to_index,
+                            category_bank=train_category_bank,
+                            category_to_index=train_category_to_index,
+                            logit_scale=model.logit_scale,
+                            category_loss_weight=0.0,
+                        )
+                    )
+
+            visual_nce = fmri_embeds.new_zeros(())
+            visual_cos_loss = fmri_embeds.new_zeros(())
+            geometry_loss = fmri_embeds.new_zeros(())
+            if visual_targets is not None:
+                target_visual = F.normalize(
+                    batch["visual_embedding"].to(device).float(), dim=-1)
+                if args.visual_nce_weight > 0:
+                    visual_nce, _ = symmetric_multi_positive_clip_loss(
+                        visual_embeds, target_visual, uids, model.visual_logit_scale)
+                if args.visual_cos_weight > 0:
+                    visual_cos_loss = (1 - (visual_embeds * target_visual).sum(dim=-1)).mean()
+            if geometry_targets is not None:
+                target_geometry = batch["geometry_target"].to(device).float()
+                geometry_loss = F.smooth_l1_loss(geometry_pred, target_geometry)
+
+            # Only positive-weight terms are added, avoiding unnecessary
+            # autograd paths and preserving the exact E0/E1 loss definitions.
+            loss = None
+            for coeff, component in (
+                (weight_nce, loss_nce),
+                (weight_full, loss_obj),
+                (weight_cat, loss_cat),
+                (args.visual_loss_weight * args.visual_nce_weight, visual_nce),
+                (args.visual_loss_weight * args.visual_cos_weight, visual_cos_loss),
+                (args.geometry_loss_weight, geometry_loss),
+            ):
+                if coeff > 0:
+                    term = coeff * component
+                    loss = term if loss is None else loss + term
+            if loss is None or not torch.isfinite(loss).item():
+                raise RuntimeError("Non-finite or empty combined training loss")
 
             loss.backward()
             optimizer.step()
 
             total_loss += float(loss.item())
             total_acc += float(batch_acc.item())
+            total_train_nce += float(loss_nce.detach().item())
+            total_train_object_ce += float(loss_obj.detach().item())
+            total_train_category_ce += float(loss_cat.detach().item())
+            total_train_object_acc += float(acc_obj.item())
+            total_train_category_acc += float(acc_cat.item())
+            total_visual_nce += float(visual_nce.detach().item())
+            total_visual_cos_loss += float(visual_cos_loss.detach().item())
+            total_geometry_loss += float(geometry_loss.detach().item())
             batches += 1
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
+        if batches == 0:
+            raise RuntimeError("No training batches; reduce --batch_size")
 
-        avg_loss = total_loss / max(1, batches)
-        train_acc = total_acc / max(1, batches)
+        avg_loss = total_loss / batches
+        train_acc = total_acc / batches
+        avg_nce = total_train_nce / batches
+        avg_obj_ce = total_train_object_ce / batches
+        avg_cat_ce = total_train_category_ce / batches
+        avg_obj_acc = total_train_object_acc / batches
+        avg_cat_acc = total_train_category_acc / batches
+        avg_visual_nce = total_visual_nce / batches
+        avg_visual_cos_loss = total_visual_cos_loss / batches
+        avg_geometry_loss = total_geometry_loss / batches
+        visual_scale = float(model.visual_logit_scale.detach().exp().clamp(max=100).item())
+        logit_scale = float(model.logit_scale.detach().exp().clamp(max=100).item())
 
-        # Full-candidate validation retrieval.
-        # The returned object_ce compares every validation fMRI embedding
-        # against ALL validation object-caption candidates at once.
         val_metrics = evaluate_retrieval(
-            model,
-            val_loader,
-            val_records,
-            text_embeddings,
-            category_names,
-            category_embeddings,
-            device,
+            model, val_loader, val_records, text_embeddings,
+            category_names, category_embeddings, device,
         )
-        val_object_ce = val_metrics["object_ce"]
-        val_category_ce = val_metrics["category_ce"]
+        visual_val = (evaluate_dual_visual(model, val_loader, val_records,
+                                           visual_targets, geometry_targets, device)
+                      if visual_targets is not None else {})
+        val_object_ce = float(val_metrics["object_ce"])
+        val_category_ce = float(val_metrics["category_ce"])
+        val_10way = float(val_metrics["object_10way_top1"])
+        if not math.isfinite(val_object_ce) or not math.isfinite(val_10way):
+            raise RuntimeError("Validation object CE or 10-way became non-finite")
 
         print(
             f"Epoch {epoch:03d} | "
-            f"Loss={avg_loss:.4f} | "
+            f"Loss={avg_loss:.4f} | NCE={avg_nce:.4f} | "
             f"TrainBatchAcc={train_acc:.4f} | "
+            f"TrainFullObjCE={avg_obj_ce:.4f} | "
+            f"TrainCatCE={avg_cat_ce:.4f} | "
+            f"TrainObj@1={avg_obj_acc:.4f} | "
+            f"TrainCat@1={avg_cat_acc:.4f} | "
             f"ValObjCE={val_object_ce:.4f} | "
             f"ValCatCE={val_category_ce:.4f} | "
             f"Val2Way={val_metrics['object_2way_top1']:.4f} | "
-            f"Val10Way={val_metrics['object_10way_top1']:.4f} | "
+            f"Val10Way={val_10way:.4f} | "
             f"ValObj@1={val_metrics['object_top1']:.4f} | "
             f"ValObj@5={val_metrics['object_top5']:.4f} | "
             f"ValCat@1={val_metrics['category_top1']:.4f} | "
             f"ValCat@5={val_metrics['category_top5']:.4f} | "
-            f"LR={current_lr:.6g}",
+            f"VisNCE={avg_visual_nce:.4f} | VisCosLoss={avg_visual_cos_loss:.4f} | "
+            f"ValVisCE={visual_val.get('visual_ce', float('nan')):.4f} | "
+            f"ValVis10Way={visual_val.get('visual_10way', float('nan')):.4f} | "
+            f"ValVisCos={visual_val.get('visual_cos', float('nan')):.4f} | "
+            f"ValGeoMAE={visual_val.get('geometry_mae', float('nan')):.4f} | "
+            f"Scale={logit_scale:.4f} | VisScale={visual_scale:.4f} | LR={current_lr:.6g}",
             flush=True,
         )
 
-        with log_path.open(
-            "a", encoding="utf-8", newline=""
-        ) as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                [
-                    epoch,
-                    f"{avg_loss:.8f}",
-                    f"{train_acc:.8f}",
-                    f"{val_object_ce:.8f}",
-                    f"{val_category_ce:.8f}",
-                    f"{val_metrics['object_2way_top1']:.8f}",
-                    f"{val_metrics['object_10way_top1']:.8f}",
-                    f"{val_metrics['object_top1']:.8f}",
-                    f"{val_metrics['object_top5']:.8f}",
-                    f"{val_metrics['category_top1']:.8f}",
-                    f"{val_metrics['category_top5']:.8f}",
-                    f"{current_lr:.10f}",
-                ]
-            )
+        with log_path.open("a", encoding="utf-8", newline="") as f:
+            csv.writer(f).writerow([
+                epoch, f"{avg_loss:.8f}", f"{train_acc:.8f}",
+                f"{val_object_ce:.8f}", f"{val_category_ce:.8f}",
+                f"{val_metrics['object_2way_top1']:.8f}",
+                f"{val_10way:.8f}",
+                f"{val_metrics['object_top1']:.8f}",
+                f"{val_metrics['object_top5']:.8f}",
+                f"{val_metrics['category_top1']:.8f}",
+                f"{val_metrics['category_top5']:.8f}",
+                f"{current_lr:.10f}",
+                f"{avg_obj_ce:.8f}", f"{avg_cat_ce:.8f}",
+                f"{avg_obj_acc:.8f}", f"{avg_cat_acc:.8f}",
+                f"{avg_nce:.8f}", f"{logit_scale:.8f}",
+                f"{avg_visual_nce:.8f}", f"{avg_visual_cos_loss:.8f}",
+                f"{avg_geometry_loss:.8f}",
+                f"{visual_val.get('visual_ce', float('nan')):.8f}",
+                f"{visual_val.get('visual_2way', float('nan')):.8f}",
+                f"{visual_val.get('visual_10way', float('nan')):.8f}",
+                f"{visual_val.get('visual_top1', float('nan')):.8f}",
+                f"{visual_val.get('visual_top5', float('nan')):.8f}",
+                f"{visual_val.get('visual_cos', float('nan')):.8f}",
+                f"{visual_val.get('geometry_mae', float('nan')):.8f}",
+                f"{visual_scale:.8f}",
+            ])
 
-        # Checkpoint selection is based ONLY on full-validation object CE.
-        # This directly matches the full object-retrieval candidate set and
-        # replaces the previous small-mini-batch validation NCE criterion.
+        # Always save both selection criteria, and update the legacy best.pt
+        # according to --checkpoint_metric (default: object CE).
+        ckpt_info = {
+            **checkpoint_state(model),
+            "epoch": epoch,
+            "val_full_object_ce": val_object_ce,
+            "val_full_category_ce": val_category_ce,
+            "val_metrics": val_metrics,
+            "val_visual_metrics": visual_val,
+            "config": config,
+        }
+
         if val_object_ce < best_val_object_ce - args.min_delta:
             best_val_object_ce = val_object_ce
-            best_epoch = epoch
+            best_objce_epoch = epoch
             stale = 0
-
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "epoch": epoch,
-                    "val_full_object_ce": val_object_ce,
-                    "val_full_category_ce": val_category_ce,
-                    "val_metrics": val_metrics,
-                    "checkpoint_metric": "full_validation_object_ce",
-                    "config": config,
-                },
-                best_model_path,
-            )
+            payload = dict(ckpt_info, checkpoint_metric="full_validation_object_ce")
+            torch.save(payload, best_objce_path)
+            if args.checkpoint_metric != "10way":
+                torch.save(payload, best_model_path)
             print(
-                f"[*] Best checkpoint updated: "
-                f"epoch={epoch}, full_val_object_ce={val_object_ce:.6f}",
-                flush=True,
+                f"[*] BestObjCE updated: epoch={epoch}, "
+                f"ValObjCE={val_object_ce:.6f}", flush=True,
             )
         else:
             stale += 1
 
-        if (
-            args.patience > 0
-            and stale >= args.patience
-        ):
+        if val_10way > best_val_10way + args.nway_min_delta:
+            best_val_10way = val_10way
+            best_10way_epoch = epoch
+            payload = dict(ckpt_info, checkpoint_metric="validation_10way_top1")
+            torch.save(payload, best_10way_path)
+            if args.checkpoint_metric == "10way":
+                torch.save(payload, best_model_path)
+            print(
+                f"[*] Best10Way updated: epoch={epoch}, "
+                f"Val10Way={val_10way:.6f}", flush=True,
+            )
+
+        if args.patience > 0 and stale >= args.patience:
             print(
                 f"[*] Early stopping at epoch {epoch}; "
-                f"best_epoch={best_epoch}",
-                flush=True,
+                f"best_objce_epoch={best_objce_epoch}; "
+                f"best_10way_epoch={best_10way_epoch}", flush=True,
             )
             break
 
     last_model_path = out_dir / "fmri_clip_aligner_last.pt"
     torch.save(
         {
-            "model": model.state_dict(),
+            **checkpoint_state(model),
             "epoch": epoch,
             "config": config,
         },
@@ -1718,99 +2454,113 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # Reload best and report validation / test once
+    # Reload both selected checkpoints and report under the SAME validation
+    # candidate set. Default best.pt remains the CE-selected checkpoint for
+    # backward compatibility with inference_fmri_mind3dpp.py.
     # ------------------------------------------------------------------
-    best = torch.load(
-        best_model_path,
-        map_location=device,
-    )
-    model.load_state_dict(best["model"])
-
-    best_val_metrics = evaluate_retrieval(
-        model,
-        val_loader,
-        val_records,
-        text_embeddings,
-        category_names,
-        category_embeddings,
-        device,
-    )
-
-    best_train_metrics = evaluate_retrieval(
-        model,
-        train_eval_loader,
-        train_records,
-        text_embeddings,
-        category_names,
-        category_embeddings,
-        device,
-    )
-
-    summary = {
-        "best_epoch": int(best["epoch"]),
-        "checkpoint_metric": "full_validation_object_ce",
-        "best_val_full_object_ce": float(best["val_full_object_ce"]),
-        "best_val_full_category_ce": float(best["val_full_category_ce"]),
-        "train_full_retrieval": best_train_metrics,
-        "validation": best_val_metrics,
-    }
-
-    print(
-        "[TRAIN full] "
-        f"ObjCE={best_train_metrics['object_ce']:.4f} "
-        f"2Way={best_train_metrics['object_2way_top1']:.4%} "
-        f"10Way={best_train_metrics['object_10way_top1']:.4%} "
-        f"Obj@1={best_train_metrics['object_top1']:.4%} "
-        f"Obj@5={best_train_metrics['object_top5']:.4%} "
-        f"Cat@1={best_train_metrics['category_top1']:.4%} "
-        f"Cat@5={best_train_metrics['category_top5']:.4%}",
-        flush=True,
-    )
-
-    print(
-        "[VAL best] "
-        f"epoch={best['epoch']} "
-        f"ObjCE={best_val_metrics['object_ce']:.4f} "
-        f"CatCE={best_val_metrics['category_ce']:.4f} "
-        f"2Way={best_val_metrics['object_2way_top1']:.4%} "
-        f"10Way={best_val_metrics['object_10way_top1']:.4%} "
-        f"Obj@1={best_val_metrics['object_top1']:.4%} "
-        f"Obj@5={best_val_metrics['object_top5']:.4%} "
-        f"Cat@1={best_val_metrics['category_top1']:.4%} "
-        f"Cat@5={best_val_metrics['category_top5']:.4%}",
-        flush=True,
-    )
-
-    if test_loader is not None:
-        test_metrics = evaluate_retrieval(
-            model,
-            test_loader,
-            test_records,
-            text_embeddings,
-            category_names,
-            category_embeddings,
-            device,
+    def load_and_evaluate(path):
+        try:
+            checkpoint = torch.load(path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(path, map_location=device)
+        model.load_state_dict(checkpoint["dual_model"], strict=True)
+        validation_metrics = evaluate_retrieval(
+            model, val_loader, val_records, text_embeddings,
+            category_names, category_embeddings, device,
         )
-        summary["test"] = test_metrics
+        training_metrics = evaluate_retrieval(
+            model, train_eval_loader, train_records, text_embeddings,
+            category_names, category_embeddings, device,
+        )
+        if visual_targets is not None:
+            validation_metrics.update(evaluate_dual_visual(
+                model, val_loader, val_records, visual_targets, geometry_targets, device))
+        return checkpoint, validation_metrics, training_metrics
 
+    ce_best, ce_val, ce_train = load_and_evaluate(best_objce_path)
+    nw_best, nw_val, nw_train = load_and_evaluate(best_10way_path)
+
+    def show_metrics(tag, ckpt, metrics):
         print(
-            "[TEST final] "
-            f"ObjCE={test_metrics['object_ce']:.4f} "
-            f"CatCE={test_metrics['category_ce']:.4f} "
-            f"2Way={test_metrics['object_2way_top1']:.4%} "
-            f"10Way={test_metrics['object_10way_top1']:.4%} "
-            f"Obj@1={test_metrics['object_top1']:.4%} "
-            f"Obj@5={test_metrics['object_top5']:.4%} "
-            f"Cat@1={test_metrics['category_top1']:.4%} "
-            f"Cat@5={test_metrics['category_top5']:.4%}",
+            f"[{tag}] epoch={ckpt['epoch']} "
+            f"ObjCE={metrics['object_ce']:.4f} "
+            f"CatCE={metrics['category_ce']:.4f} "
+            f"2Way={metrics['object_2way_top1']:.4%} "
+            f"10Way={metrics['object_10way_top1']:.4%} "
+            f"Obj@1={metrics['object_top1']:.4%} "
+            f"Obj@5={metrics['object_top5']:.4%} "
+            f"Cat@1={metrics['category_top1']:.4%} "
+            f"Cat@5={metrics['category_top5']:.4%}",
             flush=True,
         )
+
+    show_metrics("VAL best-objce", ce_best, ce_val)
+    if visual_targets is not None:
+        print("[VAL best-objce visual] "
+              f"CE={ce_val['visual_ce']:.4f} 10Way={ce_val['visual_10way']:.4%} "
+              f"Cos={ce_val['visual_cos']:.4f}", flush=True)
+    show_metrics("VAL best-10way", nw_best, nw_val)
+    show_metrics("TRAIN best-objce", ce_best, ce_train)
+    show_metrics("TRAIN best-10way", nw_best, nw_train)
+
+    # For the optional one-time official test, evaluate only the chosen legacy
+    # inference checkpoint, never use test accuracy to choose the objective.
+    primary = "10way" if args.checkpoint_metric == "10way" else "objce"
+    primary_ckpt = nw_best if primary == "10way" else ce_best
+    primary_val = nw_val if primary == "10way" else ce_val
+    primary_train = nw_train if primary == "10way" else ce_train
+
+    summary = {
+        "objective_weights": {
+            "batch_nce_weight": weight_nce,
+            "full_ce_weight": weight_full,
+            "category_ce_weight": weight_cat,
+            "visual_loss_weight": float(args.visual_loss_weight),
+            "visual_nce_weight": float(args.visual_nce_weight),
+            "visual_cos_weight": float(args.visual_cos_weight),
+            "geometry_loss_weight": float(args.geometry_loss_weight),
+        },
+        "checkpoint_metric": primary_ckpt["checkpoint_metric"],
+        "checkpoint_selection_mode": args.checkpoint_metric,
+        "primary_checkpoint": str(best_model_path),
+        "best_epoch": int(primary_ckpt["epoch"]),
+        "best_val_full_object_ce": float(primary_val["object_ce"]),
+        "best_val_full_category_ce": float(primary_val["category_ce"]),
+        "train_full_retrieval": primary_train,
+        "validation": primary_val,
+        "best_objce": {
+            "checkpoint": str(best_objce_path),
+            "epoch": int(ce_best["epoch"]),
+            "validation": ce_val,
+            "train_full_retrieval": ce_train,
+        },
+        "best_10way": {
+            "checkpoint": str(best_10way_path),
+            "epoch": int(nw_best["epoch"]),
+            "validation": nw_val,
+            "train_full_retrieval": nw_train,
+        },
+    }
+
+    if test_loader is not None:
+        model.load_state_dict(primary_ckpt["dual_model"], strict=True)
+        test_metrics = evaluate_retrieval(
+            model, test_loader, test_records, text_embeddings,
+            category_names, category_embeddings, device,
+        )
+        summary["test"] = test_metrics
+        show_metrics("TEST final", primary_ckpt, test_metrics)
 
     write_json(out_dir / "summary.json", summary)
 
     print(
-        f"[*] Best model: {best_model_path}\n"
-        f"[*] Last model: {last_model_path}\n"
+        f"[*] Best ObjCE checkpoint: {best_objce_path} "
+        f"(epoch={best_objce_epoch})\n"
+        f"[*] Best 10-way checkpoint: {best_10way_path} "
+        f"(epoch={best_10way_epoch})\n"
+        f"[*] Legacy inference checkpoint: {best_model_path} "
+        f"(selection={primary})\n"
+        f"[*] Last checkpoint: {last_model_path}\n"
         f"[*] Summary: {out_dir / 'summary.json'}",
         flush=True,
     )
