@@ -20,7 +20,7 @@ fMRI (6프레임)
 | `prism_model.py` | `PrismMVDiffusion`: 공식 `src/mvdiffusion.MVDiffusion` 상속. 의미 ProtoCE(범주 프로토타입), 의미 경로 확산 gradient 차단(EEG판과 같음), 공식 CLIP 대조 손실 유지, 직교 손실 없음 |
 | `train_prism_fmri.py` | 학습 (Pro6000 MinD-3D++ 재학습 스크립트 기반). `--init_ckpt`로 공개 가중치에서 시작 |
 | `infer_prism_fmri.py` | 추론: 6뷰(`images/` 격자, `views/<이름>/00~05.png` TRELLIS 입력) + InstantMesh 메시(`--no_lrm`이면 생략) |
-| `scripts/*.sh` | Pro6000 실행 (`common.sh` 경로, `smoke_prism.sh`, `train_prism.sh`, `infer_prism.sh`) |
+| `scripts/*.sh` | Pro6000 실행 (`common.sh` 경로, `smoke_prism.sh`, `train_prism.sh`, `infer_prism.sh`, `eval_prism.sh`) |
 
 ## 학습 손실
 | 성분 | 손실 |
@@ -32,6 +32,10 @@ fMRI (6프레임)
 
 총 손실 = 확산 + `λ_clip`·CLIP + `λ_proto`·ProtoCE (기본 1, 1).
 
+- **학습 GT = 자극 영상 프레임** (Pro6000 `data/GTviews_video/obj`, 영상 0·64·…·320번 프레임). 학습 정답은 피험자가 본 자극 안에서만. 평가 GT·렌더는 MinD-3D++ 프로토콜 그대로.
+- **`--freeze_encoder`** (스크립트 기본 켜짐, `FREEZE=`로 끔): 인코더 ViT 본체를 공개 가중치 그대로 고정하고 헤드·aggregation·LoRA·semantic_to_clip만 학습. GPU 1을 MinD-3D++ 재학습과 나눠 쓰거나 4090(24 GB)에서 돌릴 때.
+- 남은 문제: 영상 GT로 학습하면 6뷰가 영상 자세(고도 0°, 회전 방향 물체별) → InstantMesh 입력 카메라(v1.2 가정)를 맞춰야 함. TRELLIS(`views/`)는 카메라 불필요.
+
 ## Pro6000 실행 환경
 - 저장소 위치: `/home/oem/jhj/MinD-3D++/mind_neural3d` (`common.sh`의 `P`)
 - 공식 코드 `MinD-3D/`(4b74ebe), 작업 폴더 `run/`(`src` → `MinD-3D/src`, `pretrained_models/`), venv, 데이터, `weights/zero123plus-v1.2`, `weights/InstantMesh`는 MinD-3D++ 재학습 때 세팅한 것 그대로 사용
@@ -41,4 +45,4 @@ fMRI (6프레임)
 ## 확인 순서
 1. `bash scripts/smoke_prism.sh` — 데이터 2개 형상, 공개 가중치 불러오기(`[init] … lora >0`), 20스텝 손실·메모리
 2. 연결 확인: `CKPT=<공개 가중치> bash scripts/infer_prism.sh --limit 5` → 헤드가 항등이라 MinD-3D++ 공개 가중치 추론과 같은 6뷰가 나와야 함
-3. `STEPS=5000 bash scripts/train_prism.sh` → `bash scripts/infer_prism.sh` → 평가(MinD-3D++ 평가와 같은 `eval_obj_bs28.sh` 방식)
+3. `STEPS=5000 bash scripts/train_prism.sh` → `bash scripts/infer_prism.sh` → `MESH=<추론 meshes 폴더> NAME=<이름> bash scripts/eval_prism.sh`

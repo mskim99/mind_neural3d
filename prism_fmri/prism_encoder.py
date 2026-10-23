@@ -34,6 +34,29 @@ class PrismFMRIEncoder(fMRI_Encoder):
         self.sem_head = ResidualMLP(dim, head_hidden)
         self.var_head = ResidualMLP(dim, head_hidden)
         self.subj_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, head_hidden), nn.GELU(), nn.Linear(head_hidden, dim))
+        self.freeze_backbone = False
+
+    BACKBONE = ('patch_embed', 'cls_token', 'pos_embed', 'blocks', 'norm', 'clip_norm')   # 공개 가중치에서 온 ViT 본체 (aggregation·헤드는 제외)
+
+    def set_freeze_backbone(self, flag=True):
+        """ViT 본체를 고정 (gradient·dropout 끔). 헤드 3개와 aggregation(패치 → cond_lat 변환)만 학습."""
+        self.freeze_backbone = flag
+        for n, p in self.named_parameters():
+            if n.split('.')[0] in self.BACKBONE:
+                p.requires_grad_(not flag)
+        self.train(self.training)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_backbone:
+            for n in self.BACKBONE:
+                m = getattr(self, n, None)
+                if isinstance(m, nn.Module): m.eval()
+        return self
+
+    def _backbone(self, fn, x):
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self.freeze_backbone):
+            return fn(x)
 
     def route(self, tokens):
         """tokens [N, 257, D] (마지막 층 출력) → [의미 CLS ; 변형 패치] 같은 모양."""
@@ -42,10 +65,10 @@ class PrismFMRIEncoder(fMRI_Encoder):
 
     # 공식 코드가 부르는 이름 그대로 덮어씀 (학습: _clip, 추론 파이프라인: wo_pred)
     def forward_encoder_wo_pred(self, x):
-        return self.route(super().forward_encoder_wo_pred(x))
+        return self.route(self._backbone(super().forward_encoder_wo_pred, x))
 
     def forward_encoder_wo_pred_clip(self, x):
-        tokens, fmri_feature = super().forward_encoder_wo_pred_clip(x)
+        tokens, fmri_feature = self._backbone(super().forward_encoder_wo_pred_clip, x)
         return self.route(tokens), fmri_feature
 
     def components(self, x):

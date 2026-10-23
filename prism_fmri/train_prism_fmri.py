@@ -4,6 +4,8 @@
 #  ③ 데이터에 범주 번호 'cls' 추가 (학습 리스트의 범주를 정렬한 순서), 범주 이름 → OpenCLIP 텍스트 프로토타입
 #  ④ 손실 = 확산 + λ_clip·CLIP 대조(공식) + λ_proto·ProtoCE. 직교 손실 없음
 #  ⑤ 기본 스텝 수를 짧게(--max_step 기본 5000): 공개 가중치에서 시작하는 미세조정이라
+#  ⑥ --freeze_encoder: 인코더 ViT 본체 고정 (GPU 1을 다른 학습과 나눠 쓸 때, 4090 24 GB용)
+#  학습 GT: 자극 영상 프레임 (Pro6000 data/GTviews_video/obj, 로컬 DataSet/MinD-3D++/GT_views_train) — 학습 정답은 피험자가 본 자극 안에서만
 # 실행 (cwd = pretrained_models/ 와 src → MinD-3D/src 링크가 있는 작업 폴더, 예: /home/oem/jhj/MinD-3D++/run):
 #   torchrun --nproc_per_node=1 <이 파일> --dataset obj --repo .../MinD-3D --data_root ... --image_root ... --z123 ... --init_ckpt .../sub01.pt --out_dir ...
 import os, sys, time, random, argparse
@@ -31,6 +33,7 @@ p.add_argument('--warmup', type=int, default=300)
 p.add_argument('--lambda_clip', type=float, default=1.0)
 p.add_argument('--lambda_proto', type=float, default=1.0)
 p.add_argument('--proto_temp', type=float, default=0.07)
+p.add_argument('--freeze_encoder', action='store_true')  # fMRI 인코더 ViT 본체 고정 (공개 가중치 그대로) → 헤드·aggregation·LoRA만 학습, 메모리 절약
 p.add_argument('--no_sem_detach', action='store_true')  # 켜면 확산 손실 gradient가 의미 경로로도 흐름 (EEG판은 차단)
 p.add_argument('--save_every', type=int, default=1000)
 p.add_argument('--print_every', type=int, default=10)
@@ -114,6 +117,8 @@ model = PrismMVDiffusion(cfg, sdc, cfg.model.params.fmri_encoder_config, a.out_d
                          lr=a.lr, warmup=a.warmup, total_steps=a.max_step, sem_detach=not a.no_sem_detach, proto_temp=a.proto_temp).cuda()
 if a.init_ckpt:
     model.load_init(a.init_ckpt)
+if a.freeze_encoder:
+    model.set_freeze_encoder(True)
 model.build_prototypes()
 if a.grad_ckpt:                                                      # train_mind3dpp_ours.py와 같은 패치 (계산 결과 동일)
     from diffusers import UNet2DConditionModel
@@ -150,7 +155,7 @@ def save_latest():
 ntr = sum(x.numel() for x in model.parameters() if x.requires_grad)
 if rank == 0:
     print(f'{a.dataset}: trainable {ntr/1e6:.1f}M, world {dist.get_world_size()} x bs {a.bs} x accum {a.accum} = {dist.get_world_size()*a.bs*a.accum}/step, '
-          f'stop at step {a.max_step}, init {a.init_ckpt or "LEA(처음부터)"}, sem_detach {not a.no_sem_detach}', flush=True)
+          f'stop at step {a.max_step}, init {a.init_ckpt or "LEA(처음부터)"}, sem_detach {not a.no_sem_detach}, freeze_encoder {a.freeze_encoder}', flush=True)
 t0 = time.time(); done = step >= a.max_step
 while not done:
     epoch += 1; samp.set_epoch(epoch)

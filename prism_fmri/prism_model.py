@@ -35,11 +35,21 @@ class PrismMVDiffusion(MVDiffusion):
         self.sem_detach = sem_detach
         self.proto_temp = proto_temp
 
-        # 옵티마이저 다시 만들기 (공식과 같은 AdamW β(0.9, 0.95)·warmup·linear decay, 새 모듈 포함)
+        self._opt_cfg = (lr, warmup, total_steps)
+        self.build_optimizer()
+
+    def build_optimizer(self):
+        """공식과 같은 AdamW β(0.9, 0.95)·warmup·linear decay. requires_grad인 파라미터만 (인코더 고정 시 본체 제외)."""
+        lr, warmup, total_steps = self._opt_cfg
         params = list(self.unet.parameters()) + list(self.fmri_encoder.parameters()) + \
             [self.i_logit_scale, self.t_logit_scale] + list(self.semantic_to_clip.parameters())
-        self.opt = AdamW(params, lr=lr, betas=(0.9, 0.95))
+        self.opt = AdamW([p for p in params if p.requires_grad], lr=lr, betas=(0.9, 0.95))
         self.sche = get_linear_schedule_with_warmup(self.opt, num_warmup_steps=warmup, num_training_steps=total_steps)
+
+    def set_freeze_encoder(self, flag=True):
+        """fMRI 인코더 ViT 본체 고정 (공개 가중치 그대로) → 헤드·aggregation·LoRA·semantic_to_clip만 학습. 메모리·시간 절약."""
+        self.fmri_encoder.set_freeze_backbone(flag)
+        self.build_optimizer()
 
     @torch.no_grad()
     def build_prototypes(self, template='a 3D object of {}'):
