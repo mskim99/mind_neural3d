@@ -58,26 +58,42 @@ class PrismMVDiffusion(MVDiffusion):
             f = self.clip_model.encode_text(self.tokenizer([template.format(n) for n in self.class_names]).cuda())
         self.cls_prototypes.copy_(F.normalize(f.float(), dim=-1))
 
-    def load_init(self, path):
+    def load_init(self, path, lora_scale=1.0):
         """MinD-3D++ 공개 가중치(또는 우리 재학습 model_final.pt)에서 인코더·LoRA·logit scale 불러오기.
-        peft 버전에 따라 '…to_q.weight' ↔ '…to_q.base_layer.weight'가 다를 수 있어 양쪽으로 맞춰 봄."""
+        peft 버전에 따라 '…to_q.weight' ↔ '…to_q.base_layer.weight'가 다를 수 있어 양쪽으로 맞춰 봄.
+        LoRA rank가 우리 모델(공식 코드 r64)과 다르면 (공개 Objaverse 가중치는 r16) 공개 LoRA를 본체 가중치에 병합
+        (W ← W + B·A·lora_scale, 배율 1 = 저자 가중치 추론 때와 같음) → 우리 LoRA(r64)는 0에서 시작 → 출력은 공개 가중치와 같음."""
         sd = torch.load(path, map_location='cpu')
         sd = sd.get('model', sd)
         own = self.state_dict()
-        new, skipped = {}, []
-        for k, v in sd.items():
+
+        def own_key(k, shape):
             cands = [k, k.replace('.weight', '.base_layer.weight').replace('.bias', '.base_layer.bias'), k.replace('.base_layer.', '.')]
-            hit = next((c for c in cands if c in own and own[c].shape == v.shape), None)
+            return next((c for c in cands if c in own and own[c].shape == shape), None)
+
+        new, skipped, merged = {}, [], 0
+        lora_mismatch = {k for k in sd if 'lora_' in k and own_key(k, sd[k].shape) is None}
+        for k, v in sd.items():
+            if k in lora_mismatch:
+                continue
+            hit = own_key(k, v.shape)
             if hit is None:
                 skipped.append(k)
             else:
                 new[hit] = v
+        for ka in [k for k in lora_mismatch if '.lora_A.' in k]:              # rank가 다른 LoRA → 본체에 병합
+            kb = ka.replace('.lora_A.', '.lora_B.')
+            base = ka.split('.lora_A.')[0]
+            kbase = next((c for c in (base + '.base_layer.weight', base + '.weight') if c in new), None)
+            if kbase is None or kb not in sd:
+                skipped += [ka, kb]; continue
+            new[kbase] = (new[kbase].float() + sd[kb].float() @ sd[ka].float() * lora_scale).to(new[kbase].dtype); merged += 1
         r = self.load_state_dict(new, strict=False)
         n_lora = sum('lora_' in k for k in new); n_enc = sum(k.startswith('fmri_encoder.') for k in new)
         missing_core = [k for k in r.missing_keys if k.startswith('fmri_encoder.') and not any(h in k for h in ('sem_head', 'var_head', 'subj_head'))]
-        print(f'[init] {path}: loaded {len(new)} (fmri_encoder {n_enc}, lora {n_lora}), skipped {len(skipped)}, '
+        print(f'[init] {path}: loaded {len(new)} (fmri_encoder {n_enc}, lora {n_lora}, rank 다른 LoRA 본체 병합 {merged}), skipped {len(skipped)}, '
               f'missing fmri_encoder core {len(missing_core)}', flush=True)
-        assert n_lora > 0 and n_enc > 0 and not missing_core, 'init 가중치에서 인코더·LoRA를 못 찾음'
+        assert (n_lora > 0 or merged > 0) and n_enc > 0 and not missing_core, 'init 가중치에서 인코더·LoRA를 못 찾음'
         return r
 
     def proto_loss(self, sem, labels):
