@@ -17,7 +17,7 @@ fMRI (6프레임)
 | 파일 | 내용 |
 |---|---|
 | `prism_encoder.py` | `PrismFMRIEncoder`: MinD-3D++ `fMRI_Encoder` 상속 + 헤드 3개. 의미·변형 헤드는 잔차 MLP(마지막 층 0 초기화) → 처음엔 항등이라 공개 가중치를 넣으면 MinD-3D++와 같은 출력 |
-| `prism_model.py` | `PrismMVDiffusion`: 공식 `src/mvdiffusion.MVDiffusion` 상속. 의미 ProtoCE(범주 프로토타입), 의미 경로 확산 gradient 차단(EEG판과 같음), 공식 CLIP 대조 손실 유지, 직교 손실 없음 |
+| `prism_model.py` | `PrismMVDiffusion`: 공식 `src/mvdiffusion.MVDiffusion` 상속. 의미 ProtoCE(범주 프로토타입), 의미 경로 확산 gradient 차단(EEG판과 같음), 공식 CLIP 대조 손실 유지, 직교 손실(EEG판, λ_ortho)·1단계 학습 옵션 |
 | `train_prism_fmri.py` | 학습 (Pro6000 MinD-3D++ 재학습 스크립트 기반). `--init_ckpt`로 공개 가중치에서 시작 |
 | `infer_prism_fmri.py` | 추론: 6뷰까지 (`images/` 격자, `views/<이름>/00~05.png` TRELLIS 입력). 3D는 `scripts/infer_prism.sh`가 이어서 TRELLIS로 |
 | `tools/instantmesh_baseline.py` | **MinD-3D++ 기준선 전용** 6뷰 → InstantMesh (`--cam v12` 공식 / `--cam video` 영상 자세: FOV 30·거리 5.06·방향 자동). PRISM에는 안 씀 |
