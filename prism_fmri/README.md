@@ -30,9 +30,13 @@ fMRI (6프레임)
 | 의미 | ProtoCE: 6프레임 평균 → `semantic_to_clip`(1024→128→1024) → 범주 이름 OpenCLIP ViT-H 텍스트 프로토타입 (temp 0.07). 확산 손실은 차단(`--no_sem_detach`로 해제) |
 | 변형 · LoRA · aggregation | 확산 손실 (v-예측 MSE, 공식) |
 | 인코더 12층 CLS | 공식 CLIP 대조 손실 (OpenCLIP 이미지·텍스트) |
-| 피험자 | 없음 |
+| 피험자 | 직교 손실에만 참여 (EEG판 bias_filtering과 같음), joint 단계에서 고정 |
 
-총 손실 = 확산 + `λ_clip`·CLIP + `λ_proto`·ProtoCE (기본 1, 1).
+총 손실 = 확산 + `λ_clip`·CLIP + `λ_proto`·ProtoCE + `λ_ortho`·직교 (기본 1, 1, 0).
+
+- **직교 손실 (EEG판 그대로, 10-26 추가):** 의미(CLS 6프레임 평균)·변형(패치 토큰 평균)·피험자(헤드 출력 6프레임 평균) 세 벡터의 쌍별 |cos| 배치 평균 합. `ORTHO=1`로 켬.
+- **2단계 학습 (EEG판 그대로):** `STAGE1=N`이면 처음 N 스텝은 확산 없이 ProtoCE + 직교만 → joint. 피험자 헤드는 joint에서 고정. EEG판과 다른 점: 1단계에서도 fMRI 인코더 ViT는 고정(`FREEZE`, 공개 가중치)
+- 설계대로 돌리기: `ORTHO=1 STAGE1=1000 OUT_TAG=_s1o STEPS=6000 BS=4 AC=4 bash scripts/train_prism.sh` (출력 `prism_train_obj_s1o/`)
 
 - **학습 GT = 자극 영상 프레임** (Pro6000 `data/GTviews_video/obj`, 영상 0·64·…·320번 프레임). 학습 정답은 피험자가 본 자극 안에서만. 평가 GT·렌더는 MinD-3D++ 프로토콜 그대로.
 - **`--freeze_encoder`** (스크립트 기본 켜짐, `FREEZE=`로 끔): 인코더 ViT 본체를 공개 가중치 그대로 고정하고 헤드·aggregation·LoRA·semantic_to_clip만 학습. GPU 1을 MinD-3D++ 재학습과 나눠 쓰거나 4090(24 GB)에서 돌릴 때.

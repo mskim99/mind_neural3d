@@ -1,7 +1,7 @@
 # PRISM fMRI판 인코더 — MinD-3D++ fMRI 인코더(fMRI_Encoder)를 상속해 성분 분리 헤드 3개를 붙임.
 #   의미   (semantic)  : 프레임별 CLS 토큰 → sem_head → (6프레임 평균) → Zero123++ cross-attention
 #   변형   (variation) : 패치 토큰 256개   → var_head → (MinD-3D++ 재배열 + aggregation) → Zero123++ cond_lat
-#   피험자 (perceptive): CLS 토큰          → subj_head → 생성에 안 씀 (지금은 손실 없음, 자리만 둠)
+#   피험자 (perceptive): CLS 토큰          → subj_head → 생성에 안 씀. EEG판(bias_filtering)처럼 직교 손실에만 참여, 2단계에서 고정
 # 의미·변형 헤드는 잔차 MLP이고 마지막 층을 0으로 시작 → 처음에는 입력을 그대로 통과(항등)시켜
 # MinD-3D++ 공개 가중치를 불러오면 MinD-3D++와 같은 조건(같은 6뷰)에서 학습이 시작됨.
 # 기존 fMRI_Encoder의 키(patch_embed·blocks·norm·clip_norm·aggregation)는 이름이 그대로라 공개 가중치가 바로 들어감.
@@ -61,6 +61,7 @@ class PrismFMRIEncoder(fMRI_Encoder):
     def route(self, tokens):
         """tokens [N, 257, D] (마지막 층 출력) → [의미 CLS ; 변형 패치] 같은 모양."""
         cls, patch = tokens[:, :1], tokens[:, 1:]
+        self.last_subj = self.subj_head(cls[:, 0])          # 직교 손실용 (생성에는 안 씀)
         return torch.cat([self.sem_head(cls), self.var_head(patch)], dim=1)
 
     # 공식 코드가 부르는 이름 그대로 덮어씀 (학습: _clip, 추론 파이프라인: wo_pred)

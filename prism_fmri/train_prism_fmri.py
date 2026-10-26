@@ -2,7 +2,9 @@
 #  ① 모델: PrismMVDiffusion (prism_model.py) — 의미/변형/피험자 헤드, 의미 ProtoCE, 의미 경로 확산 gradient 차단
 #  ② 초기값: --init_ckpt (MinD-3D++ 공개 가중치 sub01.pt 등)에서 인코더·LoRA·logit scale을 불러옴. 새 헤드는 항등으로 시작
 #  ③ 데이터에 범주 번호 'cls' 추가 (학습 리스트의 범주를 정렬한 순서), 범주 이름 → OpenCLIP 텍스트 프로토타입
-#  ④ 손실 = 확산 + λ_clip·CLIP 대조(공식) + λ_proto·ProtoCE. 직교 손실 없음
+#  ④ 손실 = 확산 + λ_clip·CLIP 대조(공식) + λ_proto·ProtoCE + λ_ortho·직교(EEG판과 같음, 기본 0 = 끔)
+#  ④-2 --stage1_steps N: EEG판 2단계 학습. 처음 N 스텝은 확산 없이 ProtoCE + 직교만(의미·변형·피험자 헤드, CLIP projection),
+#      그다음 joint(확산 포함). 피험자 헤드는 joint에서 고정 (EEG판 bias_filtering과 같음). 0이면 joint만
 #  ⑤ 기본 스텝 수를 짧게(--max_step 기본 5000): 공개 가중치에서 시작하는 미세조정이라
 #  ⑥ --freeze_encoder: 인코더 ViT 본체 고정 (GPU 1을 다른 학습과 나눠 쓸 때, 4090 24 GB용)
 #  학습 GT: 자극 영상 프레임 (Pro6000 data/GTviews_video/obj, 로컬 DataSet/MinD-3D++/GT_views_train) — 학습 정답은 피험자가 본 자극 안에서만
@@ -33,6 +35,8 @@ p.add_argument('--warmup', type=int, default=300)
 p.add_argument('--lambda_clip', type=float, default=1.0)
 p.add_argument('--lambda_proto', type=float, default=1.0)
 p.add_argument('--proto_temp', type=float, default=0.07)
+p.add_argument('--lambda_ortho', type=float, default=0.0)
+p.add_argument('--stage1_steps', type=int, default=0)
 p.add_argument('--freeze_encoder', action='store_true')  # fMRI 인코더 ViT 본체 고정 (공개 가중치 그대로) → 헤드·aggregation·LoRA만 학습, 메모리 절약
 p.add_argument('--no_sem_detach', action='store_true')  # 켜면 확산 손실 gradient가 의미 경로로도 흐름 (EEG판은 차단)
 p.add_argument('--save_every', type=int, default=1000)
@@ -155,19 +159,25 @@ def save_latest():
 ntr = sum(x.numel() for x in model.parameters() if x.requires_grad)
 if rank == 0:
     print(f'{a.dataset}: trainable {ntr/1e6:.1f}M, world {dist.get_world_size()} x bs {a.bs} x accum {a.accum} = {dist.get_world_size()*a.bs*a.accum}/step, '
-          f'stop at step {a.max_step}, init {a.init_ckpt or "LEA(처음부터)"}, sem_detach {not a.no_sem_detach}, freeze_encoder {a.freeze_encoder}', flush=True)
-t0 = time.time(); done = step >= a.max_step
+          f'stop at step {a.max_step}, init {a.init_ckpt or "LEA(처음부터)"}, sem_detach {not a.no_sem_detach}, freeze_encoder {a.freeze_encoder}, lambda_ortho {a.lambda_ortho}, stage1_steps {a.stage1_steps}', flush=True)
+t0 = time.time(); done = step >= a.max_step; stage = None
 while not done:
     epoch += 1; samp.set_epoch(epoch)
     for batch in tl:
         model.train(); it += 1
-        dl, cl, pl, pa = model.get_loss(batch)
-        ((dl + a.lambda_clip * cl + a.lambda_proto * pl) / a.accum).backward()
+        if step < a.stage1_steps:                                          # 1단계: 확산 없음
+            stage = 'S1'; pl, pa, ol = model.semantic_stage_loss(batch); dl = cl = torch.zeros((), device=pl.device)
+            ((a.lambda_proto * pl + a.lambda_ortho * ol) / a.accum).backward()
+        else:
+            if stage != 'J':                                               # joint 시작: 피험자 헤드 고정 (EEG판)
+                model.fmri_encoder.subj_head.requires_grad_(False); stage = 'J'
+            dl, cl, pl, pa, ol = model.get_loss(batch)
+            ((dl + a.lambda_clip * cl + a.lambda_proto * pl + a.lambda_ortho * ol) / a.accum).backward()
         if it % a.accum != 0:
             continue
         model.opt.step(); model.opt.zero_grad(); model.sche.step(); step += 1
         if rank == 0 and step % a.print_every == 0:
-            print(f'[ep {epoch}] step {step}/{a.max_step} diff {float(dl):.4f} clip {float(cl):.4f} proto {float(pl):.4f} proto_acc {float(pa):.3f} '
+            print(f'[ep {epoch}] step {step}/{a.max_step} diff {float(dl):.4f} clip {float(cl):.4f} proto {float(pl):.4f} proto_acc {float(pa):.3f} ortho {float(ol):.4f} {stage} '
                   f'lr {model.sche.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated()/1e9:.1f}GB {time.time()-t0:.0f}s', flush=True)
         if a.save_every and step % a.save_every == 0 and step < a.max_step:
             save_latest()

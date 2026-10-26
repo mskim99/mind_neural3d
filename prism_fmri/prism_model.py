@@ -5,7 +5,8 @@
 #     의미(6프레임 평균) → semantic_to_clip(1024→128→1024) → 범주 이름 OpenCLIP ViT-H 텍스트 프로토타입과 코사인/temperature → CE
 #  ③ 의미 → cross-attention 경로에서 확산 손실 gradient 차단(sem_detach, EEG판과 같음): 의미는 범주 손실로만, 변형은 확산 손실로만 학습
 #  ④ 공식 CLIP 대조 손실(12층 CLS, OpenCLIP 이미지·텍스트)은 그대로 둠
-#  ⑤ 직교 손실은 넣지 않음 (10-21 지시). 피험자 헤드는 자리만 있고 학습 신호 없음
+#  ⑤ 직교 손실 (EEG판 get_orthogonal_loss와 같음): 의미·변형·피험자 세 벡터의 쌍별 |cos| 평균 합. λ_ortho=0이면 끔
+#     벡터: 의미 = 프레임별 의미 CLS의 6프레임 평균, 변형 = 변형 패치 토큰 평균(256패치 × 6프레임), 피험자 = 피험자 헤드 출력 6프레임 평균
 # 실행 위치: 공식 코드처럼 cwd에 pretrained_models/ 와 src(→ MinD-3D/src 링크)가 있어야 함.
 import numpy as np
 import torch
@@ -100,6 +101,30 @@ class PrismMVDiffusion(MVDiffusion):
         assert (n_lora > 0 or merged > 0 or dropped > 0) and n_enc > 0 and not missing_core, 'init 가중치에서 인코더·LoRA를 못 찾음'
         return r
 
+    @staticmethod
+    def orthogonal_loss(sem, var, subj):
+        """EEG판(mvdiffusion_var_protofinal.py get_orthogonal_loss) 그대로: 세 벡터 간 |cos|의 배치 평균을 쌍마다 더함."""
+        s, v, b = (F.normalize(x.float(), dim=-1) for x in (sem, var, subj))
+        return (s * v).sum(-1).abs().mean() + (s * b).sum(-1).abs().mean() + (v * b).sum(-1).abs().mean()
+
+    def component_vectors(self, tokens, B):
+        """route()를 거친 토큰 [B*6, 257, D] → (의미 [B, D], 변형 [B, D], 피험자 [B, D])."""
+        sem = tokens[:, 0, :].view(B, 6, -1).mean(1)
+        var = tokens[:, 1:, :].mean(1).view(B, 6, -1).mean(1)
+        subj = self.fmri_encoder.last_subj.view(B, 6, -1).mean(1)
+        return sem, var, subj
+
+    @torch.autocast("cuda", dtype=torch.bfloat16)
+    def semantic_stage_loss(self, batch):
+        """1단계(EEG판 stage='semantic'): 확산 없이 ProtoCE + 직교만."""
+        cond_fmri, _ = self.prepare_batch_data(batch)
+        B = cond_fmri.shape[0]
+        dtype = next(self.fmri_encoder.parameters()).dtype
+        tokens = self.fmri_encoder.forward_encoder_wo_pred(cond_fmri.to(dtype).view(-1, 1, 256, 256))
+        sem, var, subj = self.component_vectors(tokens, B)
+        p_loss, p_acc = self.proto_loss(sem, batch['cls'].to(self.device))
+        return p_loss, p_acc, self.orthogonal_loss(sem, var, subj)
+
     def proto_loss(self, sem, labels):
         z = F.normalize(self.semantic_to_clip(sem.float()), dim=-1)
         logits = z @ self.cls_prototypes.t() / self.proto_temp
@@ -135,8 +160,9 @@ class PrismMVDiffusion(MVDiffusion):
         clip_loss = self.cal_clip_loss(image_features, fmri_feature, self.i_logit_scale.exp()) + \
             self.cal_clip_loss(text_features, fmri_feature, self.t_logit_scale.exp())
 
-        sem = tokens[:, 0, :].view(B, 6, 1024).mean(dim=1)               # 의미 성분 (6프레임 평균)
+        sem, var_vec, subj = self.component_vectors(tokens, B)            # 의미 성분 (6프레임 평균) 등
         p_loss, p_acc = self.proto_loss(sem, batch['cls'].to(self.device))
+        o_loss = self.orthogonal_loss(sem, var_vec, subj)
 
         if np.random.rand() < self.drop_cond_prob:                       # classifier-free guidance (공식과 같음)
             prompt_embeds = self.pipeline._encode_prompt([""] * B, self.device, 1, False)
@@ -152,4 +178,4 @@ class PrismMVDiffusion(MVDiffusion):
         v_pred = self.forward_unet(latents_noisy, t, prompt_embeds, cond_lat)
         diff_loss, _ = self.compute_loss(v_pred, self.get_v(latents, noise, t))
         self.global_step += 1
-        return diff_loss, clip_loss, p_loss, p_acc
+        return diff_loss, clip_loss, p_loss, p_acc, o_loss
