@@ -36,6 +36,7 @@ p.add_argument('--diffusion_steps', type=int, default=75)
 p.add_argument('--seed', type=int, default=42)
 p.add_argument('--scale', type=float, default=1.0)
 p.add_argument('--no_lrm', action='store_true')
+p.add_argument('--base_unet', default='')           # 학습 중 체크포인트(model_latest.pt: 인코더·LoRA만)일 때 본체 UNet (학습 초기값 diffusion_pytorch_model.bin)
 a = p.parse_args()
 seed_everything(a.seed)
 
@@ -50,6 +51,17 @@ sd = torch.load(a.unet_path, map_location='cpu')["model"]
 fm = {k.replace("fmri_encoder.", "", 1): v for k, v in sd.items() if k.startswith("fmri_encoder.")}
 un = {k.replace("unet.base_model.model.unet.", ""): v for k, v in sd.items() if "unet.base_model.model.unet" in k}
 un = {k.replace('.base_layer.', '.'): v for k, v in un.items()}
+if a.base_unet:                                       # 체크포인트에 UNet 본체가 없으면 학습 초기값 UNet을 바탕으로
+    pipeline.unet.load_state_dict(torch.load(a.base_unet, map_location='cpu'), strict=True)
+    print(f'base unet: {a.base_unet}', flush=True)
+base_sd = pipeline.unet.state_dict()
+n_fill = 0
+for k in [k for k in un if '.lora_A.default.weight' in k]:
+    b = k.replace('.lora_A.default.weight', '.weight')
+    if b not in un:
+        un[b] = base_sd[b].clone(); n_fill += 1
+if n_fill:
+    print(f'UNet 본체가 체크포인트에 없음 → 현재 UNet에서 {n_fill}개 채움 (--base_unet {"있음" if a.base_unet else "없음: zero123plus 본체"})', flush=True)
 n_lora = 0
 if a.merge_lora:
     for k in [k for k in un if '.lora_A.default.weight' in k]:
