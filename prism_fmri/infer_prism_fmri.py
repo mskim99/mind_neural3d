@@ -36,6 +36,11 @@ p.add_argument('--diffusion_steps', type=int, default=75)
 p.add_argument('--seed', type=int, default=42)
 p.add_argument('--scale', type=float, default=1.0)
 p.add_argument('--no_lrm', action='store_true')
+p.add_argument('--cam', choices=['v12', 'video'], default='v12')   # InstantMesh 입력 카메라. v12 = 공식(방위 30~330·고도 20/-10·거리 4·FOV 30)
+p.add_argument('--cam_radius', type=float, default=5.06)          # video: 고도 0·방위 0,60..300 (방향 자동), FOV·거리는 보정 시험(10-26) 권장값
+p.add_argument('--cam_fov', type=float, default=30.0)
+p.add_argument('--lrm_only', action='store_true')                 # images/<이름>.png가 있으면 6뷰 생성을 건너뛰고 3D만
+p.add_argument('--mesh_dir', default='meshes')
 p.add_argument('--base_unet', default='')           # 학습 중 체크포인트(model_latest.pt: 인코더·LoRA만)일 때 본체 UNet (학습 초기값 diffusion_pytorch_model.bin)
 a = p.parse_args()
 seed_everything(a.seed)
@@ -92,7 +97,7 @@ for l in lines:
 if a.limit:
     items = items[:a.limit]
 
-for d in ('images', 'meshes', 'views'):
+for d in ('images', a.mesh_dir, 'views'):
     os.makedirs(os.path.join(a.out_dir, d), exist_ok=True)
 logp = os.path.join(a.out_dir, '_timing.csv'); new = not os.path.exists(logp)
 logf = open(logp, 'a', newline=''); w = csv.writer(logf)
@@ -112,6 +117,8 @@ def save_views(grid, name):
 sec_mv = {}
 for i, (name, npy) in enumerate(items):
     t0 = time.time()
+    if a.lrm_only and os.path.exists(os.path.join(a.out_dir, 'images', f'{name}.png')):
+        sec_mv[name] = 0.0; continue
     x = np.load(npy)[2:8]
     if len(x) < 6:
         x = np.concatenate([x, x[-(6 - len(x)):]])
@@ -134,9 +141,23 @@ model = instantiate_from_config(config.model_config)
 st = torch.load(a.lrm_ckpt, map_location='cpu')['state_dict']
 model.load_state_dict({k[14:]: v for k, v in st.items() if k.startswith('lrm_generator.')}, strict=True)
 model = model.to(device); model.init_flexicubes_geometry(device, fovy=30.0); model = model.eval()
-input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0 * a.scale).to(device)
+from src.utils.camera_util import spherical_camera_pose, FOV_to_intrinsics
+
+def cams16(az, el, r, fov):
+    c2w = spherical_camera_pose(np.array(az, float), np.array(el, float), r).float().flatten(-2)
+    K = FOV_to_intrinsics(fov).unsqueeze(0).repeat(len(az), 1, 1).float().flatten(-2)
+    return torch.cat([c2w[:, :12], torch.stack([K[:, 0], K[:, 4], K[:, 2], K[:, 5]], -1)], -1).unsqueeze(0).to(device)
+
+if a.cam == 'v12':
+    input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0 * a.scale).to(device)
+else:   # 영상 자세: 고도 0, 방위 0·60·…·300, 회전 방향은 물체마다 입력 6뷰 실루엣 IoU로 고름 (GT 미사용, tools/cam_calib.py와 같은 기준)
+    model.init_flexicubes_geometry(device, fovy=a.cam_fov)
+    AZ = {d: [d * 60 * i for i in range(6)] for d in (1, -1)}
+    VCAM = {d: cams16(AZ[d], [0] * 6, a.cam_radius, a.cam_fov) for d in (1, -1)}
+    VW2C = {d: torch.linalg.inv(spherical_camera_pose(np.array(AZ[d], float), np.zeros(6), a.cam_radius).float()).unsqueeze(0).to(device) for d in (1, -1)}
+    dirf = open(os.path.join(a.out_dir, f'{a.mesh_dir}_dir.csv'), 'a', newline=''); dw = csv.writer(dirf)
 for i, (name, npy) in enumerate(items):
-    mp = os.path.join(a.out_dir, 'meshes', f'{name}.obj')
+    mp = os.path.join(a.out_dir, a.mesh_dir, f'{name}.obj')
     if os.path.exists(mp):
         continue
     torch.cuda.reset_peak_memory_stats(); t1 = time.time()
@@ -145,7 +166,17 @@ for i, (name, npy) in enumerate(items):
     imgs = rearrange(imgs, 'c (n h) (m w) -> (n m) c h w', n=3, m=2).unsqueeze(0).to(device)
     imgs = v2.functional.resize(imgs, 320, interpolation=3, antialias=True).clamp(0, 1)
     with torch.no_grad():
-        planes = model.forward_planes(imgs, input_cameras)
+        if a.cam == 'v12':
+            planes = model.forward_planes(imgs, input_cameras)
+        else:
+            sil = (imgs[0].min(1)[0] < 235 / 255.).cpu().numpy()          # 생성 6뷰 실루엣 (흰 배경)
+            best = None
+            for d in (1, -1):
+                pl = model.forward_planes(imgs, VCAM[d])
+                m = model.forward_geometry(pl, VW2C[d], render_size=320)['mask'][0, :, 0].float().cpu().numpy() > 0.5
+                iou = float(np.mean([(m[v_] & sil[v_]).sum() / max((m[v_] | sil[v_]).sum(), 1) for v_ in range(6)]))
+                if best is None or iou > best[0]: best = (iou, d, pl)
+            planes = best[2]; dw.writerow([name, best[1], f'{best[0]:.4f}']); dirf.flush()
         v, f, uvs, tidx, tex = model.extract_mesh(planes, use_texture_map=True, **infer_kwargs)
         save_obj_with_mtl(v.data.cpu().numpy(), uvs.data.cpu().numpy(), f.data.cpu().numpy(),
                           tidx.data.cpu().numpy(), tex.permute(1, 2, 0).data.cpu().numpy(), mp)

@@ -1,6 +1,7 @@
 #!/bin/bash
 # PRISM 3단계: test 추론 → 6뷰(images/, views/) + InstantMesh 메시. 사용법: CKPT=<model_final.pt> bash infer_prism.sh [--no_lrm] [--limit N]
 # 학습 중 체크포인트(model_latest.pt, 인코더·LoRA만): CKPT=…/model_latest.pt OUT=… bash infer_prism.sh --no_lrm --base_unet $W/weights/train_init/diffusion_pytorch_model.bin
+# 영상 자세 학습 모델 3D: bash infer_prism.sh --lrm_only --cam video --mesh_dir meshes_vid   (FOV 30·거리 5.06·방향 자동, 보정 시험 10-26)
 # CKPT를 공개 가중치($INIT)로 주면 헤드 없이 항등 → MinD-3D++와 같은 결과가 나와야 함 (연결 확인용)
 source $(dirname $0)/common.sh || exit 1
 CK=${CKPT:-$W/prism_train_$D/model_final.pt}; OUT=${OUT:-$W/prism_infer_$D/$(basename $(dirname $CK))}
