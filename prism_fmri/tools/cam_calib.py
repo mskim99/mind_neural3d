@@ -8,6 +8,7 @@ import os, sys, csv, glob, time, argparse
 import numpy as np, torch
 from PIL import Image
 from omegaconf import OmegaConf
+sys.path.insert(0, '.')                                 # 실행 위치(MinD-3D/InstantMesh)의 src
 from src.utils.train_util import instantiate_from_config
 from src.utils.camera_util import spherical_camera_pose, FOV_to_intrinsics
 
