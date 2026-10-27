@@ -13,9 +13,11 @@ p.add_argument('mode', choices=['dino', 'gen'])
 p.add_argument('--frames'); p.add_argument('--pred'); p.add_argument('--out', required=True)
 p.add_argument('--view', type=int, default=0); p.add_argument('--seed', type=int, default=42); p.add_argument('--limit', type=int, default=0)
 p.add_argument('--trellis_repo', default='/home/oem/jhj/meshgen_tools/repo/third_party/TRELLIS')
-p.add_argument('--model', default='microsoft/TRELLIS-image-large')
+p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
 os.environ.setdefault('SPCONV_ALGO', 'native')
+# 서버 meshgen venv에는 flash_attn이 없음 → TRELLIS attention 백엔드를 xformers로 (기본값 flash_attn이면 모델 로드 실패)
+os.environ.setdefault('ATTN_BACKEND', 'xformers'); os.environ.setdefault('SPARSE_ATTN_BACKEND', 'xformers')
 import torch
 import xformers.ops as xops
 from xformers.ops import fmha
@@ -27,6 +29,10 @@ sys.path.insert(0, a.trellis_repo)
 from PIL import Image
 from trellis.pipelines import TrellisImageTo3DPipeline
 
+if not a.model:
+    snaps = sorted(glob.glob(os.path.join(os.environ.get('HF_HOME', ''), 'hub', 'models--microsoft--TRELLIS-image-large', 'snapshots', '*', 'pipeline.json')))
+    a.model = os.path.dirname(snaps[-1]) if snaps else 'microsoft/TRELLIS-image-large'
+print('model', a.model, flush=True)
 pipe = TrellisImageTo3DPipeline.from_pretrained(a.model); pipe.cuda()
 for f in ('preprocess_image', 'get_cond', 'sample_sparse_structure', 'sample_slat', 'decode_slat'):
     assert hasattr(pipe, f), f'TRELLIS API에 {f} 없음'
