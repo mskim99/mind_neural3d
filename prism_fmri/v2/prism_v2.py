@@ -113,6 +113,8 @@ def dice_loss(logit, target, eps=1.0):
 
 def prism_v2_losses(out, batch, proto_temp=0.07):
     L = {}
+    # autocast(bf16) 출력을 fp32로 맞춤 (CUDA에서 bf16 출력 vs fp32 정답 MSE는 backward dtype 오류)
+    out = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in out.items()}
     tgt = batch['cond_tokens'].float()
     L['tok_mse'] = F.mse_loss(out['cond_tokens'], tgt)
     L['tok_cos'] = (1 - F.cosine_similarity(out['cond_tokens'], tgt, dim=-1)).mean()
