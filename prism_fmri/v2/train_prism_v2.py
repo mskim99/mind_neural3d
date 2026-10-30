@@ -27,6 +27,8 @@ p.add_argument('--lam_tok', type=float, default=1.0); p.add_argument('--lam_prot
 p.add_argument('--lam_var', type=float, default=1.0); p.add_argument('--lam_subj', type=float, default=0.1)
 p.add_argument('--print_every', type=int, default=20); p.add_argument('--val_every', type=int, default=1000); p.add_argument('--save_every', type=int, default=2000)
 p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', action='store_true')
+p.add_argument('--probe_grad', type=int, default=0)     # >0: 학습 대신 loss별 gradient 크기만 재고 끝 (배치 수)
+p.add_argument('--probe_ckpt', default='')               # 비우면 초기값만, 주면 초기값 + 이 체크포인트 둘 다
 a = p.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
 dev = 'cuda'
@@ -127,6 +129,35 @@ def validate():
           f'rot {L["rot"]:.4f} subj_acc {L["subj_acc"]:.3f}', flush=True)
     model.train()
 
+
+
+if a.probe_grad:   # loss별로 SV Encoder·P에 도착하는 gradient 크기 (가중치 λ 곱한 값 기준, 학습 안 함)
+    import json
+    groups = {'sv_encoder': list(model.shared.parameters()) + list(model.frame_emb.parameters()), 'P': list(model.P.parameters())}
+    terms = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambda L: W['proto'] * L['proto'],
+             'geo': lambda L: W['geo'] * L['geo'], 'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot']),
+             'subj': lambda L: W['subj'] * L['subj']}
+    res = {}
+    for tag in ['init'] + (['trained'] if a.probe_ckpt else []):
+        if tag == 'trained':
+            model.load_state_dict(torch.load(a.probe_ckpt, map_location='cpu')['model'], strict=False); model.to(dev)
+        model.train(); acc = {}; it = iter(tl)
+        for i in range(a.probe_grad):
+            b = to_dev(next(it))
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                out = model(b['fmri'], b['frame_idx'])
+            L = prism_v2_losses(out, b)
+            for name, f in terms.items():
+                v = f(L); acc.setdefault((name, 'value'), []).append(float(v))
+                for gname, ps in groups.items():
+                    gr = torch.autograd.grad(v, ps, retain_graph=True, allow_unused=True)
+                    n = math.sqrt(sum(float((x.float() ** 2).sum()) for x in gr if x is not None))
+                    acc.setdefault((name, gname), []).append(n)
+        res[tag] = {f'{k[0]}/{k[1]}': float(np.mean(v)) for k, v in acc.items()}
+        print(f'[probe {tag}] {a.probe_grad} batches  (loss value · |grad| at SV Encoder · |grad| at P)', flush=True)
+        for name in terms:
+            print(f'  {name:5s}  value {res[tag][name + "/value"]:.4f}  sv_encoder {res[tag][name + "/sv_encoder"]:.4e}  P {res[tag][name + "/P"]:.4e}', flush=True)
+    json.dump(res, open(f'{a.out_dir}/grad_probe.json', 'w'), indent=1); print('PROBE_DONE', flush=True); sys.exit(0)
 
 t0 = time.time(); model.train(); done = step >= a.max_step; ep = step // max(1, len(tl))
 while not done:
