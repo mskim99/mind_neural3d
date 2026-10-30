@@ -6,7 +6,7 @@ import os, sys, argparse, numpy as np, torch
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from omegaconf import OmegaConf
 from src.encoder.autoencoder2 import fMRI_Encoder
-from prism_v2 import PrismV2
+from prism_v2 import PrismV2, model_opts
 p = argparse.ArgumentParser()
 p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--ckpt', required=True)
 p.add_argument('--out', required=True); p.add_argument('--subs', default=''); p.add_argument('--split', default='test')
@@ -15,7 +15,7 @@ a = p.parse_args()
 ck = torch.load(a.ckpt, map_location='cpu')
 SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8))
 cfg = OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))
-model = PrismV2(fMRI_Encoder(cfg.model.params.fmri_encoder_config), n_classes=len(SYN), n_subjects=len(SUBS))
+model = PrismV2(fMRI_Encoder(cfg.model.params.fmri_encoder_config), n_classes=len(SYN), n_subjects=len(SUBS), **model_opts(ck.get('args')))   # 학습 옵션대로
 print('load', model.load_state_dict(ck['model'], strict=True), flush=True)
 model = model.cuda().eval()
 ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{a.split}_list.txt')) if l.strip()]
