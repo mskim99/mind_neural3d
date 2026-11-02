@@ -15,7 +15,8 @@ a = p.parse_args()
 ck = torch.load(a.ckpt, map_location='cpu')
 SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8))
 cfg = OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))
-model = Prism(fMRI_Encoder(cfg.model.params.fmri_encoder_config), n_classes=len(SYN), n_subjects=len(SUBS))
+model = Prism(fMRI_Encoder(cfg.model.params.fmri_encoder_config), n_classes=len(SYN), n_subjects=len(SUBS),
+              temporal=bool((ck.get('args') or {}).get('temporal', 0)))   # 옛 체크포인트(11-02 첫 학습)는 Temporal Stem 없음
 print('load', model.load_state_dict(ck['model'], strict=True), flush=True)
 model = model.cuda().eval()
 ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{a.split}_list.txt')) if l.strip()]

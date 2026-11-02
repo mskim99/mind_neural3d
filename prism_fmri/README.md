@@ -4,7 +4,7 @@
 
 | 성분 | 구현 (`prism.py`) |
 |---|---|
-| 앞단 | ViT 토큰 + 프레임 임베딩 → Semantic-Variation Encoder (ResMLP×2) → Mixed Features → Orthogonal Projection |
+| 앞단 (Spatio-Temporal) | 공간: ViT(프레임마다) / 시간: Temporal Stem(패치 위치·채널마다 프레임 축 1D conv, 박사님 EEG `TemporalStem`의 fMRI판, `--temporal 1` 기본) → + 프레임 임베딩 → Semantic-Variation Encoder (ResMLP×2) → Mixed Features → Orthogonal Projection |
 | Semantic | 패치 16×16 격자에서 ConvNeXt식 residual encoder (Down Stage → ConvNeXt Block×2 → Residual Encoder) + 학습 감독(CLIP 범주 텍스트 프로토타입 CE) |
 | Variational | 프레임마다 Center(tanh) / Scale(softplus) / Rotate(6D) head (MLP×3 → LayerNorm → Linear) → Aggregate |
 | Perceptive | Token Pooling → Subject Projector (Linear-BN-GELU) → FiLM + 피험자 분류(보조) |

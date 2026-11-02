@@ -24,6 +24,7 @@ p.add_argument('--lam_tok', type=float, default=1.0); p.add_argument('--lam_prot
 p.add_argument('--lam_var', type=float, default=1.0); p.add_argument('--lam_subj', type=float, default=0.1)
 p.add_argument('--print_every', type=int, default=20); p.add_argument('--val_every', type=int, default=1000); p.add_argument('--save_every', type=int, default=2000)
 p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', action='store_true')
+p.add_argument('--temporal', type=int, default=1)    # 1: Temporal Stem 사용 (구조도 Spatio-Temporal), 0: 없음
 p.add_argument('--probe_grad', type=int, default=0)     # >0: 학습 대신 loss별 gradient 크기만 재고 끝 (배치 수)
 p.add_argument('--probe_ckpt', default='')               # 비우면 초기값만, 주면 초기값 + 이 체크포인트 둘 다
 a = p.parse_args()
@@ -79,7 +80,7 @@ sd = torch.load(a.init_ckpt, map_location='cpu'); sd = sd.get('model', sd)
 r = enc.load_state_dict({k[len('fmri_encoder.'):]: v for k, v in sd.items() if k.startswith('fmri_encoder.')}, strict=False)
 print(f'[init] encoder from {a.init_ckpt}: missing {len(r.missing_keys)} unexpected {len(r.unexpected_keys)}', flush=True)
 del sd
-model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS)).to(dev)
+model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), temporal=bool(a.temporal)).to(dev)
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
 print(f'trainable {sum(q.numel() for q in params) / 1e6:.1f}M, subjects {SUBS}, bs {a.bs}, steps {a.max_step}', flush=True)

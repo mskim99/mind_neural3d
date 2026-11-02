@@ -1,13 +1,17 @@
 # PRISM 모델 — 박사님 10-27 구조도(.참고자료/261027_구조도.png)의 분리부를 그림대로 구현 (11-02)
 #  형태 감독(Geometry head) 없음. 각 성분 head의 출력(Semantic·Variational Features)이 그대로 재구성 입력
-#  fMRI 6프레임 → MinD-3D++ fMRI ViT(고정) → Semantic-Variation Encoder(학습, + 프레임 임베딩) → Mixed Features
+#  fMRI 6프레임 → [Spatio-Temporal] MinD-3D++ fMRI ViT(고정, 프레임마다 공간) + Temporal Stem(학습, 패치 위치마다 프레임 축 1D conv)
+#    → Semantic-Variation Encoder(학습, + 프레임 임베딩) → Mixed Features
 #    → Orthogonal Projection P (직교 행렬, 토큰마다) → [Semantic Routing | Variation Routing | Perceptive Filtering]
 #      Semantic    : 패치 16×16 격자에서 ConvNeXt식 residual encoder (Down Stage → ConvNeXt Block×N → Residual Encoder) → Semantic Features
 #                    (+ 학습 감독: 풀링 → CLIP projection → 범주 텍스트 프로토타입 CE)
 #      Variational : 프레임마다 Center / Scale / Rotate head (MLP×3 → LayerNorm → Linear → tanh / softplus / 6D) → Aggregate → Variational Features
 #      Perceptive  : Token Pooling → Subject Projector (Linear-BN-GELU) → Perceptive Features (+ 피험자 분류 보조)
 #    → 재구성: 구조도의 Tri-plane 대신 TRELLIS — [Semantic ; Variational] Features를 Perceptive(FiLM)로 보정 → 조건 토큰 디코더 → TRELLIS 조건 토큰 [1374, 1024]
-#  구조도에 없어 정한 것: ConvNeXt 블록 수(2)·채널, head 은닉 256, Aggregate = 세 head 특징(LayerNorm 출력) 이어 붙여 Linear, Perceptive 입력 방식 FiLM
+#  구조도에 없어 정한 것: ConvNeXt 블록 수(2)·채널, head 은닉 256, Aggregate = 세 head 특징(LayerNorm 출력) 이어 붙여 Linear, Perceptive 입력 방식 FiLM,
+#    Temporal Stem — 구조도엔 이름만 있어 박사님 EEG 코드(src/mvdiffusion_var_semantic_cls_sg.py TemporalStem: 채널마다 시간축 1D conv + BN + GELU)를
+#    fMRI에 옮김: 채널마다(depthwise) 프레임 축 conv(커널 3, 6프레임 유지) + GELU + Linear, 잔차. 마지막 Linear 0 초기화(처음엔 ViT 특징 그대로).
+#    EEG는 시간 → 공간 순서지만, 여기선 공간(ViT)이 고정·사전학습이라 ViT 뒤에 둠. temporal=False면 이전 체크포인트와 같은 구조
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -71,15 +75,30 @@ class PoseHead(nn.Module):
         f = self.n(self.mlp(x)); return self.out(f), f
 
 
+class TemporalStem(nn.Module):
+    """[B, T, N, D] → 같은 크기. 패치 위치(N)·채널(D)마다 따로 프레임 축(T) 1D conv (박사님 EEG TemporalStem의 fMRI판), 잔차."""
+    def __init__(self, d, k=3):
+        super().__init__()
+        self.n = nn.LayerNorm(d)
+        self.conv = nn.Conv1d(d, d, k, padding=k // 2, groups=d)
+        self.out = nn.Linear(d, d); nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)
+    def forward(self, x):
+        B, T, N, D = x.shape
+        h = self.n(x).permute(0, 2, 3, 1).reshape(B * N, D, T)                  # 패치 위치마다 [D, T]
+        h = F.gelu(self.conv(h)).reshape(B, N, D, T).permute(0, 3, 1, 2)        # [B, T, N, D]
+        return x + self.out(h)
+
+
 class Prism(nn.Module):
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256):
+                 sem_ch=512, sem_blocks=2, head_dim=256, temporal=True):
         super().__init__()
         assert sum(splits) == d
         self.encoder = encoder.requires_grad_(False).eval()            # MinD-3D++ fMRI ViT (패치 16, 256×256 → 16×16 + CLS), 고정
         self.splits = splits
         ds, dv, dp = splits
         self.frame_emb = nn.Embedding(n_frames, d)
+        self.temporal = TemporalStem(d) if temporal else None              # Spatio-Temporal의 시간 부분
         self.shared = nn.Sequential(ResMLP(d, 2 * d), ResMLP(d, 2 * d))   # Semantic-Variation Encoder
         self.P = orthogonal(nn.Linear(d, d, bias=False))               # Orthogonal Projection
         # Semantic
@@ -115,7 +134,10 @@ class Prism(nn.Module):
         perceptive_override: 평가 때 Perceptive 벡터를 바꿔 끼우기 ('mean' → 배치 평균 = 사실상 버리기, 텐서 → 그 값)."""
         tok = self.encode_frames(fmri).float()
         B, T, N, D = tok.shape
-        mixed = self.shared(tok + self.frame_emb(frame_idx)[:, :, None, :])           # Mixed Features [B, T, 257, D]
+        x = tok + self.frame_emb(frame_idx)[:, :, None, :]
+        if self.temporal is not None:
+            x = self.temporal(x)                                                     # 프레임 사이 정보 교환
+        mixed = self.shared(x)                                                       # Mixed Features [B, T, 257, D]
         s, v, p = self.P(mixed).split(self.splits, dim=-1)
         out = {}
         # Semantic: 프레임 평균(정적 성분) → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
