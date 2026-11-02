@@ -16,4 +16,4 @@
 3. `infer.sh` — test fMRI → 조건 토큰 → TRELLIS GLB (`PERC=keep|mean`) → `$W/prism_infer$TAG`
 4. `eval.sh` — Shape test 104 렌더·지표 (`M0=1` 권장: metallic 0 렌더)
 
-전처리(로컬): `prep_shape_targets.py` (영상 방위·center·scale, 영상 프레임). 정답 폴더는 서버의 `$W/data/prism_v2_shape` 그대로 씀.
+전처리(로컬): `prep_shape_targets.py` (영상 방위·center·scale, 영상 프레임). 정답 폴더는 서버의 `$W/data/shape_targets`.
