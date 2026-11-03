@@ -1,13 +1,14 @@
 # PRISM 학습 (fMRI-Shape, 다피험자) — 10-27 구조도 분리부 그대로 (prism.py). MinD-3D++ venv, 실행 위치 $W/run (src → MinD-3D/src)
 #  데이터·정답 (prep_shape_targets.py + scripts/dino.sh): <tgt>/targets/<uid>.npz (영상 방위·center·scale), <tgt>/dino/<uid>.npy (TRELLIS 조건 토큰, 영상 프레임 0). 복셀은 안 씀
 #  fMRI 프레임 k ↔ 영상 프레임 round(19.2k) (MinD-3D 전처리가 BOLD 지연 6초를 이미 반영). 쓰는 fMRI 프레임 2~7
+#  --per_subject 1 (11-04): 피험자별 ViT · Semantic · Variational + 공유 SV 인코더 · Perceptive · 디코더, 배치마다 피험자 같은 수, 저장에서 ViT 제외
 #  손실 = λ_tok·(MSE + (1−cos)) + λ_proto·CE(범주 텍스트 프로토타입) + λ_var·(center + scale + rot) + λ_subj·CE(피험자)
 import os, sys, math, time, argparse, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from omegaconf import OmegaConf
 from src.encoder.autoencoder2 import fMRI_Encoder
-from prism import Prism, prism_losses
+from prism import Prism, prism_losses, load_encoder
 
 CLASSES = {'02691156': 'airplane', '02828884': 'bench', '02933112': 'cabinet', '02958343': 'car', '03001627': 'chair', '03211117': 'display',
            '03636649': 'lamp', '03691459': 'loudspeaker', '04090263': 'rifle', '04256520': 'sofa', '04379243': 'table', '04401088': 'telephone',
@@ -27,6 +28,8 @@ p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', actio
 p.add_argument('--temporal', type=int, default=1)    # 1: Temporal Stem 사용 (구조도 Spatio-Temporal), 0: 없음
 p.add_argument('--probe_grad', type=int, default=0)     # >0: 학습 대신 loss별 gradient 크기만 재고 끝 (배치 수)
 p.add_argument('--probe_ckpt', default='')               # 비우면 초기값만, 주면 초기값 + 이 체크포인트 둘 다
+p.add_argument('--per_subject', type=int, default=0)    # 1: 피험자별 ViT · Semantic · Variational, 공유 SV 인코더 · Perceptive · 디코더 (11-04 사용자 결정)
+p.add_argument('--enc_dir', default='')                  # per_subject=1: <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
 a = p.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
 dev = 'cuda'
@@ -75,22 +78,47 @@ def build_prototypes():
 
 
 cfg = OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))
-enc = fMRI_Encoder(cfg.model.params.fmri_encoder_config)
-sd = torch.load(a.init_ckpt, map_location='cpu'); sd = sd.get('model', sd)
-r = enc.load_state_dict({k[len('fmri_encoder.'):]: v for k, v in sd.items() if k.startswith('fmri_encoder.')}, strict=False)
-print(f'[init] encoder from {a.init_ckpt}: missing {len(r.missing_keys)} unexpected {len(r.unexpected_keys)}', flush=True)
-del sd
-model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), temporal=bool(a.temporal)).to(dev)
+if a.per_subject:
+    ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
+    enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
+    print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
+else:
+    ENC_PATHS = [a.init_ckpt]
+    enc = fMRI_Encoder(cfg.model.params.fmri_encoder_config)
+    sd = torch.load(a.init_ckpt, map_location='cpu'); sd = sd.get('model', sd)
+    r = enc.load_state_dict({k[len('fmri_encoder.'):]: v for k, v in sd.items() if k.startswith('fmri_encoder.')}, strict=False)
+    print(f'[init] encoder from {a.init_ckpt}: missing {len(r.missing_keys)} unexpected {len(r.unexpected_keys)}', flush=True)
+    del sd
+model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), temporal=bool(a.temporal), per_subject_sv=bool(a.per_subject)).to(dev)
+STATE = (lambda: model.trainable_state_dict()) if a.per_subject else (lambda: model.state_dict())
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
 print(f'trainable {sum(q.numel() for q in params) / 1e6:.1f}M, subjects {SUBS}, bs {a.bs}, steps {a.max_step}', flush=True)
 opt = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=0.01)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / a.warmup) * 0.5 * (1 + math.cos(math.pi * min(1, s / a.max_step))))
-tl = DataLoader(ShapeSet('train'), batch_size=a.bs, shuffle=True, num_workers=a.workers, drop_last=True, persistent_workers=True)
+class BalancedBatches(torch.utils.data.Sampler):
+    """배치마다 피험자를 같은 수로 (bs / 피험자 수). 한 바퀴 = 가장 적은 피험자 기준."""
+    def __init__(self, items, bs):
+        self.by = {}
+        for i, (si, _) in enumerate(items): self.by.setdefault(si, []).append(i)
+        assert bs % len(self.by) == 0, f'bs {bs}는 피험자 수 {len(self.by)}의 배수여야 함'
+        self.per = bs // len(self.by); self.n = min(len(v) for v in self.by.values()) // self.per
+    def __len__(self): return self.n
+    def __iter__(self):
+        perm = {s: np.random.permutation(v) for s, v in self.by.items()}
+        for b in range(self.n):
+            yield [int(i) for s in sorted(perm) for i in perm[s][b * self.per:(b + 1) * self.per]]
+
+
+train_set = ShapeSet('train')
+if a.per_subject:
+    tl = DataLoader(train_set, batch_sampler=BalancedBatches(train_set.items, a.bs), num_workers=a.workers, persistent_workers=True)
+else:
+    tl = DataLoader(train_set, batch_size=a.bs, shuffle=True, num_workers=a.workers, drop_last=True, persistent_workers=True)
 vl = DataLoader(ShapeSet('test'), batch_size=a.bs, shuffle=False, num_workers=a.workers)
 step = 0; latest = f'{a.out_dir}/model_latest.pt'
 if a.resume and os.path.exists(latest):
-    ck = torch.load(latest, map_location='cpu'); model.load_state_dict(ck['model'])
+    ck = torch.load(latest, map_location='cpu'); model.load_state_dict(ck['model'], strict=not a.per_subject)
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
 KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'subj', 'subj_acc']
@@ -118,16 +146,18 @@ def write(split, L, tot):
 
 @torch.no_grad()
 def validate():
-    model.eval(); acc = {}
+    model.eval(); acc = {}; per = {}
     for b in vl:
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(b['fmri'], b['frame_idx'])
+            out = model(b['fmri'], b['frame_idx'], b['subj'])
         L = prism_losses(out, b)
         for k, v in L.items(): acc.setdefault(k, []).append(float(v))
+        hit = ((out['sem_clip'].float() @ model.prototypes.t()).argmax(-1) == b['cls']).float()
+        for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
     L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
     print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
-          f'rot {L["rot"]:.4f} subj_acc {L["subj_acc"]:.3f}', flush=True)
+          f'rot {L["rot"]:.4f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train()
 
 
@@ -137,12 +167,12 @@ if a.probe_grad:   # loss별로 SV Encoder·P에 도착하는 gradient 크기 (�
     res = {}
     for tag in ['init'] + (['trained'] if a.probe_ckpt else []):
         if tag == 'trained':
-            model.load_state_dict(torch.load(a.probe_ckpt, map_location='cpu')['model']); model.to(dev)
+            model.load_state_dict(torch.load(a.probe_ckpt, map_location='cpu')['model'], strict=not a.per_subject); model.to(dev)
         model.train(); acc = {}; it = iter(tl)
         for i in range(a.probe_grad):
             b = to_dev(next(it))
             with torch.autocast('cuda', dtype=torch.bfloat16):
-                out = model(b['fmri'], b['frame_idx'])
+                out = model(b['fmri'], b['frame_idx'], b['subj'])
             L = prism_losses(out, b)
             for name, f in TERMS.items():
                 v = f(L); acc.setdefault((name, 'value'), []).append(float(v))
@@ -162,7 +192,7 @@ while not done:
     for b in tl:
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(b['fmri'], b['frame_idx'])
+            out = model(b['fmri'], b['frame_idx'], b['subj'])
         L = prism_losses(out, b); tot = total_loss(L)
         opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); sched.step(); step += 1
         if step % a.print_every == 0:
@@ -172,9 +202,10 @@ while not done:
                   f'subj_acc {float(L["subj_acc"]):.3f} lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
         if step % a.val_every == 0: validate()
         if step % a.save_every == 0 or step >= a.max_step:
-            torch.save({'model': model.state_dict(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'step': step, 'args': vars(a)}, latest + '.tmp')
+            torch.save({'model': STATE(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'step': step, 'args': vars(a),
+                        'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, latest + '.tmp')
             os.replace(latest + '.tmp', latest); print(f'saved step {step}', flush=True)
         if step >= a.max_step: done = True; break
 validate()
-torch.save({'model': model.state_dict(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN}, f'{a.out_dir}/model_final.pt')
+torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_final.pt')
 print(f'TRAIN_DONE step {step} {time.time() - t0:.0f}s', flush=True)
