@@ -62,6 +62,8 @@ class ShapeSet(Dataset):
         self.items = [(si, k) for si, s in enumerate(SUBS) for k in ids
                       if os.path.exists(os.path.join(a.data_root, s, 'npy_data', k + '.npy'))]
         print(f'[{split}] {len(ids)} objects × {len(SUBS)} subjects = {len(self.items)}', flush=True)
+        have = {si for si, _ in self.items}
+        assert len(have) == len(SUBS), f'[{split}] fMRI 데이터가 없는 피험자: {[s for i, s in enumerate(SUBS) if i not in have]}'
     def __len__(self): return len(self.items)
     def __getitem__(self, i): return load_item(*self.items[i])
 
