@@ -2,7 +2,8 @@
 #  데이터·정답 (prep_shape_targets.py + scripts/dino.sh): <tgt>/targets/<uid>.npz (영상 방위·center·scale), <tgt>/dino/<uid>.npy (TRELLIS 조건 토큰, 영상 프레임 0). 복셀은 안 씀
 #  fMRI 프레임 k ↔ 영상 프레임 round(19.2k) (MinD-3D 전처리가 BOLD 지연 6초를 이미 반영). 쓰는 fMRI 프레임 2~7
 #  --per_subject 1 (11-04): 피험자별 ViT · Semantic · Variational + 공유 SV 인코더 · Perceptive · 디코더, 배치마다 피험자 같은 수, 저장에서 ViT 제외
-#  손실 = λ_tok·(MSE + (1−cos)) + λ_proto·CE(범주 텍스트 프로토타입) + λ_var·(center + scale + rot) + λ_subj·CE(피험자)
+#  손실 = λ_tok·(MSE + (1−cos)) + λ_proto·CE(범주 텍스트 프로토타입) + λ_var·(scale + ratio | center + scale + rot) + λ_subj·CE(피험자)
+#  --var_heads sr: 크기 비율 정답 = <tgt>/voxels/<uid>.npy (64³, 가장 긴 변 = 1)의 축별 차 있는 범위 / 64 (probe_split.py와 같음)
 #  --dev_loss 1 (11-05 정성 진단): (1−cos)를 train 평균 토큰을 뺀 편차끼리의 (1−cos)로 바꿈 + λ_nce·InfoNCE(물체 단위). val dev_cos 최저일 때 model_best.pt
 import os, sys, math, time, argparse, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
@@ -27,6 +28,8 @@ p.add_argument('--lam_var', type=float, default=1.0); p.add_argument('--lam_subj
 p.add_argument('--print_every', type=int, default=20); p.add_argument('--val_every', type=int, default=1000); p.add_argument('--save_every', type=int, default=2000)
 p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', action='store_true')
 p.add_argument('--var_mode', default='feat', choices=['feat', 'value'])   # Variational → Aggregate 입력: LayerNorm 특징 / 실제 값 임베딩
+p.add_argument('--sem_clip', default='front', choices=['front', 'back'])   # front: CLIP Projection이 Semantic 경로 앞 (11-06 구조도) / back: 이전 곁가지
+p.add_argument('--var_heads', default='sr', choices=['sr', 'csr'])   # sr: Scale + 3D 크기 비율 (11-06) / csr: 이전 Center · Scale · Rotate
 p.add_argument('--arch', default='fig', choices=['fig', 'res'])   # fig: 11-06 구조도 Temporal Stem · SV Encoder / res: 이전 구현
 p.add_argument('--temporal', type=int, default=1)    # 1: Temporal Stem 사용 (구조도 Spatio-Temporal), 0: 없음
 p.add_argument('--probe_grad', type=int, default=0)     # >0: 학습 대신 loss별 gradient 크기만 재고 끝 (배치 수)
@@ -50,6 +53,14 @@ def rot_target(az_deg, elev_deg=30.0):
     return (Rx @ Rz).astype(np.float32)
 
 
+def ratio_target(uid):
+    f = f'{a.tgt}/voxels/{uid}.npy'
+    if not os.path.exists(f): return np.zeros(3, np.float32), False                  # 복셀 없는 물체 (소파 1개) → 손실에서 뺌
+    occ = np.unpackbits(np.load(f))[:64 ** 3].reshape(64, 64, 64)
+    ext = [(lambda nz: (nz.max() - nz.min() + 1) / 64 if len(nz) else 0.0)(np.nonzero(occ.any(axis=tuple(j for j in range(3) if j != ax)))[0]) for ax in range(3)]
+    return np.array(ext, np.float32), True
+
+
 def load_item(si, k):
     syn, uid = k.split('/')
     x = np.load(os.path.join(a.data_root, SUBS[si], 'npy_data', k + '.npy')).astype(np.float32)[FRAMES]
@@ -57,7 +68,8 @@ def load_item(si, k):
     return {'fmri': torch.from_numpy(x), 'frame_idx': torch.tensor(FRAMES), 'cls': SYN.index(syn), 'subj': si,
             'cond_tokens': torch.from_numpy(np.load(f'{a.tgt}/dino/{uid}.npy')),
             'center': torch.from_numpy(np.stack([t['cx'][vf], t['cy'][vf]], -1)), 'scale': torch.from_numpy(t['scale'][vf]),
-            'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k}
+            'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k,
+            **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False))}
 
 
 class ShapeSet(Dataset):
@@ -97,7 +109,8 @@ else:
     r = enc.load_state_dict({k[len('fmri_encoder.'):]: v for k, v in sd.items() if k.startswith('fmri_encoder.')}, strict=False)
     print(f'[init] encoder from {a.init_ckpt}: missing {len(r.missing_keys)} unexpected {len(r.unexpected_keys)}', flush=True)
     del sd
-model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), temporal=bool(a.temporal), per_subject_sv=bool(a.per_subject), var_mode=a.var_mode, arch=a.arch).to(dev)
+model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), temporal=bool(a.temporal), per_subject_sv=bool(a.per_subject), var_mode=a.var_mode, arch=a.arch,
+              sem_clip=a.sem_clip, var_heads=a.var_heads).to(dev)
 STATE = (lambda: model.trainable_state_dict()) if a.per_subject else (lambda: model.state_dict())
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
@@ -135,7 +148,7 @@ if a.resume and os.path.exists(latest):
     ck = torch.load(latest, map_location='cpu'); model.load_state_dict(ck['model'], strict=not a.per_subject)
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
-KEYS = ['tok_mse', 'tok_cos', 'dev_cos', 'nce', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'subj', 'subj_acc']
+KEYS = ['tok_mse', 'tok_cos', 'dev_cos', 'nce', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'subj', 'subj_acc']
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
     log.write('step,split,total,' + ','.join(KEYS) + ',lr\n')
@@ -147,7 +160,7 @@ def to_dev(b):
 
 
 TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + (L['dev_cos'] if a.dev_loss else L['tok_cos'])), 'nce': lambda L: a.lam_nce * L['nce'], 'sem': lambda L: W['proto'] * L['proto'],
-         'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot']), 'subj': lambda L: W['subj'] * L['subj']}
+         'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio']), 'subj': lambda L: W['subj'] * L['subj']}
 
 
 def total_loss(L):
@@ -171,7 +184,7 @@ def validate():
         for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
     L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
     print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} dev_cos {L["dev_cos"]:.4f} nce {L["nce"]:.3f} proto_acc {L["proto_acc"]:.3f} '
-          f'rot {L["rot"]:.4f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
+          f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
 
@@ -225,7 +238,7 @@ while not done:
         if step % a.print_every == 0:
             write('train', L, float(tot))
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
-                  f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} '
+                  f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
                   f'subj_acc {float(L["subj_acc"]):.3f} lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
         if step % a.val_every == 0: save_best(validate())
         if step % a.save_every == 0 or step >= a.max_step:

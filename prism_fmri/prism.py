@@ -19,6 +19,10 @@
 #  arch (11-06 박사님 새 구조도 반영): 'fig' = 구조도 그대로 — Temporal Stem: LayerNorm → + Frame Emb. → DWConv1D → GELU → Linear (잔차 없음),
 #    SV Encoder: ResMLP 1개 → LayerNorm → Linear → GELU → Linear. 'res' = 이전 구현 (Frame Emb. 먼저 더함, Stem 잔차 + 0 초기화, ResMLP×2).
 #    args에 arch가 없는 이전 체크포인트는 'res'로 읽음. 구조도에 없어 정한 것: SV Encoder 뒤 MLP 은닉 = d (1024)
+#  sem_clip (11-06 박사님 구조도, CLIP을 앞단으로): 'front' = Semantic 384 패치 토큰마다 CLIP Projection(LN → Linear → GELU → Linear, → 1024 CLIP 공간)
+#    → (경로) 16×16 격자 → Down Stage → ConvNeXt ×2 → Res Encoder / (손실) 토큰 평균 → 13범주 CLIP 텍스트 프로토타입 CE. 'back' = 이전 (Res Encoder 뒤 곁가지)
+#  var_heads (11-06 사용자): 'sr' = Scale head(영상 scale, 프레임마다) + Ratio head(3D 크기 비율 ext x·y·z, 64³ 복셀에서, 물체마다 같음, sigmoid)
+#    각 head MLP 3층 → LayerNorm → Linear. 'csr' = 이전 Center · Scale · Rotate. 프로브에서 범주를 넘어 읽히는 것이 scale과 크기 비율뿐이라 바꿈
 #  피험자 (11-04): per_subject_sv=True면 ViT · Semantic · Variational은 피험자별(자기 피험자 데이터로만 학습),
 #    Temporal Stem · SV Encoder · P · Perceptive(FiLM) · 디코더는 전 피험자 공유. False면 이전 구조(전부 공유, ViT 하나)
 import torch
@@ -111,7 +115,7 @@ class TemporalStemFig(nn.Module):
         return self.out(h)
 
 
-SUBJECT_KEYS = ('sem_enc', 'sem_proj', 'center', 'scale', 'rotate', 'aggregate')   # 피험자별로 따로 두는 부품 (Semantic · Variational)
+SUBJECT_KEYS = ('sem_enc', 'sem_proj', 'sem_clip_proj', 'center', 'scale', 'rotate', 'ratio', 'aggregate')   # 피험자별로 따로 두는 부품 (Semantic · Variational)
 
 
 def remap_old_keys(sd):
@@ -148,7 +152,7 @@ class Prism(nn.Module):
     per_subject_sv=True면 Semantic · Variational을 피험자마다 따로 둠 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · Semantic-Variation Encoder · 직교 투영 P · Perceptive(Subject Projector · 피험자 분류 · FiLM) · 조건 토큰 디코더."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, temporal=True, per_subject_sv=False, var_mode='feat', arch='res'):
+                 sem_ch=512, sem_blocks=2, head_dim=256, temporal=True, per_subject_sv=False, var_mode='feat', arch='res', sem_clip='back', var_heads='csr'):
         super().__init__()
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
@@ -166,15 +170,25 @@ class Prism(nn.Module):
             self.temporal = TemporalStem(d) if temporal else None          # Spatio-Temporal의 시간 부분
             self.shared = nn.Sequential(ResMLP(d, 2 * d), ResMLP(d, 2 * d))   # Semantic-Variation Encoder
         # Semantic (피험자별 K벌)
-        self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(K)])
-        self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
+        assert sem_clip in ('back', 'front'); self.sem_clip = sem_clip
+        if sem_clip == 'front':                                             # CLIP Projection이 경로 안 (Down Stage 앞)
+            self.sem_clip_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])
+            self.sem_enc = nn.ModuleList([SemanticEncoder(1024, sem_ch, sem_blocks, dc) for _ in range(K)])
+        else:
+            self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(K)])
+            self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
         # Variational (피험자별 K벌)
-        self.center = nn.ModuleList([PoseHead(2 * dv, 2, head_dim) for _ in range(K)])
+        assert var_heads in ('csr', 'sr'); self.var_heads = var_heads
         self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(K)])
-        self.rotate = nn.ModuleList([PoseHead(2 * dv, 6, head_dim) for _ in range(K)])
+        if var_heads == 'csr':
+            self.center = nn.ModuleList([PoseHead(2 * dv, 2, head_dim) for _ in range(K)])
+            self.rotate = nn.ModuleList([PoseHead(2 * dv, 6, head_dim) for _ in range(K)])
+        else:
+            self.ratio = nn.ModuleList([PoseHead(2 * dv, 3, head_dim) for _ in range(K)])
         assert var_mode in ('feat', 'value'); self.var_mode = var_mode
-        agg_in = 3 * head_dim if var_mode == 'feat' else 12
+        nh, nv = (3, 12) if var_heads == 'csr' else (2, 4)
+        agg_in = nh * head_dim if var_mode == 'feat' else nv
         self.aggregate = nn.ModuleList([nn.Sequential(nn.Linear(agg_in, dc), nn.GELU(), nn.LayerNorm(dc)) if var_mode == 'feat' else
                                         nn.Sequential(nn.Linear(agg_in, head_dim), nn.GELU(), nn.Linear(head_dim, dc), nn.GELU(), nn.LayerNorm(dc)) for _ in range(K)])
         # Perceptive (공유)
@@ -228,18 +242,26 @@ class Prism(nn.Module):
         s, v, p = mixed.split(self.splits, dim=-1)                                  # 채널 분할 (학습 파라미터 없음)
         out = {}
         # Semantic (피험자별): 프레임 평균(정적 성분) → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
-        sg = s[:, :, 1:].mean(1).transpose(1, 2).reshape(B, -1, 16, 16)
-        sem_feat = _route(self.sem_enc, subj, sg).flatten(2).transpose(1, 2)
+        st = s[:, :, 1:].mean(1)                                                     # [B, 256, ds]
+        if self.sem_clip == 'front':
+            st = _route(self.sem_clip_proj, subj, st)                                # CLIP 공간 [B, 256, 1024]
+            out['sem_clip'] = F.normalize(st.mean(1), dim=-1)
+        sem_feat = _route(self.sem_enc, subj, st.transpose(1, 2).reshape(B, -1, 16, 16)).flatten(2).transpose(1, 2)
         out['sem_vec'] = sem_feat.mean(1)
-        out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
+        if self.sem_clip == 'back':
+            out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
         # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Center / Scale / Rotate → Aggregate → Variational Features [B, T, dc]
         vin = torch.cat([v[:, :, 0], v[:, :, 1:].mean(2)], -1)
-        c, fc = _route(self.center, subj, vin); sc, fs = _route(self.scale, subj, vin); r, fr = _route(self.rotate, subj, vin)
-        out['center'] = torch.tanh(c); out['scale'] = F.softplus(sc).squeeze(-1); out['rot6d'] = r
-        if self.var_mode == 'feat':
-            agg_in = torch.cat([fc, fs, fr], -1)                                     # LayerNorm 특징 3×256
+        sc, fs = _route(self.scale, subj, vin); out['scale'] = F.softplus(sc).squeeze(-1)
+        if self.var_heads == 'csr':
+            c, fc = _route(self.center, subj, vin); r, fr = _route(self.rotate, subj, vin)
+            out['center'] = torch.tanh(c); out['rot6d'] = r
+            feats = [fc, fs, fr]
+            vals = [out['center'], out['scale'][..., None], rot6d_to_matrix(r).flatten(-2)]          # 실제 값 2+1+9
         else:
-            agg_in = torch.cat([out['center'], out['scale'][..., None], rot6d_to_matrix(r).flatten(-2)], -1)   # 실제 값 2+1+9
+            q, fq = _route(self.ratio, subj, vin); out['ratio'] = torch.sigmoid(q)  # [B, T, 3] 크기 비율 (가장 긴 변 = 1)
+            feats = [fs, fq]; vals = [out['scale'][..., None], out['ratio']]                         # 실제 값 1+3
+        agg_in = torch.cat(feats if self.var_mode == 'feat' else vals, -1)          # feat: LayerNorm 특징 head 수×256
         var_feat = _route(self.aggregate, subj, agg_in)
         out['var_vec'] = var_feat.mean(1)
         # Perceptive (공유): Token Pooling → Subject Projector
@@ -274,7 +296,8 @@ def build_from_ckpt(ck, repo):
     args = ck.get('args') or {}; per = bool(args.get('per_subject', 0))
     encs = [load_encoder(pth, cfg) for pth in ck['enc_paths']] if per else fMRI_Encoder(cfg.model.params.fmri_encoder_config)
     model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']), temporal=bool(args.get('temporal', 0)), per_subject_sv=per,
-                  var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'))
+                  var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'),
+                  sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'))
     r = model.load_state_dict(remap_old_keys(ck['model']), strict=not per)
     if per:
         assert not r.unexpected_keys and all(k.startswith('encoders.') for k in r.missing_keys), r
@@ -300,8 +323,15 @@ def prism_losses(out, batch, proto_temp=0.07, mean_tok=None, nce_temp=0.07):
         L['dev_cos'] = torch.zeros((), device=tgt.device); L['nce'] = torch.zeros((), device=tgt.device)
     logits = out['sem_clip'] @ batch['prototypes'].t() / proto_temp
     L['proto'] = F.cross_entropy(logits, batch['cls']); L['proto_acc'] = (logits.argmax(-1) == batch['cls']).float().mean()
-    L['center'] = F.mse_loss(out['center'], batch['center']); L['scale'] = F.mse_loss(out['scale'], batch['scale'])
-    L['rot'] = F.mse_loss(rot6d_to_matrix(out['rot6d']), batch['rot'])
+    z = torch.zeros((), device=tgt.device)
+    L['scale'] = F.mse_loss(out['scale'], batch['scale'])
+    L['center'] = F.mse_loss(out['center'], batch['center']) if 'center' in out else z
+    L['rot'] = F.mse_loss(rot6d_to_matrix(out['rot6d']), batch['rot']) if 'rot6d' in out else z
+    if 'ratio' in out:                                                               # 물체 정답을 프레임마다 맞춤, 복셀 없는 물체는 뺌
+        m = batch['ratio_ok'].float()[:, None, None]
+        L['ratio'] = ((out['ratio'] - batch['ratio'][:, None]) ** 2 * m).sum() / (m.sum() * out['ratio'][0].numel()).clamp_min(1)
+    else:
+        L['ratio'] = z
     if out['subj_logit'].shape[-1] > 1:
         L['subj'] = F.cross_entropy(out['subj_logit'], batch['subj']); L['subj_acc'] = (out['subj_logit'].argmax(-1) == batch['subj']).float().mean()
     else:
