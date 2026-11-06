@@ -16,6 +16,9 @@
 #    P가 있던 이전 체크포인트(7명 기준선 prism_shape_ps7 등)는 이 코드로 읽지 않음 (지표는 이미 있음)
 #  Variational 입력 (11-05 비교 실험): var_mode='feat' = head의 LayerNorm 특징 3×256 → Aggregate (기본, 이전과 같음)
 #    var_mode='value' = head가 낸 실제 값 [center 2, scale 1, 회전 행렬 9] = 12 → MLP 임베딩 → 768 (박사님 구조도처럼 예측 값을 씀)
+#  arch (11-06 박사님 새 구조도 반영): 'fig' = 구조도 그대로 — Temporal Stem: LayerNorm → + Frame Emb. → DWConv1D → GELU → Linear (잔차 없음),
+#    SV Encoder: ResMLP 1개 → LayerNorm → Linear → GELU → Linear. 'res' = 이전 구현 (Frame Emb. 먼저 더함, Stem 잔차 + 0 초기화, ResMLP×2).
+#    args에 arch가 없는 이전 체크포인트는 'res'로 읽음. 구조도에 없어 정한 것: SV Encoder 뒤 MLP 은닉 = d (1024)
 #  피험자 (11-04): per_subject_sv=True면 ViT · Semantic · Variational은 피험자별(자기 피험자 데이터로만 학습),
 #    Temporal Stem · SV Encoder · P · Perceptive(FiLM) · 디코더는 전 피험자 공유. False면 이전 구조(전부 공유, ViT 하나)
 import torch
@@ -94,6 +97,20 @@ class TemporalStem(nn.Module):
         return x + self.out(h)
 
 
+class TemporalStemFig(nn.Module):
+    """11-06 구조도 Temporal Stem: LayerNorm → + Frame Emb. → DWConv1D(프레임 축, 패치 위치·채널마다) → GELU → Linear. 잔차 없음."""
+    def __init__(self, d, k=3):
+        super().__init__()
+        self.n = nn.LayerNorm(d)
+        self.conv = nn.Conv1d(d, d, k, padding=k // 2, groups=d)
+        self.out = nn.Linear(d, d)
+    def forward(self, x, femb):                                                 # x [B, T, N, D], femb [B, T, D]
+        B, T, N, D = x.shape
+        h = (self.n(x) + femb[:, :, None, :]).permute(0, 2, 3, 1).reshape(B * N, D, T)
+        h = F.gelu(self.conv(h)).reshape(B, N, D, T).permute(0, 3, 1, 2)
+        return self.out(h)
+
+
 SUBJECT_KEYS = ('sem_enc', 'sem_proj', 'center', 'scale', 'rotate', 'aggregate')   # 피험자별로 따로 두는 부품 (Semantic · Variational)
 
 
@@ -131,7 +148,7 @@ class Prism(nn.Module):
     per_subject_sv=True면 Semantic · Variational을 피험자마다 따로 둠 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · Semantic-Variation Encoder · 직교 투영 P · Perceptive(Subject Projector · 피험자 분류 · FiLM) · 조건 토큰 디코더."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, temporal=True, per_subject_sv=False, var_mode='feat'):
+                 sem_ch=512, sem_blocks=2, head_dim=256, temporal=True, per_subject_sv=False, var_mode='feat', arch='res'):
         super().__init__()
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
@@ -140,9 +157,14 @@ class Prism(nn.Module):
         K = n_subjects if per_subject_sv else 1
         self.splits = splits
         ds, dv, dp = splits
+        assert arch in ('res', 'fig'); self.arch = arch
         self.frame_emb = nn.Embedding(n_frames, d)
-        self.temporal = TemporalStem(d) if temporal else None              # Spatio-Temporal의 시간 부분
-        self.shared = nn.Sequential(ResMLP(d, 2 * d), ResMLP(d, 2 * d))   # Semantic-Variation Encoder
+        if arch == 'fig':                                                   # 11-06 구조도
+            self.temporal = TemporalStemFig(d) if temporal else None
+            self.shared = nn.Sequential(ResMLP(d, 2 * d), nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
+        else:                                                               # 이전 구현
+            self.temporal = TemporalStem(d) if temporal else None          # Spatio-Temporal의 시간 부분
+            self.shared = nn.Sequential(ResMLP(d, 2 * d), ResMLP(d, 2 * d))   # Semantic-Variation Encoder
         # Semantic (피험자별 K벌)
         self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(K)])
         self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
@@ -196,9 +218,12 @@ class Prism(nn.Module):
             subj = torch.zeros(fmri.shape[0], dtype=torch.long, device=fmri.device)
         tok = self.encode_frames(fmri, subj).float()
         B, T, N, D = tok.shape
-        x = tok + self.frame_emb(frame_idx)[:, :, None, :]
-        if self.temporal is not None:
-            x = self.temporal(x)                                                     # 프레임 사이 정보 교환
+        if self.arch == 'fig' and self.temporal is not None:
+            x = self.temporal(tok, self.frame_emb(frame_idx))                        # LN → + Frame Emb. → 프레임 축 conv
+        else:
+            x = tok + self.frame_emb(frame_idx)[:, :, None, :]
+            if self.temporal is not None:
+                x = self.temporal(x)                                                 # 프레임 사이 정보 교환
         mixed = self.shared(x)                                                       # Mixed Features [B, T, 257, D]
         s, v, p = mixed.split(self.splits, dim=-1)                                  # 채널 분할 (학습 파라미터 없음)
         out = {}
@@ -249,7 +274,7 @@ def build_from_ckpt(ck, repo):
     args = ck.get('args') or {}; per = bool(args.get('per_subject', 0))
     encs = [load_encoder(pth, cfg) for pth in ck['enc_paths']] if per else fMRI_Encoder(cfg.model.params.fmri_encoder_config)
     model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']), temporal=bool(args.get('temporal', 0)), per_subject_sv=per,
-                  var_mode=args.get('var_mode', 'feat'))
+                  var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'))
     r = model.load_state_dict(remap_old_keys(ck['model']), strict=not per)
     if per:
         assert not r.unexpected_keys and all(k.startswith('encoders.') for k in r.missing_keys), r
