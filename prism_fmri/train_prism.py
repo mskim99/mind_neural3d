@@ -3,6 +3,7 @@
 #  fMRI 프레임 k ↔ 영상 프레임 round(19.2k) (MinD-3D 전처리가 BOLD 지연 6초를 이미 반영). 쓰는 fMRI 프레임 2~7
 #  --per_subject 1 (11-04): 피험자별 ViT · Semantic · Variational + 공유 SV 인코더 · Perceptive · 디코더, 배치마다 피험자 같은 수, 저장에서 ViT 제외
 #  손실 = λ_tok·(MSE + (1−cos)) + λ_proto·CE(범주 텍스트 프로토타입) + λ_var·(center + scale + rot) + λ_subj·CE(피험자)
+#  --dev_loss 1 (11-05 정성 진단): (1−cos)를 train 평균 토큰을 뺀 편차끼리의 (1−cos)로 바꿈 + λ_nce·InfoNCE(물체 단위). val dev_cos 최저일 때 model_best.pt
 import os, sys, math, time, argparse, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,11 +26,15 @@ p.add_argument('--lam_tok', type=float, default=1.0); p.add_argument('--lam_prot
 p.add_argument('--lam_var', type=float, default=1.0); p.add_argument('--lam_subj', type=float, default=0.1)
 p.add_argument('--print_every', type=int, default=20); p.add_argument('--val_every', type=int, default=1000); p.add_argument('--save_every', type=int, default=2000)
 p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', action='store_true')
+p.add_argument('--var_mode', default='feat', choices=['feat', 'value'])   # Variational → Aggregate 입력: LayerNorm 특징 / 실제 값 임베딩
 p.add_argument('--temporal', type=int, default=1)    # 1: Temporal Stem 사용 (구조도 Spatio-Temporal), 0: 없음
 p.add_argument('--probe_grad', type=int, default=0)     # >0: 학습 대신 loss별 gradient 크기만 재고 끝 (배치 수)
 p.add_argument('--probe_ckpt', default='')               # 비우면 초기값만, 주면 초기값 + 이 체크포인트 둘 다
 p.add_argument('--per_subject', type=int, default=0)    # 1: 피험자별 ViT · Semantic · Variational, 공유 SV 인코더 · Perceptive · 디코더 (11-04 사용자 결정)
 p.add_argument('--enc_dir', default='')                  # per_subject=1: <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
+p.add_argument('--dev_loss', type=int, default=0)       # 1: 토큰 (1−cos)를 평균 뺀 편차 (1−cos)로
+p.add_argument('--lam_nce', type=float, default=0.0); p.add_argument('--nce_temp', type=float, default=0.07)
+p.add_argument('--eval_ckpt', default='')               # 주면 학습 없이 이 체크포인트로 val 한 번만 (기준선 재평가)
 a = p.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
 dev = 'cuda'
@@ -91,7 +96,7 @@ else:
     r = enc.load_state_dict({k[len('fmri_encoder.'):]: v for k, v in sd.items() if k.startswith('fmri_encoder.')}, strict=False)
     print(f'[init] encoder from {a.init_ckpt}: missing {len(r.missing_keys)} unexpected {len(r.unexpected_keys)}', flush=True)
     del sd
-model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), temporal=bool(a.temporal), per_subject_sv=bool(a.per_subject)).to(dev)
+model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), temporal=bool(a.temporal), per_subject_sv=bool(a.per_subject), var_mode=a.var_mode).to(dev)
 STATE = (lambda: model.trainable_state_dict()) if a.per_subject else (lambda: model.state_dict())
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
@@ -118,12 +123,18 @@ if a.per_subject:
 else:
     tl = DataLoader(train_set, batch_size=a.bs, shuffle=True, num_workers=a.workers, drop_last=True, persistent_workers=True)
 vl = DataLoader(ShapeSet('test'), batch_size=a.bs, shuffle=False, num_workers=a.workers)
+MT_PATH = f'{a.tgt}/mean_tok_train.npy'   # train 물체 GT 토큰 평균 (편차 손실·val dev_cos용, 한 번 계산해 둠)
+if not os.path.exists(MT_PATH):
+    uids = sorted({k.split('/')[1] for _, k in train_set.items}); acc_m = np.zeros((1374, 1024), np.float64)
+    for u in uids: acc_m += np.load(f'{a.tgt}/dino/{u}.npy').astype(np.float64)
+    np.save(MT_PATH + '.tmp.npy', (acc_m / len(uids)).astype(np.float32)); os.replace(MT_PATH + '.tmp.npy', MT_PATH); print(f'[mean_tok] train {len(uids)}개 평균 저장', flush=True)
+MT = torch.from_numpy(np.load(MT_PATH)).to(dev)
 step = 0; latest = f'{a.out_dir}/model_latest.pt'
 if a.resume and os.path.exists(latest):
     ck = torch.load(latest, map_location='cpu'); model.load_state_dict(ck['model'], strict=not a.per_subject)
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
-KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'subj', 'subj_acc']
+KEYS = ['tok_mse', 'tok_cos', 'dev_cos', 'nce', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'subj', 'subj_acc']
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
     log.write('step,split,total,' + ','.join(KEYS) + ',lr\n')
@@ -134,7 +145,7 @@ def to_dev(b):
     out['prototypes'] = model.prototypes; return out
 
 
-TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambda L: W['proto'] * L['proto'],
+TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + (L['dev_cos'] if a.dev_loss else L['tok_cos'])), 'nce': lambda L: a.lam_nce * L['nce'], 'sem': lambda L: W['proto'] * L['proto'],
          'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot']), 'subj': lambda L: W['subj'] * L['subj']}
 
 
@@ -153,19 +164,32 @@ def validate():
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
-        L = prism_losses(out, b)
+        L = prism_losses(out, b, mean_tok=MT, nce_temp=a.nce_temp)
         for k, v in L.items(): acc.setdefault(k, []).append(float(v))
         hit = ((out['sem_clip'].float() @ model.prototypes.t()).argmax(-1) == b['cls']).float()
         for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
     L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
-    print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
+    print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} dev_cos {L["dev_cos"]:.4f} nce {L["nce"]:.3f} proto_acc {L["proto_acc"]:.3f} '
           f'rot {L["rot"]:.4f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
-    model.train()
+    model.train(); return L
+
+
+BEST = [float('inf')]
+def save_best(L):   # val dev_cos(편차 방향 오차) 최저 체크포인트
+    if L['dev_cos'] < BEST[0]:
+        BEST[0] = L['dev_cos']
+        torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_best.pt.tmp')
+        os.replace(f'{a.out_dir}/model_best.pt.tmp', f'{a.out_dir}/model_best.pt'); print(f'saved best step {step} dev_cos {BEST[0]:.4f}', flush=True)
+
+
+if a.eval_ckpt:
+    ck = torch.load(a.eval_ckpt, map_location='cpu'); r = model.load_state_dict(ck['model'], strict=not a.per_subject); step = ck['step']
+    print(f'[eval] {a.eval_ckpt} step {step}', flush=True); validate(); print('EVAL_DONE', flush=True); sys.exit(0)
 
 
 if a.probe_grad:   # loss별로 SV Encoder·P에 도착하는 gradient 크기 (λ 곱한 값 기준, 학습 안 함)
     import json
-    groups = {'sv_encoder': list(model.shared.parameters()) + list(model.frame_emb.parameters()), 'P': list(model.P.parameters())}
+    groups = {'sv_encoder': list(model.shared.parameters()) + list(model.frame_emb.parameters())}
     res = {}
     for tag in ['init'] + (['trained'] if a.probe_ckpt else []):
         if tag == 'trained':
@@ -175,7 +199,7 @@ if a.probe_grad:   # loss별로 SV Encoder·P에 도착하는 gradient 크기 (�
             b = to_dev(next(it))
             with torch.autocast('cuda', dtype=torch.bfloat16):
                 out = model(b['fmri'], b['frame_idx'], b['subj'])
-            L = prism_losses(out, b)
+            L = prism_losses(out, b, mean_tok=MT, nce_temp=a.nce_temp)
             for name, f in TERMS.items():
                 v = f(L); acc.setdefault((name, 'value'), []).append(float(v))
                 for gname, ps in groups.items():
@@ -195,19 +219,19 @@ while not done:
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
-        L = prism_losses(out, b); tot = total_loss(L)
+        L = prism_losses(out, b, mean_tok=MT, nce_temp=a.nce_temp); tot = total_loss(L)
         opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); sched.step(); step += 1
         if step % a.print_every == 0:
             write('train', L, float(tot))
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} '
                   f'subj_acc {float(L["subj_acc"]):.3f} lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
-        if step % a.val_every == 0: validate()
+        if step % a.val_every == 0: save_best(validate())
         if step % a.save_every == 0 or step >= a.max_step:
             torch.save({'model': STATE(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'step': step, 'args': vars(a),
                         'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, latest + '.tmp')
             os.replace(latest + '.tmp', latest); print(f'saved step {step}', flush=True)
         if step >= a.max_step: done = True; break
-validate()
+save_best(validate())
 torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_final.pt')
 print(f'TRAIN_DONE step {step} {time.time() - t0:.0f}s', flush=True)
