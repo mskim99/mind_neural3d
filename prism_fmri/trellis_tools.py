@@ -3,7 +3,7 @@
 #         → 조건 토큰 [1374, 1024] (DINOv2 ViT-L/14-reg x_prenorm + layer_norm) → <tgt>/dino/<uid>.npy (fp16)
 #         흰 배경 영상이라 rembg 대신 min(RGB) < 235 를 alpha로 넣음
 #  gen  : 예측 조건 토큰 <pred>/<name>.npy → TRELLIS 1·2단계 flow (이미지 인코딩 대신 예측 토큰) → GLB
-#       --neg zero|mean (mean = --neg_file 토큰을 neg_cond로, 평균에서 밀어내는 가이던스) · --ss_cfg · --slat_cfg (음수면 TRELLIS 기본값) (11-06 색 안 3)
+#       sampler는 TRELLIS 기본값 그대로 (25 steps, cfg 5.0, neg_cond = 0 토큰)
 #  gscheck: gen과 같은 생성(같은 seed) 후 TRELLIS 내부 Gaussian 렌더 색 vs to_glb가 구운 텍스처 색 비교 → <out>/gscheck.jsonl + <out>/<name>_gs.png
 #         (GLB 굽는 단계에서 색이 어두워지는지 확인용, 10-30)
 #  sm_120에서 xformers 기본 커널(FA3)이 오류 → op 미지정 호출만 CUTLASS로 보냄 (run_trellis.py와 같은 처리, 계산식 동일)
@@ -18,8 +18,6 @@ p.add_argument('--frames'); p.add_argument('--pred'); p.add_argument('--out', re
 p.add_argument('--view', type=int, default=0); p.add_argument('--seed', type=int, default=42); p.add_argument('--limit', type=int, default=0)
 p.add_argument('--trellis_repo', default='/home/oem/jhj/meshgen_tools/repo/third_party/TRELLIS')
 p.add_argument('--names', default='')   # gscheck: 이 목록의 이름만
-p.add_argument('--neg', default='zero', choices=['zero', 'mean']); p.add_argument('--neg_file', default='')
-p.add_argument('--ss_cfg', type=float, default=-1); p.add_argument('--slat_cfg', type=float, default=-1)
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
 os.environ.setdefault('SPCONV_ALGO', 'native')
@@ -44,13 +42,8 @@ pipe = TrellisImageTo3DPipeline.from_pretrained(a.model); pipe.cuda()
 for f in ('preprocess_image', 'get_cond', 'sample_sparse_structure', 'sample_slat', 'decode_slat'):
     assert hasattr(pipe, f), f'TRELLIS API에 {f} 없음'
 print('기본 sampler', pipe.sparse_structure_sampler_params, pipe.slat_sampler_params, flush=True)
-SSP = {'cfg_strength': a.ss_cfg} if a.ss_cfg >= 0 else {}; SLP = {'cfg_strength': a.slat_cfg} if a.slat_cfg >= 0 else {}
-NEG = torch.from_numpy(np.load(a.neg_file)).float().cuda()[None] if a.neg == 'mean' else None
-print('neg', a.neg, '| ss', SSP or '기본', '| slat', SLP or '기본', flush=True)
-
-
 def make_cond(c):
-    return {'cond': c, 'neg_cond': NEG.expand_as(c) if NEG is not None else torch.zeros_like(c)}
+    return {'cond': c, 'neg_cond': torch.zeros_like(c)}      # TRELLIS get_cond와 같은 형식 (neg_cond = 0)
 
 
 os.makedirs(a.out, exist_ok=True); t0 = time.time()
@@ -83,8 +76,8 @@ elif a.mode == 'gscheck':
         cond = make_cond(cond)
         torch.manual_seed(a.seed)
         with torch.no_grad():
-            coords = pipe.sample_sparse_structure(cond, 1, SSP)
-            slat = pipe.sample_slat(cond, coords, SLP)
+            coords = pipe.sample_sparse_structure(cond, 1)
+            slat = pipe.sample_slat(cond, coords)
             outs = pipe.decode_slat(slat, ['mesh', 'gaussian'])
         g = outs['gaussian'][0]
         k = render_utils.render_snapshot(g, resolution=512, bg_color=(0, 0, 0), verbose=False)['color']
@@ -111,8 +104,8 @@ else:
         cond = make_cond(cond)
         torch.manual_seed(a.seed)
         with torch.no_grad():
-            coords = pipe.sample_sparse_structure(cond, 1, SSP)
-            slat = pipe.sample_slat(cond, coords, SLP)
+            coords = pipe.sample_sparse_structure(cond, 1)
+            slat = pipe.sample_slat(cond, coords)
             outs = pipe.decode_slat(slat, ['mesh', 'gaussian'])
         os.makedirs(od, exist_ok=True)
         glb = postprocessing_utils.to_glb(outs['gaussian'][0], outs['mesh'][0], simplify=0.95, texture_size=1024, verbose=False)

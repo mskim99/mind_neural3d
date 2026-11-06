@@ -1,30 +1,19 @@
-# PRISM 모델 — 박사님 10-27 구조도(.참고자료/261027_구조도.png)의 분리부를 그림대로 구현 (11-02)
-#  형태 감독(Geometry head) 없음. 각 성분 head의 출력(Semantic·Variational Features)이 그대로 재구성 입력
-#  fMRI 6프레임 → [Spatio-Temporal] MinD-3D++ fMRI ViT(고정, 프레임마다 공간) + Temporal Stem(학습, 패치 위치마다 프레임 축 1D conv)
-#    → Semantic-Variation Encoder(학습, + 프레임 임베딩) → Mixed Features
-#    → 채널 분할 S 384 / V 384 / P 256 (11-05, 학습 P 없음) → [Semantic Routing | Variation Routing | Perceptive Filtering]
-#      Semantic    : 패치 16×16 격자에서 ConvNeXt식 residual encoder (Down Stage → ConvNeXt Block×N → Residual Encoder) → Semantic Features
-#                    (+ 학습 감독: 풀링 → CLIP projection → 범주 텍스트 프로토타입 CE)
-#      Variational : 프레임마다 Center / Scale / Rotate head (MLP×3 → LayerNorm → Linear → tanh / softplus / 6D) → Aggregate → Variational Features
-#      Perceptive  : Token Pooling → Subject Projector (Linear-BN-GELU) → Perceptive Features (+ 피험자 분류 보조)
-#    → 재구성: 구조도의 Tri-plane 대신 TRELLIS — [Semantic ; Variational] Features를 Perceptive(FiLM)로 보정 → 조건 토큰 디코더 → TRELLIS 조건 토큰 [1374, 1024]
-#  구조도에 없어 정한 것: ConvNeXt 블록 수(2)·채널, head 은닉 256, Aggregate = 세 head 특징(LayerNorm 출력) 이어 붙여 Linear, Perceptive 입력 방식 FiLM,
-#    Temporal Stem — 구조도엔 이름만 있어 박사님 EEG 코드(src/mvdiffusion_var_semantic_cls_sg.py TemporalStem: 채널마다 시간축 1D conv + BN + GELU)를
-#    fMRI에 옮김: 채널마다(depthwise) 프레임 축 conv(커널 3, 6프레임 유지) + GELU + Linear, 잔차. 마지막 Linear 0 초기화(처음엔 ViT 특징 그대로).
-#    EEG는 시간 → 공간 순서지만, 여기선 공간(ViT)이 고정·사전학습이라 ViT 뒤에 둠. temporal=False면 이전 체크포인트와 같은 구조
-#  성분 분할 (11-05): 학습 직교 P를 뺌. Mixed Features를 채널 384 / 384 / 256으로 바로 자름 (박사님 11월 그림, 회전은 SV Encoder가 흡수).
-#    P가 있던 이전 체크포인트(7명 기준선 prism_shape_ps7 등)는 이 코드로 읽지 않음 (지표는 이미 있음)
-#  Variational 입력 (11-05 비교 실험): var_mode='feat' = head의 LayerNorm 특징 3×256 → Aggregate (기본, 이전과 같음)
-#    var_mode='value' = head가 낸 실제 값 [center 2, scale 1, 회전 행렬 9] = 12 → MLP 임베딩 → 768 (박사님 구조도처럼 예측 값을 씀)
-#  arch (11-06 박사님 새 구조도 반영): 'fig' = 구조도 그대로 — Temporal Stem: LayerNorm → + Frame Emb. → DWConv1D → GELU → Linear (잔차 없음),
-#    SV Encoder: ResMLP 1개 → LayerNorm → Linear → GELU → Linear. 'res' = 이전 구현 (Frame Emb. 먼저 더함, Stem 잔차 + 0 초기화, ResMLP×2).
-#    args에 arch가 없는 이전 체크포인트는 'res'로 읽음. 구조도에 없어 정한 것: SV Encoder 뒤 MLP 은닉 = d (1024)
-#  sem_clip (11-06 박사님 구조도, CLIP을 앞단으로): 'front' = Semantic 384 패치 토큰마다 CLIP Projection(LN → Linear → GELU → Linear, → 1024 CLIP 공간)
-#    → (경로) 16×16 격자 → Down Stage → ConvNeXt ×2 → Res Encoder / (손실) 토큰 평균 → 13범주 CLIP 텍스트 프로토타입 CE. 'back' = 이전 (Res Encoder 뒤 곁가지)
-#  var_heads (11-06 사용자): 'sr' = Scale head(영상 scale, 프레임마다) + Ratio head(3D 크기 비율 ext x·y·z, 64³ 복셀에서, 물체마다 같음, sigmoid)
-#    각 head MLP 3층 → LayerNorm → Linear. 'csr' = 이전 Center · Scale · Rotate. 프로브에서 범주를 넘어 읽히는 것이 scale과 크기 비율뿐이라 바꿈
-#  피험자 (11-04): per_subject_sv=True면 ViT · Semantic · Variational은 피험자별(자기 피험자 데이터로만 학습),
-#    Temporal Stem · SV Encoder · P · Perceptive(FiLM) · 디코더는 전 피험자 공유. False면 이전 구조(전부 공유, ViT 하나)
+# PRISM 모델 — 박사님 구조도의 분리부를 구현 (11-02 첫 구현, 11-06 박사님 새 구조도 반영). 재구성은 Tri-plane 대신 TRELLIS
+#  fMRI 6프레임 → MinD-3D++ fMRI ViT(고정, 피험자별, 프레임마다 공간) → Temporal Stem(학습, 프레임 축) → SV Encoder(학습) → Mixed Features
+#    → 채널 분할 S 384 / V 384 / P 256 (학습 파라미터 없음, 11-05 학습 직교 P 뺌)
+#      Semantic    : 패치 토큰 → CLIP Projection(→ 1024, L_sem) → 16×16 격자 → Down Stage → ConvNeXt Block×2 → Res Encoder → Semantic Features
+#      Variational : 프레임마다 [CLS; 패치 평균] → Scale · Ratio(3D 크기 비율) head (MLP×3 → LayerNorm → Linear) → Aggregate → Variational Features
+#      Perceptive  : Token Pooling → Subject Projector (Linear-BN-GELU) → FiLM γ, β (+ 피험자 분류 보조)
+#    → 재구성: Ⓒ[Semantic ; Variational] (+ type · frame emb.) → FiLM ⊙(1+γ)+β → Transformer Decoder(learned query 1374, Cross-Attention K·V) → TRELLIS 조건 토큰 [1374, 1024]
+#  옵션 (기본값 = 11-06 구조도, train_prism.py 기본값과 같음). 이전 값은 기준선 prism_nop_feat · prism_nop_value를 읽고 다시 학습하려고 남김
+#    arch      'fig' Temporal Stem = LN → + Frame Emb. → DWConv1D → GELU → Linear (잔차 없음), SV Encoder = ResMLP → LN → Linear → GELU → Linear
+#              'res' 이전: Frame Emb. 먼저 더함 → Stem(잔차, 0 초기화) → ResMLP×2
+#    sem_clip  'front' CLIP Projection이 Down Stage 앞 경로 안 / 'back' 이전: Res Encoder 뒤 곁가지(토큰 평균 → CLIP Projection)
+#    var_heads 'sr' Scale(영상 scale, 프레임마다) + Ratio(64³ 복셀의 축별 범위, 물체마다, sigmoid) / 'csr' 이전: Center · Scale · Rotate
+#    var_mode  'feat' head의 LayerNorm 특징 → Aggregate / 'value' head가 낸 값 → MLP 임베딩 (11-06 비교 결과 feat 권고)
+#  피험자: ViT · Semantic · Variational은 피험자별(자기 데이터로만 학습), Temporal Stem · SV Encoder · Perceptive(FiLM) · 디코더는 공유
+#  읽는 체크포인트: per_subject 1 · temporal 1 · P 없음 (c7ae1f8 이후). P가 있던 이전 체크포인트(prism_shape_ps7 등)는 못 읽음 (지표는 이미 있음)
+#  구조도에 없어 정한 것: ConvNeXt 블록 수 2 · 채널 512, head 은닉 256, SV Encoder 뒤 MLP 은닉 1024, Perceptive 입력 방식 FiLM
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,7 +67,7 @@ class SemanticEncoder(nn.Module):
 
 
 class PoseHead(nn.Module):
-    """구조도 Center/Scale/Rotate head: MLP×3 → LayerNorm → Linear (+ 활성은 밖에서). 특징(LayerNorm 출력)도 돌려줌."""
+    """구조도 Variational head (Scale · Ratio, 이전 Center · Rotate): MLP×3 → LayerNorm → Linear (+ 활성은 밖에서). 특징(LayerNorm 출력)도 돌려줌."""
     def __init__(self, d, k, h=256):
         super().__init__()
         self.mlp = nn.Sequential(nn.Linear(d, h), nn.GELU(), nn.Linear(h, h), nn.GELU(), nn.Linear(h, h), nn.GELU())
@@ -115,25 +104,6 @@ class TemporalStemFig(nn.Module):
         return self.out(h)
 
 
-SUBJECT_KEYS = ('sem_enc', 'sem_proj', 'sem_clip_proj', 'center', 'scale', 'rotate', 'ratio', 'aggregate')   # 피험자별로 따로 두는 부품 (Semantic · Variational)
-
-
-def remap_old_keys(sd):
-    """피험자별 구조 이전 체크포인트(encoder 하나, S·V 한 벌) → 지금 키 이름 (encoders.0. / sem_enc.0. …)."""
-    if any(k.startswith('sem_enc.0.') for k in sd):             # 이미 지금 형식
-        return dict(sd)
-    out = {}
-    for k, v in sd.items():
-        if k.startswith('encoder.'):
-            k = 'encoders.0.' + k[len('encoder.'):]
-        else:
-            for n in SUBJECT_KEYS:
-                if k.startswith(n + '.'):
-                    k = f'{n}.0.' + k[len(n) + 1:]; break
-        out[k] = v
-    return out
-
-
 def _route(mods, idx, x):
     """샘플마다 자기 피험자 모듈로 보냄. mods: 모듈 리스트, idx: [B] 피험자 번호. 출력이 튜플이어도 됨."""
     if len(mods) == 1:
@@ -148,26 +118,26 @@ def _route(mods, idx, x):
 
 
 class Prism(nn.Module):
-    """encoder: fMRI ViT 하나(피험자 공통, 이전 방식) 또는 피험자별 리스트.
-    per_subject_sv=True면 Semantic · Variational을 피험자마다 따로 둠 (각자 자기 피험자 데이터로만 학습).
-    공유: Temporal Stem · Semantic-Variation Encoder · 직교 투영 P · Perceptive(Subject Projector · 피험자 분류 · FiLM) · 조건 토큰 디코더."""
+    """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
+    공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, temporal=True, per_subject_sv=False, var_mode='feat', arch='res', sem_clip='back', var_heads='csr'):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr'):
         super().__init__()
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
         self.encoders = nn.ModuleList([e.requires_grad_(False).eval() for e in encs])   # MinD-3D++ fMRI ViT (패치 16, 256×256 → 16×16 + CLS), 고정
         self.enc_grad = False                                          # True: 입력까지 기울기 (성분 지도용)
-        K = n_subjects if per_subject_sv else 1
+        K = n_subjects
+        assert len(encs) == K, f'피험자 {K}명인데 ViT {len(encs)}개'
         self.splits = splits
         ds, dv, dp = splits
         assert arch in ('res', 'fig'); self.arch = arch
         self.frame_emb = nn.Embedding(n_frames, d)
         if arch == 'fig':                                                   # 11-06 구조도
-            self.temporal = TemporalStemFig(d) if temporal else None
+            self.temporal = TemporalStemFig(d)
             self.shared = nn.Sequential(ResMLP(d, 2 * d), nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, d))
         else:                                                               # 이전 구현
-            self.temporal = TemporalStem(d) if temporal else None          # Spatio-Temporal의 시간 부분
+            self.temporal = TemporalStem(d)                                 # Spatio-Temporal의 시간 부분
             self.shared = nn.Sequential(ResMLP(d, 2 * d), ResMLP(d, 2 * d))   # Semantic-Variation Encoder
         # Semantic (피험자별 K벌)
         assert sem_clip in ('back', 'front'); self.sem_clip = sem_clip
@@ -232,16 +202,14 @@ class Prism(nn.Module):
             subj = torch.zeros(fmri.shape[0], dtype=torch.long, device=fmri.device)
         tok = self.encode_frames(fmri, subj).float()
         B, T, N, D = tok.shape
-        if self.arch == 'fig' and self.temporal is not None:
+        if self.arch == 'fig':
             x = self.temporal(tok, self.frame_emb(frame_idx))                        # LN → + Frame Emb. → 프레임 축 conv
         else:
-            x = tok + self.frame_emb(frame_idx)[:, :, None, :]
-            if self.temporal is not None:
-                x = self.temporal(x)                                                 # 프레임 사이 정보 교환
+            x = self.temporal(tok + self.frame_emb(frame_idx)[:, :, None, :])        # 이전: Frame Emb. 더한 뒤 Stem (잔차)
         mixed = self.shared(x)                                                       # Mixed Features [B, T, 257, D]
         s, v, p = mixed.split(self.splits, dim=-1)                                  # 채널 분할 (학습 파라미터 없음)
         out = {}
-        # Semantic (피험자별): 프레임 평균(정적 성분) → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
+        # Semantic (피험자별): 프레임 평균(정적 성분) → (front) CLIP Projection → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
         st = s[:, :, 1:].mean(1)                                                     # [B, 256, ds]
         if self.sem_clip == 'front':
             st = _route(self.sem_clip_proj, subj, st)                                # CLIP 공간 [B, 256, 1024]
@@ -250,7 +218,7 @@ class Prism(nn.Module):
         out['sem_vec'] = sem_feat.mean(1)
         if self.sem_clip == 'back':
             out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
-        # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Center / Scale / Rotate → Aggregate → Variational Features [B, T, dc]
+        # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Scale · Ratio (csr: Center · Scale · Rotate) → Aggregate → Variational Features [B, T, dc]
         vin = torch.cat([v[:, :, 0], v[:, :, 1:].mean(2)], -1)
         sc, fs = _route(self.scale, subj, vin); out['scale'] = F.softplus(sc).squeeze(-1)
         if self.var_heads == 'csr':
@@ -288,39 +256,35 @@ def load_encoder(path, cfg):
 
 
 def build_from_ckpt(ck, repo):
-    """체크포인트 → Prism. 피험자별 체크포인트는 enc_paths에서 ViT를 읽고, 이전 체크포인트는 키 이름만 바꿔 읽음."""
+    """체크포인트 → Prism. ViT는 enc_paths(피험자별 공개 가중치)에서 다시 읽음. args에 없는 옵션은 이전 값(res · back · csr · feat)으로."""
     import os
     from omegaconf import OmegaConf
-    from src.encoder.autoencoder2 import fMRI_Encoder
     cfg = OmegaConf.load(os.path.join(repo, 'configs', 'mind3d_pp.yaml'))
-    args = ck.get('args') or {}; per = bool(args.get('per_subject', 0))
-    encs = [load_encoder(pth, cfg) for pth in ck['enc_paths']] if per else fMRI_Encoder(cfg.model.params.fmri_encoder_config)
-    model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']), temporal=bool(args.get('temporal', 0)), per_subject_sv=per,
+    args = ck.get('args') or {}
+    assert args.get('per_subject', 0) and args.get('temporal', 1), '피험자별 ViT · Temporal Stem 체크포인트만 읽음 (11-04 이전 구조는 지원 안 함)'
+    encs = [load_encoder(pth, cfg) for pth in ck['enc_paths']]
+    model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']),
                   var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'),
                   sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'))
-    r = model.load_state_dict(remap_old_keys(ck['model']), strict=not per)
-    if per:
-        assert not r.unexpected_keys and all(k.startswith('encoders.') for k in r.missing_keys), r
+    check_load(model, ck['model'])
     return model
 
 
-def prism_losses(out, batch, proto_temp=0.07, mean_tok=None, nce_temp=0.07):
-    """mean_tok [1374,1024] (train GT 평균 토큰)을 주면 편차 손실도 계산 (11-05 정성 진단):
-       dev_cos = 1 − cos(예측 − 평균, GT − 평균) (토큰별), nce = 물체 단위 InfoNCE (토큰 평균 편차, 배치 안 같은 물체는 모두 정답)."""
+def check_load(model, sd):
+    """고정 ViT를 뺀 체크포인트 불러오기: ViT(encoders.*) 말고 빠지거나 남는 키가 있으면 멈춤 (구조 옵션이 안 맞을 때)."""
+    r = model.load_state_dict(sd, strict=False)
+    bad = [k for k in r.missing_keys if not k.startswith('encoders.')]
+    assert not r.unexpected_keys and not bad, f'체크포인트와 구조가 안 맞음: 남는 키 {r.unexpected_keys[:5]} · 빠진 키 {bad[:5]}'
+    return r
+
+
+def prism_losses(out, batch, proto_temp=0.07):
+    """L_tok (MSE · 1 − cos) · L_sem (CLIP 텍스트 프로토타입 CE) · L_var (scale · ratio | center · scale · rot) · L_sub (피험자 CE). 없는 항은 0."""
     L = {}
     out = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in out.items()}   # bf16 → fp32
     tgt = batch['cond_tokens'].float()
     L['tok_mse'] = F.mse_loss(out['cond_tokens'], tgt)
     L['tok_cos'] = (1 - F.cosine_similarity(out['cond_tokens'], tgt, dim=-1)).mean()
-    if mean_tok is not None:
-        dp, dg = out['cond_tokens'] - mean_tok, tgt - mean_tok
-        L['dev_cos'] = (1 - F.cosine_similarity(dp, dg, dim=-1)).mean()
-        zp, zg = F.normalize(dp.mean(1), dim=-1), F.normalize(dg.mean(1), dim=-1)
-        names = batch['name']; same = torch.tensor([[x == y for y in names] for x in names], dtype=torch.float32, device=zp.device)
-        logp = F.log_softmax(zp @ zg.t() / nce_temp, -1)
-        L['nce'] = -((logp * same).sum(-1) / same.sum(-1)).mean()
-    else:
-        L['dev_cos'] = torch.zeros((), device=tgt.device); L['nce'] = torch.zeros((), device=tgt.device)
     logits = out['sem_clip'] @ batch['prototypes'].t() / proto_temp
     L['proto'] = F.cross_entropy(logits, batch['cls']); L['proto_acc'] = (logits.argmax(-1) == batch['cls']).float().mean()
     z = torch.zeros((), device=tgt.device)

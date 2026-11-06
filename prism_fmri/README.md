@@ -1,19 +1,24 @@
 # PRISM fMRI판
 
-박사님 10-27 구조도의 분리부를 그대로 구현 (11-02). 앞단은 MinD-3D++ fMRI ViT(고정), 재구성은 TRELLIS, 형태 감독 없음.
+박사님 구조도의 분리부를 구현 (11-02 첫 구현, 11-06 박사님 새 구조도 반영). 앞단은 MinD-3D++ fMRI ViT(고정, 피험자별), 재구성은 Tri-plane 대신 TRELLIS.
+구조도 그림: `EEG/.보고 자료/261112_9차보고/PRISM_구조도.png`
 
-| 성분 | 구현 (`prism.py`) |
+| 성분 | 구현 (`prism.py`, 기본값 `--arch fig --sem_clip front --var_heads sr --var_mode feat`) |
 |---|---|
-| 앞단 (Spatio-Temporal) | 공간: ViT(프레임마다) / 시간: Temporal Stem(패치 위치·채널마다 프레임 축 1D conv, 박사님 EEG `TemporalStem`의 fMRI판, `--temporal 1` 기본) → + 프레임 임베딩 → Semantic-Variation Encoder (ResMLP×2) → Mixed Features → Orthogonal Projection |
-| Semantic | 패치 16×16 격자에서 ConvNeXt식 residual encoder (Down Stage → ConvNeXt Block×2 → Residual Encoder) + 학습 감독(CLIP 범주 텍스트 프로토타입 CE) |
-| Variational | 프레임마다 Center(tanh) / Scale(softplus) / Rotate(6D) head (MLP×3 → LayerNorm → Linear) → Aggregate |
-| Perceptive | Token Pooling → Subject Projector (Linear-BN-GELU) → FiLM + 피험자 분류(보조) |
-| 재구성 | [Semantic ; Variational] Features → 조건 토큰 디코더 → TRELLIS 조건 토큰 [1374, 1024] → TRELLIS |
+| 앞단 | ViT(프레임마다, 고정) → Temporal Stem (LayerNorm → + Frame Emb. → DWConv1D(프레임 축) → GELU → Linear) → SV Encoder (ResMLP → LayerNorm → Linear → GELU → Linear) → Mixed Features → 채널 분할 S 384 / V 384 / P 256 |
+| Semantic | 패치 토큰 → CLIP Projection(→ 1024, 13범주 CLIP 텍스트 프로토타입 CE) → 16×16 격자 → Down Stage → ConvNeXt Block×2 → Res Encoder |
+| Variational | 프레임마다 [CLS; 패치 평균] → Scale(softplus) · Ratio(3D 크기 비율, sigmoid) head (MLP×3 → LayerNorm → Linear) → Aggregate |
+| Perceptive | Token Pooling → Subject Projector (Linear-BN-GELU) → FiLM γ, β + 피험자 분류(보조) |
+| 재구성 | Ⓒ[Semantic ; Variational] → FiLM ⊙(1+γ)+β → Transformer Decoder (learned query 1374, Cross-Attention K·V) → TRELLIS 조건 토큰 [1374, 1024] → TRELLIS |
 
-## 실행 (Pro6000, `scripts/`)
-1. `dino.sh` — 자극 영상 프레임 → TRELLIS 조건 토큰 정답 (meshgen venv)
-2. `train.sh` — 학습 (`STEPS`, `BS`, `TAG`, `EXTRA`) → `$W/prism_shape$TAG`, 로그 `logs/prism_shape$TAG.log`
-3. `infer.sh` — test fMRI → 조건 토큰 → TRELLIS GLB (`PERC=keep|mean`) → `$W/prism_infer$TAG`
-4. `eval.sh` — Shape test 104 렌더·지표 (`M0=1` 권장: metallic 0 렌더)
+이전 값(`--arch res --sem_clip back --var_heads csr`)은 기준선 `prism_nop_feat` · `prism_nop_value`를 읽고 다시 학습하려고 남김 (`scripts/run_var_cmp.sh`).
 
-전처리(로컬): `prep_shape_targets.py` (영상 방위·center·scale, 영상 프레임). 정답 폴더는 서버의 `$W/data/shape_targets`.
+## 실행 (Pro6000, 코드는 huijong 브랜치 → 서버 `git pull`)
+- `scripts/common.sh` — 공통 경로 · guard (모든 스크립트가 source)
+- `scripts/dino.sh` — 자극 영상 프레임 → TRELLIS 조건 토큰 정답 (meshgen venv)
+- `scripts/run_fig.sh` — 지금 구조 학습(7명, bs 14, 4만 스텝) → sub-0001 GLB → 8지표 (`spp_eval/run_spp.sh`) · 진행 `scripts/status_fig.sh`
+- `scripts/run_var_cmp.sh` · `run_var_cmp7.sh` — Variational feat vs value 비교 (학습 · sub-0001 / 나머지 6명 평가)
+- `scripts/run_tokfix.sh` — 예측 토큰 → train 정답 토큰 공간 (kNN · PCA, 추론만)
+- 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color.py` (색 선형 프로브), `probe_split.py` (분기 분리 프로브), `tokfix.py`
+
+전처리(로컬): `prep_shape_targets.py` (영상 방위·center·scale, 영상 프레임, 64³ 복셀). 정답 폴더는 서버의 `$W/data/shape_targets`.

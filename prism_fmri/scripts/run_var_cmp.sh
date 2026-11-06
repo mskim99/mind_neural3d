@@ -1,5 +1,6 @@
 #!/bin/bash
 # Variational 입력 비교 (11-05, Pro6000 GPU 1). 두 모델 모두 학습 P 없음, 7명 학습 설정은 prism_shape_ps7과 같음 (bs 14, 4만 스텝)
+#  11-06 기본값이 바뀌어 당시 구조(--arch res --sem_clip back --var_heads csr)를 명시해 고정함 → prism_nop_feat · value 재학습용
 #  feat  = 기준선: head의 LayerNorm 특징 → Aggregate      value = head가 낸 center · scale · 회전 값 → MLP 임베딩 → Aggregate
 #  1 두 학습 병렬  2 모델마다 병렬로: sub-0001 토큰 → 자세 일치도(eval_pose.py) → GLB → 8지표(spp_eval)  3 결과 묶기
 # 사용: nohup bash run_var_cmp.sh > $W/logs/prism_varcmp.log 2>&1 < /dev/null & disown
@@ -7,7 +8,7 @@ SUBS=sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008
 source $(dirname $0)/common.sh || exit 1
 export SPP_ROOT=$W/spp_eval SPP_PY=$W/venv/bin/python SPP_BLENDER=$W/tools/blender-4.2.3-linux-x64/blender
 ENC=$W/weights/MinD-3D-pp/fMRI-Shape; PY=$W/venv/bin/python; S1=sub-0001
-COMMON="--repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --init_ckpt $INIT --bs 14 --max_step 40000 --per_subject 1 --enc_dir $ENC"
+COMMON="--repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --init_ckpt $INIT --bs 14 --max_step 40000 --per_subject 1 --enc_dir $ENC --arch res --sem_clip back --var_heads csr"
 step() { echo "=== $1 $(date +%H:%M:%S)"; }
 cd $W/run
 
