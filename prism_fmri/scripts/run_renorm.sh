@@ -1,14 +1,14 @@
 #!/bin/bash
 # 색 실험 1: 예측 토큰 재조정 스윕 + 범주 지표 (11-07, Pro6000 GPU 1, 추론만 · 재학습 없음). 모델 MODEL(기본 fig), sub-0001 test 104
-#  1 추론 (토큰 + 범주 점수 13개)  2 renorm.py: 변형 토큰 (ln · s137 · s160 · ln_s137 · ln_s160) + 진단 + top-3 · kNN 범주 일치
-#  3 빠른 확인: 정성 14물체 × (pred · gt · 변형 5) Gaussian 렌더 + 색 → renorm_quick.tar (RENORM_QUICK_DONE)
-#  4 변형 5개 GLB 104 → 8지표 (앞 변형 평가와 다음 변형 GLB를 겹쳐 돌림)  5 렌더 색 · 정성(물체 5 × 뷰 0·2·4) · 묶기 → renorm.tar (RENORM_DONE)
+#  1 추론 (토큰 + 범주 점수 13개)  2 renorm.py: 변형 토큰 (ln · ln_s137 · ln_s160, LN 없는 ×s는 진단만) + 진단 + top-3 · kNN 범주 일치
+#  3 빠른 확인: 정성 14물체 × (pred · gt · 변형 3) Gaussian 렌더 + 색 → renorm_quick.tar (RENORM_QUICK_DONE)
+#  4 변형 3개 GLB 104 → 8지표 (앞 변형 평가와 다음 변형 GLB를 겹쳐 돌림)  5 렌더 색 · 정성(물체 5 × 뷰 0·2·4) · 묶기 → renorm.tar (RENORM_DONE)
 #  비교 기준 pred = 이미 평가한 $SPP_ROOT/out/$MODEL (run_fig.sh)
 # 사용: nohup bash run_renorm.sh > $W/logs/prism_renorm.log 2>&1 < /dev/null & disown
 source $(dirname $0)/common.sh || exit 1
 export SPP_ROOT=$W/spp_eval SPP_PY=$W/venv/bin/python SPP_BLENDER=$W/tools/blender-4.2.3-linux-x64/blender
 PY=$W/venv/bin/python; MODEL=${MODEL:-fig}; S1=sub-0001; CK=$W/prism_$MODEL/model_final.pt
-O=$W/prism_renorm/$MODEL; I=$O/infer/${S1}_keep; VARS="ln s137 s160 ln_s137 ln_s160"
+O=$W/prism_renorm/$MODEL; I=$O/infer/${S1}_keep; VARS="ln ln_s137 ln_s160"
 step() { echo "=== $1 $(date +%H:%M:%S)"; }
 src() { case $1 in pred) echo $I/tokens ;; gt) echo $TGT/dino ;; *) echo $O/tok/$1 ;; esac; }
 trel() { (cd $MG && source $MG/mg_guard.sh && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
@@ -26,7 +26,7 @@ for v in pred gt $VARS; do
 import json; r=[json.loads(l) for l in open('$O/quick/$v/gscheck.jsonl')]
 print('Gaussian 밝기 %.1f 채도 %.1f | 텍스처 밝기 %.1f 채도 %.1f (n %d)' % tuple([sum(x[k][i] for x in r)/len(r) for k in ('gauss_mean_chroma','tex_mean_chroma') for i in (0,1)] + [len(r)]))")"
 done
-cd $O && tar cf renorm_quick.tar quick/*/*.png quick/*/gscheck.jsonl tok/renorm_stats.json && echo "PACK quick $(ls quick/*/*.png | wc -l)개 (예상 98)"
+cd $O && tar cf renorm_quick.tar quick/*/*.png quick/*/gscheck.jsonl tok/renorm_stats.json && echo "PACK quick $(ls quick/*/*.png | wc -l)개 (예상 70)"
 step "RENORM_QUICK_DONE"
 
 step "4 전체 ($VARS: GLB 104 → 8지표)"
@@ -54,6 +54,6 @@ for v in pred $VARS; do
     [ -n "$f" ] && mkdir -p $P/$v/qual/$u && cp $f/{0,2,4}.png $P/$v/qual/$u/
   done
 done
-cd $O && tar cf renorm.tar pack && echo "PACK $(find pack -name '*.png' | wc -l)개 (예상 90) $(du -sh renorm.tar | cut -f1)"
+cd $O && tar cf renorm.tar pack && echo "PACK $(find pack -name '*.png' | wc -l)개 (예상 60) $(du -sh renorm.tar | cut -f1)"
 echo "=== 결과"; for v in pred $VARS; do echo "$v $(cat $P/$v/values.txt 2>/dev/null)"; done
 step "RENORM_DONE"

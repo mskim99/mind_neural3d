@@ -2,8 +2,8 @@
 #  배경: 예측 편차(토큰 − train 평균 토큰 M)의 크기가 정답의 0.7~0.76배 → 평균 쪽으로 수축해 회색이 나오는지 가리는 진단
 #  변형 (M = train 정답 토큰 평균, LN = 토큰마다 1024차원 affine 없는 layer_norm, TRELLIS get_cond 마지막 처리와 같음)
 #   ln        : LN(pred)
-#   s<스케일>  : M + s·(pred − M)
 #   ln_s<스케일>: LN(M + s·(pred − M))
+#   s<스케일>  : M + s·(pred − M) — 진단 수치만 (토큰 저장 안 함, ×1.41은 11-05 정성 진단에서 효과 없어 버림)
 #  출력 <out>/<변형>/<uid>.npy (fp16, trellis_tools gen/gscheck에 바로 넣음), <out>/renorm_stats.json
 #  진단 (test 정답과 비교): 편차 방향 cos, 편차 크기 비, 토큰별 표준편차(정답은 LN이라 ≈1)
 #  범주 (components.npz의 cls_score): top-1 · top-3 정확도, kNN 이웃 범주 일치 — 거르지 않음 / 예측 top-3 범주 안에서만 / top-1 범주 안에서만
@@ -48,7 +48,8 @@ V = {'ln': ln(P)}
 for s in map(float, a.scales.split(',')):
     t = f'{round(s * 100)}'; V[f's{t}'] = M + s * (P - M); V[f'ln_s{t}'] = ln(V[f's{t}'])
 for n, Q in V.items():
-    diag(n, Q); save(n, Q)
+    diag(n, Q)
+    if n.startswith('ln'): save(n, Q)
 del V
 # 범주: top-1 · top-3, kNN 이웃 범주 일치 (거르지 않음 / top-3 / top-1 안에서)
 c = np.load(a.comp); SYN = [str(x) for x in c['classes']]; row = {uid(str(n)): i for i, n in enumerate(c['name'])}
