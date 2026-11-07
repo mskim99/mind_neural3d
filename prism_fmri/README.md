@@ -20,6 +20,7 @@
 - `scripts/run_var_cmp.sh` · `run_var_cmp7.sh` — Variational feat vs value 비교 (학습 · sub-0001 / 나머지 6명 평가)
 - `scripts/run_tokfix.sh` — 예측 토큰 → train 정답 토큰 공간 (kNN · PCA, 추론만)
 - `scripts/run_renorm.sh` — 색 실험 1: 예측 토큰 LN 재적용(+ 편차 ×1.37 · ×1.6) 스윕 + top-3 범주 · 범주로 거른 kNN 일치 → 정성 14 · 8지표 (추론만)
-- 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color.py` (색 선형 프로브), `probe_split.py` (분기 분리 프로브), `tokfix.py`, `renorm.py`
+- `scripts/run_purple.sh` — 색 실험 1 후속: 보라 치우침 출처 (평균 토큰 · 예측 평균 · 공통 치우침 뺀 예측 렌더)
+- 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color.py` (색 선형 프로브), `probe_split.py` (분기 분리 프로브), `tokfix.py`, `renorm.py`, `purple_check.py`
 
 전처리(로컬): `prep_shape_targets.py` (영상 방위·center·scale, 영상 프레임, 64³ 복셀). 정답 폴더는 서버의 `$W/data/shape_targets`.
