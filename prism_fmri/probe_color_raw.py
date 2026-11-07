@@ -175,6 +175,10 @@ def report(tag, sA, sB):
 
 
 SUBS = a.subs.split(',') if a.subs else sorted(d for d in os.listdir(a.data_root) if d.startswith('sub-'))
+full = lambda s: all(os.path.exists(os.path.join(a.data_root, s, 'npy_data', k + '.npy')) for k in keys)
+skip = [s for s in SUBS if not full(s)]; SUBS = [s for s in SUBS if s not in skip]
+if skip: print('fMRI 파일이 모자라 건너뜀: ' + ' '.join(skip), flush=True)
+R['skipped_subs'] = skip
 R['subs'] = {}; ens = {}
 for sub in SUBS:
     F = load_sub(sub, keys); R['subs'][sub] = {}
@@ -197,7 +201,7 @@ for sub in SUBS:
         R['subs'][sub][fn] = {'A_train_to_test': sA, 'B_cv10': sB}
         print(f"PROBE {sub} {fn} 양성 대조: 범주 정확도 A {sA['cat_acc']:.3f} · B {sB['cat_acc']:.3f} (우연 {1 / len(CL):.3f})", flush=True)
         report(f'{sub} {fn}', sA, sB)
-        json.dump(R, open(f'{a.out}/probe_color_raw.json', 'w'), indent=1, ensure_ascii=False)
+        json.dump(R, open(f'{a.out}/probe_color_raw.json', 'w', encoding='utf-8'), indent=1, ensure_ascii=False)
 if len(SUBS) > 1:
     R['ensemble'] = {}
     for fn, e in ens.items():
@@ -209,5 +213,5 @@ if len(SUBS) > 1:
             sB['null'] = null_stats(np.array(sB['resid']), [r_cols(e['nB'][t] / S, e['tB'][t]) for t in range(a.perm)])
         R['ensemble'][fn] = {'A_train_to_test': sA, 'B_cv10': sB}
         report(f'{len(SUBS)}명 평균 {fn}', sA, sB)
-json.dump(R, open(f'{a.out}/probe_color_raw.json', 'w'), indent=1, ensure_ascii=False)
+json.dump(R, open(f'{a.out}/probe_color_raw.json', 'w', encoding='utf-8'), indent=1, ensure_ascii=False)
 print('PROBE_RAW_DONE', flush=True)

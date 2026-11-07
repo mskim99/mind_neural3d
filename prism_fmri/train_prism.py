@@ -5,6 +5,8 @@
 #  fMRI 프레임 k ↔ 영상 프레임 round(19.2k) (MinD-3D 전처리가 BOLD 지연 6초를 이미 반영). 쓰는 fMRI 프레임 2~7
 #  피험자별 ViT(<enc_dir>/subNN_encoder.pt) · Semantic · Variational + 공유 Temporal Stem · SV Encoder · Perceptive · 디코더, 배치마다 피험자 같은 수, 저장에서 ViT 제외
 #  손실 = λ_tok·(MSE + (1−cos)) + λ_proto·CE(범주 텍스트 프로토타입) + λ_var·(scale + ratio | center + scale + rot) + λ_subj·CE(피험자). 저장: model_latest.pt · model_final.pt
+#  --color 1 (11-08): Semantic 안 색 코드 (prism.py 머리말). 정답 data/stim_color.npz (probe_color_raw.py가 자극 영상 48프레임에서 계산) 중 정규채도 · rg_n · by_n
+#    train 통계로 표준화 → 학습 때 --color_drop 비율은 코드를 비움, 손실 += λ_color · MSE(색 머리, 코드). 검증은 코드 없이 (fMRI만)
 #  이전 기준선(prism_nop_feat · value)을 다시 학습하려면 --arch res --sem_clip back --var_heads csr (scripts/run_var_cmp.sh)
 import os, sys, math, time, argparse, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
@@ -34,6 +36,9 @@ p.add_argument('--var_heads', default='sr', choices=['sr', 'csr'])   # sr: Scale
 p.add_argument('--arch', default='fig', choices=['fig', 'res'])   # fig: 11-06 구조도 Temporal Stem · SV Encoder / res: 이전 구현
 p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자별 ViT · S · V만 지원 (11-04 사용자 결정). 기록용으로 args에 남김 (build_from_ckpt가 확인)
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
+p.add_argument('--color', type=int, default=0, choices=[0, 1])   # Semantic 안 색 코드 (11-08)
+p.add_argument('--color_npz', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'stim_color.npz'))
+p.add_argument('--color_drop', type=float, default=0.3); p.add_argument('--lam_color', type=float, default=0.1)
 p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
 a = p.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
@@ -57,6 +62,15 @@ def ratio_target(uid):
     return np.array(ext, np.float32), True
 
 
+COLOR_COLS = ['정규채도', 'rg_n', 'by_n']
+if a.color:
+    _z = np.load(a.color_npz); _names = list(_z['names']); _Y = _z['Y'][:, [_names.index(c) for c in COLOR_COLS]].astype(np.float32)
+    _keys = list(_z['keys']); _tr = {l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt')) if l.strip()}
+    _m = np.array([k in _tr for k in _keys]); COLOR_MU, COLOR_SD = _Y[_m].mean(0), _Y[_m].std(0) + 1e-6   # train 물체로만 표준화
+    COLOR = {k: (y - COLOR_MU) / COLOR_SD for k, y in zip(_keys, _Y)}
+    print(f'[color] {len(COLOR)}개 코드 {COLOR_COLS}, train 평균 {COLOR_MU.round(3)} · 표준편차 {COLOR_SD.round(3)}', flush=True)
+
+
 def load_item(si, k):
     syn, uid = k.split('/')
     x = np.load(os.path.join(a.data_root, SUBS[si], 'npy_data', k + '.npy')).astype(np.float32)[FRAMES]
@@ -65,6 +79,7 @@ def load_item(si, k):
             'cond_tokens': torch.from_numpy(np.load(f'{a.tgt}/dino/{uid}.npy')),
             'center': torch.from_numpy(np.stack([t['cx'][vf], t['cy'][vf]], -1)), 'scale': torch.from_numpy(t['scale'][vf]),
             'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k,
+            **({'color': torch.from_numpy(COLOR[k])} if a.color else {}),
             **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False))}
 
 
@@ -97,7 +112,8 @@ cfg = OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))
 ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
 enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
-model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads).to(dev)
+model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads, color=a.color).to(dev)
+if a.color: model.color_mu.copy_(torch.from_numpy(COLOR_MU)); model.color_sd.copy_(torch.from_numpy(COLOR_SD))
 STATE = lambda: model.trainable_state_dict()
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
@@ -125,8 +141,8 @@ step = 0; latest = f'{a.out_dir}/model_latest.pt'
 if a.resume and os.path.exists(latest):
     ck = torch.load(latest, map_location='cpu'); check_load(model, ck['model'])   # 구조 옵션이 다르면 멈춤
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
-W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
-KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'subj', 'subj_acc']
+W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj, color=a.lam_color)
+KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'subj', 'subj_acc'] + (['color'] if a.color else [])   # color 0이면 로그 열은 이전과 같음
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
     log.write('step,split,total,' + ','.join(KEYS) + ',lr\n')
@@ -138,7 +154,8 @@ def to_dev(b):
 
 
 TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambda L: W['proto'] * L['proto'],
-         'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio']), 'subj': lambda L: W['subj'] * L['subj']}
+         'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio']), 'subj': lambda L: W['subj'] * L['subj'],
+         'color': lambda L: W['color'] * L['color']}
 
 
 def total_loss(L):
@@ -162,7 +179,7 @@ def validate():
         for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
     L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
     print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
-          f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
+          f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} subj_acc {L["subj_acc"]:.3f}' + (f' color {L["color"]:.4f}' if a.color else '') + ' | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
 
@@ -171,15 +188,16 @@ while not done:
     ep += 1
     for b in tl:
         b = to_dev(b)
+        cm = (torch.rand(len(b['subj']), device=dev) >= a.color_drop) if a.color else None          # 코드를 넣을 샘플
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(b['fmri'], b['frame_idx'], b['subj'])
+            out = model(b['fmri'], b['frame_idx'], b['subj'], color_code=b.get('color'), color_mask=cm)
         L = prism_losses(out, b); tot = total_loss(L)
         opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); sched.step(); step += 1
         if step % a.print_every == 0:
             write('train', L, float(tot))
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
-                  f'subj_acc {float(L["subj_acc"]):.3f} lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
+                  f'subj_acc {float(L["subj_acc"]):.3f}' + (f' color {float(L["color"]):.4f}' if a.color else '') + f' lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
         if step % a.val_every == 0: validate()
         if step % a.save_every == 0 or step >= a.max_step:
             torch.save({'model': STATE(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'step': step, 'args': vars(a),

@@ -14,6 +14,9 @@
 #  피험자: ViT · Semantic · Variational은 피험자별(자기 데이터로만 학습), Temporal Stem · SV Encoder · Perceptive(FiLM) · 디코더는 공유
 #  읽는 체크포인트: per_subject 1 · temporal 1 · P 없음 (c7ae1f8 이후). P가 있던 이전 체크포인트(prism_shape_ps7 등)는 못 읽음 (지표는 이미 있음)
 #  구조도에 없어 정한 것: ConvNeXt 블록 수 2 · 채널 512, head 은닉 256, SV Encoder 뒤 MLP 은닉 1024, Perceptive 입력 방식 FiLM
+#  color 1 (11-08, Semantic 안): 색 = 관찰 조건이 달라도 안정적인 전역 시각 특성 (논문 초안 3.1의 Semantic 정의). 갈래 수는 그대로
+#    색 코드 3차원(자극 영상의 정규채도 · rg_n · by_n, train 통계로 표준화) + 있음 표시 → Linear(0 초기화) → Semantic Features에 더함
+#    색 머리: Semantic 벡터 → 색 코드 예측 (fMRI만 보고). 학습 때 GT 코드를 일부만 넣고(나머지는 비움), 평가 때 코드 = 없음 · fMRI 예측 · 범주 표본 · GT(상한)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -121,7 +124,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr'):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', color=0):
         super().__init__()
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
@@ -148,6 +151,12 @@ class Prism(nn.Module):
             self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(K)])
             self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
+        self.color = color                                                  # Semantic 안 색 코드 (피험자별 K벌)
+        if color:
+            self.color_head = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 256), nn.GELU(), nn.Linear(256, 3)) for _ in range(K)])
+            self.color_emb = nn.ModuleList([nn.Linear(4, dc) for _ in range(K)])
+            for m in self.color_emb: nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)   # 처음엔 색 코드 영향 없음
+            self.register_buffer('color_mu', torch.zeros(3)); self.register_buffer('color_sd', torch.ones(3))   # 코드 표준화 (train 통계)
         # Variational (피험자별 K벌)
         assert var_heads in ('csr', 'sr'); self.var_heads = var_heads
         self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(K)])
@@ -195,9 +204,10 @@ class Prism(nn.Module):
             order = torch.cat(order); inv = torch.empty_like(order); inv[order] = torch.arange(len(order), device=order.device)
             return torch.cat(outs)[inv]
 
-    def forward(self, fmri, frame_idx, subj=None, perceptive_override=None):
+    def forward(self, fmri, frame_idx, subj=None, perceptive_override=None, color_code=None, color_mask=None):
         """fmri [B, T, 256, 256], frame_idx [B, T] (fMRI 프레임 번호, 0~9), subj [B] 피험자 번호 (없으면 0).
-        perceptive_override: 평가 때 Perceptive 벡터를 바꿔 끼우기 ('mean' → 배치 평균 = 사실상 버리기, 텐서 → 그 값)."""
+        perceptive_override: 평가 때 Perceptive 벡터를 바꿔 끼우기 ('mean' → 배치 평균 = 사실상 버리기, 텐서 → 그 값).
+        color_code [B, 3] 표준화된 색 코드, color_mask [B] (1 = 코드 있음). color 1 모델에서만. 코드가 없으면 '없음' 임베딩."""
         if subj is None:
             subj = torch.zeros(fmri.shape[0], dtype=torch.long, device=fmri.device)
         tok = self.encode_frames(fmri, subj).float()
@@ -218,6 +228,11 @@ class Prism(nn.Module):
         out['sem_vec'] = sem_feat.mean(1)
         if self.sem_clip == 'back':
             out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
+        if self.color:                                                               # Semantic 안 색: 예측(fMRI만) → 코드 입력을 Semantic Features에 더함
+            out['color_pred'] = _route(self.color_head, subj, out['sem_vec'])        # [B, 3] 표준화된 코드
+            m = torch.zeros(B, 1, device=fmri.device) if color_code is None else                 (torch.ones(B, 1, device=fmri.device) if color_mask is None else color_mask.float().view(B, 1))
+            code = torch.zeros(B, 3, device=fmri.device) if color_code is None else color_code.float() * m
+            sem_feat = sem_feat + _route(self.color_emb, subj, torch.cat([code, m], -1))[:, None].to(sem_feat.dtype)
         # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Scale · Ratio (csr: Center · Scale · Rotate) → Aggregate → Variational Features [B, T, dc]
         vin = torch.cat([v[:, :, 0], v[:, :, 1:].mean(2)], -1)
         sc, fs = _route(self.scale, subj, vin); out['scale'] = F.softplus(sc).squeeze(-1)
@@ -265,7 +280,7 @@ def build_from_ckpt(ck, repo):
     encs = [load_encoder(pth, cfg) for pth in ck['enc_paths']]
     model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']),
                   var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'),
-                  sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'))
+                  sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'), color=args.get('color', 0))
     check_load(model, ck['model'])
     return model
 
@@ -289,6 +304,7 @@ def prism_losses(out, batch, proto_temp=0.07):
     L['proto'] = F.cross_entropy(logits, batch['cls']); L['proto_acc'] = (logits.argmax(-1) == batch['cls']).float().mean()
     z = torch.zeros((), device=tgt.device)
     L['scale'] = F.mse_loss(out['scale'], batch['scale'])
+    L['color'] = F.mse_loss(out['color_pred'], batch['color']) if 'color_pred' in out and 'color' in batch else z   # 색 머리 (표준화 코드)
     L['center'] = F.mse_loss(out['center'], batch['center']) if 'center' in out else z
     L['rot'] = F.mse_loss(rot6d_to_matrix(out['rot6d']), batch['rot']) if 'rot6d' in out else z
     if 'ratio' in out:                                                               # 물체 정답을 프레임마다 맞춤, 복셀 없는 물체는 뺌
