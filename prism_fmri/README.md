@@ -21,6 +21,6 @@
 - `scripts/run_tokfix.sh` — 예측 토큰 → train 정답 토큰 공간 (kNN · PCA, 추론만)
 - `scripts/run_renorm.sh` — 색 실험 1: 예측 토큰 LN 재적용(+ 편차 ×1.37 · ×1.6) 스윕 + top-3 범주 · 범주로 거른 kNN 일치 → 정성 14 · 8지표 (추론만)
 - `scripts/run_purple.sh` — 색 실험 1 후속: 보라 치우침 출처 (평균 토큰 · 예측 평균 · 공통 치우침 뺀 예측 렌더)
-- 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color.py` (색 선형 프로브), `probe_split.py` (분기 분리 프로브), `tokfix.py`, `renorm.py`, `purple_check.py`
+- 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color.py` (색 선형 프로브), `probe_color_raw.py` (원 fMRI 색 프로브, 범주 넘는 색 · 면적 · 밝기 제거 · 순열 검정, CPU), `probe_split.py` (분기 분리 프로브), `tokfix.py`, `renorm.py`, `purple_check.py`
 
 전처리(로컬): `prep_shape_targets.py` (영상 방위·center·scale, 영상 프레임, 64³ 복셀). 정답 폴더는 서버의 `$W/data/shape_targets`.
