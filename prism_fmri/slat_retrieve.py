@@ -3,11 +3,13 @@
 #  거리: 토큰마다 affine 없는 layer_norm → 토큰 평균 → train 평균 빼기 → cos (평균을 안 빼면 모두 cos ≈ 1)
 #  평균 토큰이 아니라 실제 토큰 하나를 그대로 씀 (실제 분포 안의 조건 → TRELLIS 외형 디코더가 정상 색을 내는지 확인)
 #  출력: <out>/<test uid>.npy = 고른 train 토큰 파일로 가는 symlink, <out>/slat_map.json (test uid → train uid · cos · 범주)
+#  --exclude_self 1: 같은 물체는 후보에서 뺌 (조정용 검증 물체가 train 목록에 있을 때)
 # 사용: python slat_retrieve.py --pred <예측 tokens> --comp <components.npz> --tgt <shape_targets> --data_root <fMRI-Shape> --out <폴더>
 import os, json, shutil, argparse, numpy as np
 p = argparse.ArgumentParser()
 p.add_argument('--pred', required=True); p.add_argument('--comp', required=True); p.add_argument('--tgt', required=True)
 p.add_argument('--data_root', required=True); p.add_argument('--out', required=True)
+p.add_argument('--exclude_self', type=int, default=0)   # 1: 같은 uid는 후보에서 뺌 (train 물체로 조정할 때)
 a = p.parse_args()
 os.makedirs(a.out, exist_ok=True)
 lst = lambda sp: [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{sp}_list.txt')) if l.strip()]
@@ -29,6 +31,7 @@ for k, pc, gc in zip(names, cp, cl):
     u = k.split('/')[1]; f = f'{a.pred}/{u}.npy'
     if not os.path.exists(f): print('없음', f, flush=True); continue
     cat = classes[int(pc)]; idx = np.where(TCAT == cat)[0]
+    if a.exclude_self: idx = np.array([j for j in idx if tr[j].split('/')[1] != u])
     s = TN[idx] @ nz(pool(f)); j = idx[int(s.argmax())]; tu = tr[j].split('/')[1]
     o = f'{a.out}/{u}.npy'
     if os.path.lexists(o): os.unlink(o)

@@ -5,6 +5,7 @@
 #  fMRI 프레임 k ↔ 영상 프레임 round(19.2k) (MinD-3D 전처리가 BOLD 지연 6초를 이미 반영). 쓰는 fMRI 프레임 2~7
 #  피험자별 ViT(<enc_dir>/subNN_encoder.pt) · Semantic · Variational + 공유 Temporal Stem · SV Encoder · Perceptive · 디코더, 배치마다 피험자 같은 수, 저장에서 ViT 제외
 #  손실 = λ_tok·(MSE + (1−cos)) + λ_proto·CE(범주 텍스트 프로토타입) + λ_var·(scale + ratio | center + scale + rot) + λ_subj·CE(피험자). 저장: model_latest.pt · model_final.pt
+#  --fold k/n (11-09, 토큰 prior용 교차 학습): train 목록(annotations 순서)에서 i % n == k인 물체를 학습에서 뺌 → infer_prism.py --split train --fold k/n로 그 물체의 '안 본' 예측을 만듦
 #  이전 기준선(prism_nop_feat · value)을 다시 학습하려면 --arch res --sem_clip back --var_heads csr
 import os, sys, math, time, argparse, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
@@ -34,6 +35,7 @@ p.add_argument('--var_heads', default='sr', choices=['sr', 'csr'])   # sr: Scale
 p.add_argument('--arch', default='fig', choices=['fig', 'res'])   # fig: 11-06 구조도 Temporal Stem · SV Encoder / res: 이전 구현
 p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자별 ViT · S · V만 지원 (11-04 사용자 결정). 기록용으로 args에 남김 (build_from_ckpt가 확인)
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
+p.add_argument('--fold', default='')       # 'k/n': train에서 i % n == k 물체를 뺌 (교차 학습). 비우면 전부
 p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
 a = p.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
@@ -71,6 +73,8 @@ def load_item(si, k):
 class ShapeSet(Dataset):
     def __init__(self, split):
         ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{split}_list.txt')) if l.strip()]
+        if split == 'train' and a.fold:
+            fk, fn = map(int, a.fold.split('/')); ids = [k for i, k in enumerate(ids) if i % fn != fk]   # 목록 순서 기준 (infer_prism.py --fold와 같음)
         ids = [k for k in ids if os.path.exists(f'{a.tgt}/dino/{k.split("/")[1]}.npy')]
         ids = ids[:a.limit] if a.limit else ids
         self.items = [(si, k) for si, s in enumerate(SUBS) for k in ids
