@@ -11,18 +11,13 @@
 | Perceptive | Token Pooling → Subject Projector (Linear-BN-GELU) → FiLM γ, β + 피험자 분류(보조) |
 | 재구성 | Ⓒ[Semantic ; Variational] → FiLM ⊙(1+γ)+β → Transformer Decoder (learned query 1374, Cross-Attention K·V) → TRELLIS 조건 토큰 [1374, 1024] → TRELLIS |
 
-이전 값(`--arch res --sem_clip back --var_heads csr`)은 기준선 `prism_nop_feat` · `prism_nop_value`를 읽고 다시 학습하려고 남김 (`scripts/run_var_cmp.sh`).
 
 ## 실행 (Pro6000, 코드는 huijong 브랜치 → 서버 `git pull`)
 - `scripts/common.sh` — 공통 경로 · guard (모든 스크립트가 source)
 - `scripts/dino.sh` — 자극 영상 프레임 → TRELLIS 조건 토큰 정답 (meshgen venv)
-- `scripts/run_fig.sh` — 지금 구조 학습(7명, bs 14, 4만 스텝) → sub-0001 GLB → 8지표 (`spp_eval/run_spp.sh`) · 진행 `scripts/status_fig.sh`
-- `scripts/run_var_cmp.sh` · `run_var_cmp7.sh` — Variational feat vs value 비교 (학습 · sub-0001 / 나머지 6명 평가)
-- `scripts/run_tokfix.sh` — 예측 토큰 → train 정답 토큰 공간 (kNN · PCA, 추론만)
+- `scripts/run_fig.sh` — 지금 구조 학습(7명, bs 14, 4만 스텝) → sub-0001 GLB → 8지표 (`spp_eval/run_spp.sh`)
 - `scripts/run_renorm.sh` — 색 실험 1: 예측 토큰 LN 재적용(+ 편차 ×1.37 · ×1.6) 스윕 + top-3 범주 · 범주로 거른 kNN 일치 → 정성 14 · 8지표 (추론만)
-- `scripts/run_purple.sh` — 색 실험 1 후속: 보라 치우침 출처 (평균 토큰 · 예측 평균 · 공통 치우침 뺀 예측 렌더)
 - `scripts/run_slatsplit.sh` — 외형 단계 분리 (11-09, 추론만): TRELLIS 형상 단계 = fig 예측 토큰, 외형 단계 = 실제 토큰(`slat_retrieve.py`로 예측 범주 안 가장 가까운 train 정답 / test 정답 상한) → 8지표 + 색 일치. `trellis_tools.py --slat_pred`
-- `scripts/run_color.sh` — 색 코드 실험 (11-08): Semantic 안 색 코드(`--color 1`) 학습 → sub-0001 · sub-0008 모드별(none · pred · cat_sample · gt) 8지표 + 색 일치. 정답 `data/stim_color.npz`
-- 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color.py` (색 선형 프로브), `probe_color_raw.py` (원 fMRI 색 프로브, 범주 넘는 색 · 면적 · 밝기 제거 · 순열 검정, CPU), `scripts/color_agree.py` (렌더 색과 자극 색 일치), `probe_split.py` (분기 분리 프로브), `tokfix.py`, `renorm.py`, `purple_check.py`
+- 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color_raw.py` (원 fMRI 색 프로브, 범주 넘는 색 · 면적 · 밝기 제거 · 순열 검정, CPU), `scripts/color_agree.py` (렌더 색과 자극 색 일치), `probe_split.py` (분기 분리 프로브), `renorm.py`
 
 전처리(로컬): `prep_shape_targets.py` (영상 방위·center·scale, 영상 프레임, 64³ 복셀). 정답 폴더는 서버의 `$W/data/shape_targets`.

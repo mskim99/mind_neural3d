@@ -3,7 +3,7 @@
 #   범주 (분류) — annotations 경로의 synset
 #   scale · cx · cy — 영상 실루엣 값 (<tgt>/targets/<uid>.npz), fMRI 프레임 2~7에 대응하는 영상 프레임 평균
 #   크기 비율 ext_x · ext_y · ext_z — 64³ 복셀(<tgt>/voxels, 가장 긴 변 = 1)에서 축별로 차 있는 범위 / 64. ShapeNet은 y가 위
-#  특징: vit_cls (고정 MinD-3D++ ViT, 프레임 평균 CLS) · sem · var · perc · tok — probe_color.py와 같음
+#  특징: vit_cls (고정 MinD-3D++ ViT, 프레임 평균 CLS) · sem · var · perc · tok
 #  프로브: 표준화 + ridge (alpha는 학습 안 5겹으로 고름), train fMRI로 맞추고 test에 적용 (train→test) + test 5겹 cv
 #   범주: one-hot ridge → argmax 정확도. 기준 = 최빈 범주, 우연 = 1/범주 수
 #   연속값: Pearson r. 범주 평균을 빼고 남은 부분(잔차)을 다시 맞춘 r도 냄 → 0보다 확실히 크면 범주를 넘는 정보
