@@ -6,6 +6,7 @@
 #       sampler는 TRELLIS 기본값 그대로 (25 steps, cfg 5.0, neg_cond = 0 토큰)
 #  gscheck: gen과 같은 생성(같은 seed) 후 TRELLIS 내부 Gaussian 렌더 색 vs to_glb가 구운 텍스처 색 비교 → <out>/gscheck.jsonl + <out>/<name>_gs.png
 #         (GLB 굽는 단계에서 색이 어두워지는지 확인용, 10-30)
+#  --slat_pred <폴더>: 외형 단계 분리 (11-09). 1단계(형상, SS)는 --pred 토큰, 2단계(외형, SLat)는 이 폴더의 같은 이름 토큰을 조건으로 씀 (gen · gscheck)
 #  sm_120에서 xformers 기본 커널(FA3)이 오류 → op 미지정 호출만 CUTLASS로 보냄 (run_trellis.py와 같은 처리, 계산식 동일)
 # 사용: python trellis_tools.py dino --frames <tgt>/frames --out <tgt>/dino [--view 0]
 #       python trellis_tools.py gen --pred <tokens 폴더> --out <glb 폴더> [--seed 42]
@@ -17,6 +18,7 @@ p.add_argument('mode', choices=['dino', 'gen', 'gscheck'])
 p.add_argument('--frames'); p.add_argument('--pred'); p.add_argument('--out', required=True)
 p.add_argument('--view', type=int, default=0); p.add_argument('--seed', type=int, default=42); p.add_argument('--limit', type=int, default=0)
 p.add_argument('--trellis_repo', default='/home/oem/jhj/meshgen_tools/repo/third_party/TRELLIS')
+p.add_argument('--slat_pred', default='')   # 비우면 두 단계 모두 --pred 토큰
 p.add_argument('--names', default='')   # gscheck: 이 목록의 이름만
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
@@ -46,6 +48,14 @@ def make_cond(c):
     return {'cond': c, 'neg_cond': torch.zeros_like(c)}      # TRELLIS get_cond와 같은 형식 (neg_cond = 0)
 
 
+def load_conds(name):   # (형상 조건, 외형 조건). --slat_pred 없으면 같은 것, 외형 토큰이 없으면 None
+    ld = lambda f: make_cond(torch.from_numpy(np.load(f)).float().cuda()[None])
+    c1 = ld(f'{a.pred}/{name}.npy')
+    if not a.slat_pred: return c1, c1
+    f2 = f'{a.slat_pred}/{name}.npy'
+    return (c1, ld(f2)) if os.path.exists(f2) else (c1, None)
+
+
 os.makedirs(a.out, exist_ok=True); t0 = time.time()
 
 if a.mode == 'dino':
@@ -72,12 +82,12 @@ elif a.mode == 'gscheck':
     for i, name in enumerate(names[: a.limit or None]):
         f = f'{a.pred}/{name}.npy'
         if not os.path.exists(f): print('없음', f, flush=True); continue
-        cond = torch.from_numpy(np.load(f)).float().cuda()[None]
-        cond = make_cond(cond)
+        cond, cond2 = load_conds(name)
+        if cond2 is None: print('외형 토큰 없음', name, flush=True); continue
         torch.manual_seed(a.seed)
         with torch.no_grad():
             coords = pipe.sample_sparse_structure(cond, 1)
-            slat = pipe.sample_slat(cond, coords)
+            slat = pipe.sample_slat(cond2, coords)
             outs = pipe.decode_slat(slat, ['mesh', 'gaussian'])
         g = outs['gaussian'][0]
         k = render_utils.render_snapshot(g, resolution=512, bg_color=(0, 0, 0), verbose=False)['color']
@@ -100,12 +110,12 @@ else:
         name = os.path.basename(f)[:-4]; od = f'{a.out}/{name}'
         if os.path.exists(f'{od}/{name}.glb'): continue
         t1 = time.time()
-        cond = torch.from_numpy(np.load(f)).float().cuda()[None]
-        cond = make_cond(cond)
+        cond, cond2 = load_conds(name)
+        if cond2 is None: print('외형 토큰 없음', name, flush=True); continue
         torch.manual_seed(a.seed)
         with torch.no_grad():
             coords = pipe.sample_sparse_structure(cond, 1)
-            slat = pipe.sample_slat(cond, coords)
+            slat = pipe.sample_slat(cond2, coords)
             outs = pipe.decode_slat(slat, ['mesh', 'gaussian'])
         os.makedirs(od, exist_ok=True)
         glb = postprocessing_utils.to_glb(outs['gaussian'][0], outs['mesh'][0], simplify=0.95, texture_size=1024, verbose=False)

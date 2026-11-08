@@ -21,6 +21,7 @@
 - `scripts/run_tokfix.sh` — 예측 토큰 → train 정답 토큰 공간 (kNN · PCA, 추론만)
 - `scripts/run_renorm.sh` — 색 실험 1: 예측 토큰 LN 재적용(+ 편차 ×1.37 · ×1.6) 스윕 + top-3 범주 · 범주로 거른 kNN 일치 → 정성 14 · 8지표 (추론만)
 - `scripts/run_purple.sh` — 색 실험 1 후속: 보라 치우침 출처 (평균 토큰 · 예측 평균 · 공통 치우침 뺀 예측 렌더)
+- `scripts/run_slatsplit.sh` — 외형 단계 분리 (11-09, 추론만): TRELLIS 형상 단계 = fig 예측 토큰, 외형 단계 = 실제 토큰(`slat_retrieve.py`로 예측 범주 안 가장 가까운 train 정답 / test 정답 상한) → 8지표 + 색 일치. `trellis_tools.py --slat_pred`
 - `scripts/run_color.sh` — 색 코드 실험 (11-08): Semantic 안 색 코드(`--color 1`) 학습 → sub-0001 · sub-0008 모드별(none · pred · cat_sample · gt) 8지표 + 색 일치. 정답 `data/stim_color.npz`
 - 분석: `eval_pose.py` (Variational 출력 vs GT), `probe_color.py` (색 선형 프로브), `probe_color_raw.py` (원 fMRI 색 프로브, 범주 넘는 색 · 면적 · 밝기 제거 · 순열 검정, CPU), `scripts/color_agree.py` (렌더 색과 자극 색 일치), `probe_split.py` (분기 분리 프로브), `tokfix.py`, `renorm.py`, `purple_check.py`
 
