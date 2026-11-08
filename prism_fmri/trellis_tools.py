@@ -7,6 +7,9 @@
 #  gscheck: gen과 같은 생성(같은 seed) 후 TRELLIS 내부 Gaussian 렌더 색 vs to_glb가 구운 텍스처 색 비교 → <out>/gscheck.jsonl + <out>/<name>_gs.png
 #         (GLB 굽는 단계에서 색이 어두워지는지 확인용, 10-30)
 #  --slat_pred <폴더>: 외형 단계 분리 (11-09). 1단계(형상, SS)는 --pred 토큰, 2단계(외형, SLat)는 이 폴더의 같은 이름 토큰을 조건으로 씀 (gen · gscheck)
+#  --slat_t0 t (0 < t < 1, --slat_pred와 같이): 외형 단계 SDEdit (11-09, prior 0단계). 예측 토큰으로 만든 SLat을 정규화 공간에서 시점 t까지 노이즈를 넣고
+#       (x_t = (1 − t)·x0 + (σmin + (1 − σmin)·t)·ε, TRELLIS FlowEulerSampler와 같은 식) --slat_pred 조건으로 t → 0까지 같은 sampler(sample_once, 같은 step 표 · cfg)로 되돌림
+#       t = 1이면 보통 외형 분리와 같음. t가 작을수록 예측 SLat을 더 남김
 #  sm_120에서 xformers 기본 커널(FA3)이 오류 → op 미지정 호출만 CUTLASS로 보냄 (run_trellis.py와 같은 처리, 계산식 동일)
 # 사용: python trellis_tools.py dino --frames <tgt>/frames --out <tgt>/dino [--view 0]
 #       python trellis_tools.py gen --pred <tokens 폴더> --out <glb 폴더> [--seed 42]
@@ -19,6 +22,7 @@ p.add_argument('--frames'); p.add_argument('--pred'); p.add_argument('--out', re
 p.add_argument('--view', type=int, default=0); p.add_argument('--seed', type=int, default=42); p.add_argument('--limit', type=int, default=0)
 p.add_argument('--trellis_repo', default='/home/oem/jhj/meshgen_tools/repo/third_party/TRELLIS')
 p.add_argument('--slat_pred', default='')   # 비우면 두 단계 모두 --pred 토큰
+p.add_argument('--slat_t0', type=float, default=1.0)   # < 1이면 외형 단계 SDEdit
 p.add_argument('--names', default='')   # gscheck: 이 목록의 이름만
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
@@ -43,9 +47,31 @@ print('model', a.model, flush=True)
 pipe = TrellisImageTo3DPipeline.from_pretrained(a.model); pipe.cuda()
 for f in ('preprocess_image', 'get_cond', 'sample_sparse_structure', 'sample_slat', 'decode_slat'):
     assert hasattr(pipe, f), f'TRELLIS API에 {f} 없음'
-print('기본 sampler', pipe.sparse_structure_sampler_params, pipe.slat_sampler_params, flush=True)
+print('기본 sampler', pipe.sparse_structure_sampler_params, pipe.slat_sampler_params, type(pipe.slat_sampler).__name__, flush=True)
+if a.slat_t0 < 1: assert a.slat_pred and hasattr(pipe.slat_sampler, 'sample_once') and hasattr(pipe.slat_sampler, 'sigma_min'), 'SDEdit은 --slat_pred와 FlowEuler sampler 필요'
 def make_cond(c):
     return {'cond': c, 'neg_cond': torch.zeros_like(c)}      # TRELLIS get_cond와 같은 형식 (neg_cond = 0)
+
+
+def sdedit(slat0, cond2, t0):   # 정규화 공간에서 t0까지 노이즈 → cond2로 t0 → 0 Euler (TRELLIS sampler 그대로)
+    fm, smp = pipe.models['slat_flow_model'], pipe.slat_sampler; prm = dict(pipe.slat_sampler_params)
+    std = torch.tensor(pipe.slat_normalization['std'])[None].to(slat0.feats.device); mean = torch.tensor(pipe.slat_normalization['mean'])[None].to(slat0.feats.device)
+    s = smp.sigma_min; x0 = (slat0.feats - mean) / std
+    x = slat0.replace((1 - t0) * x0 + (s + (1 - s) * t0) * torch.randn_like(x0))
+    steps, rt = prm.pop('steps', 50), prm.pop('rescale_t', 1.0)          # 없으면 FlowEulerSampler.sample 기본값
+    ts = np.linspace(1, 0, steps + 1); ts = rt * ts / (1 + (rt - 1) * ts); ts = [t0] + [float(t) for t in ts if t < t0]
+    for t, tp in zip(ts[:-1], ts[1:]):
+        x = smp.sample_once(fm, x, t, tp, **cond2, **prm).pred_x_prev
+    return x.replace(x.feats * std + mean)
+
+
+def generate(cond, cond2):
+    coords = pipe.sample_sparse_structure(cond, 1)
+    if a.slat_pred and a.slat_t0 < 1:
+        slat = sdedit(pipe.sample_slat(cond, coords), cond2, a.slat_t0)
+    else:
+        slat = pipe.sample_slat(cond2, coords)
+    return pipe.decode_slat(slat, ['mesh', 'gaussian'])
 
 
 def load_conds(name):   # (형상 조건, 외형 조건). --slat_pred 없으면 같은 것, 외형 토큰이 없으면 None
@@ -86,9 +112,7 @@ elif a.mode == 'gscheck':
         if cond2 is None: print('외형 토큰 없음', name, flush=True); continue
         torch.manual_seed(a.seed)
         with torch.no_grad():
-            coords = pipe.sample_sparse_structure(cond, 1)
-            slat = pipe.sample_slat(cond2, coords)
-            outs = pipe.decode_slat(slat, ['mesh', 'gaussian'])
+            outs = generate(cond, cond2)
         g = outs['gaussian'][0]
         k = render_utils.render_snapshot(g, resolution=512, bg_color=(0, 0, 0), verbose=False)['color']
         w = render_utils.render_snapshot(g, resolution=512, bg_color=(1, 1, 1), verbose=False)['color']
@@ -114,9 +138,7 @@ else:
         if cond2 is None: print('외형 토큰 없음', name, flush=True); continue
         torch.manual_seed(a.seed)
         with torch.no_grad():
-            coords = pipe.sample_sparse_structure(cond, 1)
-            slat = pipe.sample_slat(cond2, coords)
-            outs = pipe.decode_slat(slat, ['mesh', 'gaussian'])
+            outs = generate(cond, cond2)
         os.makedirs(od, exist_ok=True)
         glb = postprocessing_utils.to_glb(outs['gaussian'][0], outs['mesh'][0], simplify=0.95, texture_size=1024, verbose=False)
         glb.export(f'{od}/{name}.glb')
