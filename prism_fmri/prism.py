@@ -66,6 +66,16 @@ class SemanticEncoder(nn.Module):
         return self.up(self.blocks(self.down(x))) + self.skip(x)
 
 
+class GradReverse(torch.autograd.Function):
+    """GRL (Ganin & Lempitsky 2015): 앞으로는 그대로, 뒤로는 기울기 × (−λ). 붙은 분류기는 맞히려 하고 앞단은 못 맞히게 학습됨."""
+    @staticmethod
+    def forward(ctx, x, lam):
+        ctx.lam = lam; return x.view_as(x)
+    @staticmethod
+    def backward(ctx, g):
+        return -ctx.lam * g, None
+
+
 class PoseHead(nn.Module):
     """구조도 Variational head (Scale · Ratio, 이전 Center · Rotate): MLP×3 → LayerNorm → Linear (+ 활성은 밖에서). 특징(LayerNorm 출력)도 돌려줌."""
     def __init__(self, d, k, h=256):
@@ -121,7 +131,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr'):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False):
         super().__init__()
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
@@ -149,19 +159,26 @@ class Prism(nn.Module):
             self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
         # Variational (피험자별 K벌)
-        assert var_heads in ('csr', 'sr'); self.var_heads = var_heads
-        self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(K)])
+        assert var_heads in ('csr', 'sr', 'sil', 'view'); self.var_heads = var_heads
+        if var_heads in ('sil', 'view'):                                    # 11-09: V = 변하는 정보 (물체 평균 · 프레임 평균을 뺀 실루엣 / 시점 특징), head 하나
+            assert vdim > 0, 'sil · view는 vdim 필요'
+            self.vhead = nn.ModuleList([PoseHead(2 * dv, vdim, head_dim) for _ in range(K)])
+        else:
+            self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(K)])
         if var_heads == 'csr':
             self.center = nn.ModuleList([PoseHead(2 * dv, 2, head_dim) for _ in range(K)])
             self.rotate = nn.ModuleList([PoseHead(2 * dv, 6, head_dim) for _ in range(K)])
-        else:
+        elif var_heads == 'sr':
             self.ratio = nn.ModuleList([PoseHead(2 * dv, 3, head_dim) for _ in range(K)])
         assert var_mode in ('feat', 'value'); self.var_mode = var_mode
-        nh, nv = (3, 12) if var_heads == 'csr' else (2, 4)
+        nh, nv = {'csr': (3, 12), 'sr': (2, 4)}.get(var_heads, (1, vdim))
         agg_in = nh * head_dim if var_mode == 'feat' else nv
         self.aggregate = nn.ModuleList([nn.Sequential(nn.Linear(agg_in, dc), nn.GELU(), nn.LayerNorm(dc)) if var_mode == 'feat' else
                                         nn.Sequential(nn.Linear(agg_in, head_dim), nn.GELU(), nn.Linear(head_dim, dc), nn.GELU(), nn.LayerNorm(dc)) for _ in range(K)])
         # Perceptive (공유)
+        self.grl_lam = 0.0                                                  # GRL 세기 (학습 스크립트가 스텝마다 정함)
+        if grl_v:                                                           # 11-09: V에서 범주 정보 빼기 — Variational Features로 범주를 맞히는 분류기를 GRL 뒤에 붙임 (공유)
+            self.v_adv = nn.Sequential(nn.Linear(dc, 256), nn.GELU(), nn.Linear(256, n_classes))
         self.subj_proj = nn.Sequential(nn.Linear(dp, 256), nn.BatchNorm1d(256), nn.GELU())
         self.subj_cls = nn.Linear(256, max(n_subjects, 1))
         self.film = nn.Linear(256, 2 * dc); nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)   # 처음엔 보정 없음
@@ -220,18 +237,24 @@ class Prism(nn.Module):
             out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
         # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Scale · Ratio (csr: Center · Scale · Rotate) → Aggregate → Variational Features [B, T, dc]
         vin = torch.cat([v[:, :, 0], v[:, :, 1:].mean(2)], -1)
-        sc, fs = _route(self.scale, subj, vin); out['scale'] = F.softplus(sc).squeeze(-1)
+        if self.var_heads in ('sil', 'view'):
+            q, fq = _route(self.vhead, subj, vin); out['vt'] = q                    # [B, T, vdim] 표준화된 변화량
+            feats = [fq]; vals = [q]
+        else:
+            sc, fs = _route(self.scale, subj, vin); out['scale'] = F.softplus(sc).squeeze(-1)
         if self.var_heads == 'csr':
             c, fc = _route(self.center, subj, vin); r, fr = _route(self.rotate, subj, vin)
             out['center'] = torch.tanh(c); out['rot6d'] = r
             feats = [fc, fs, fr]
             vals = [out['center'], out['scale'][..., None], rot6d_to_matrix(r).flatten(-2)]          # 실제 값 2+1+9
-        else:
+        elif self.var_heads == 'sr':
             q, fq = _route(self.ratio, subj, vin); out['ratio'] = torch.sigmoid(q)  # [B, T, 3] 크기 비율 (가장 긴 변 = 1)
             feats = [fs, fq]; vals = [out['scale'][..., None], out['ratio']]                         # 실제 값 1+3
         agg_in = torch.cat(feats if self.var_mode == 'feat' else vals, -1)          # feat: LayerNorm 특징 head 수×256
         var_feat = _route(self.aggregate, subj, agg_in)
         out['var_vec'] = var_feat.mean(1)
+        if hasattr(self, 'v_adv'):
+            out['v_adv_logit'] = self.v_adv(GradReverse.apply(out['var_vec'], float(self.grl_lam)))
         # Perceptive (공유): Token Pooling → Subject Projector
         pv = p.mean((1, 2))
         if perceptive_override is not None:
@@ -265,7 +288,8 @@ def build_from_ckpt(ck, repo):
     encs = [load_encoder(pth, cfg) for pth in ck['enc_paths']]
     model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']),
                   var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'),
-                  sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'))
+                  sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'),
+                  vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0)
     check_load(model, ck['model'])
     return model
 
@@ -288,7 +312,7 @@ def prism_losses(out, batch, proto_temp=0.07):
     logits = out['sem_clip'] @ batch['prototypes'].t() / proto_temp
     L['proto'] = F.cross_entropy(logits, batch['cls']); L['proto_acc'] = (logits.argmax(-1) == batch['cls']).float().mean()
     z = torch.zeros((), device=tgt.device)
-    L['scale'] = F.mse_loss(out['scale'], batch['scale'])
+    L['scale'] = F.mse_loss(out['scale'], batch['scale']) if 'scale' in out else z
     L['center'] = F.mse_loss(out['center'], batch['center']) if 'center' in out else z
     L['rot'] = F.mse_loss(rot6d_to_matrix(out['rot6d']), batch['rot']) if 'rot6d' in out else z
     if 'ratio' in out:                                                               # 물체 정답을 프레임마다 맞춤, 복셀 없는 물체는 뺌
@@ -296,6 +320,15 @@ def prism_losses(out, batch, proto_temp=0.07):
         L['ratio'] = ((out['ratio'] - batch['ratio'][:, None]) ** 2 * m).sum() / (m.sum() * out['ratio'][0].numel()).clamp_min(1)
     else:
         L['ratio'] = z
+    if 'vt' in out:                                                                  # 변하는 정보 (표준화), 정답 없는 물체는 뺌
+        m = batch['vt_ok'].float()[:, None, None]
+        L['vt'] = ((out['vt'] - batch['vt']) ** 2 * m).sum() / (m.sum() * out['vt'][0].numel()).clamp_min(1)
+    else:
+        L['vt'] = z
+    if 'v_adv_logit' in out:                                                         # GRL 뒤 분류기 (V로 범주 맞히기) — 정확도가 우연(1/13)에 가까울수록 V에 범주가 적음
+        L['v_adv'] = F.cross_entropy(out['v_adv_logit'], batch['cls']); L['v_adv_acc'] = (out['v_adv_logit'].argmax(-1) == batch['cls']).float().mean()
+    else:
+        L['v_adv'] = z; L['v_adv_acc'] = z
     if out['subj_logit'].shape[-1] > 1:
         L['subj'] = F.cross_entropy(out['subj_logit'], batch['subj']); L['subj_acc'] = (out['subj_logit'].argmax(-1) == batch['subj']).float().mean()
     else:

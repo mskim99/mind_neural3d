@@ -5,6 +5,8 @@
 #  fMRI 프레임 k ↔ 영상 프레임 round(19.2k) (MinD-3D 전처리가 BOLD 지연 6초를 이미 반영). 쓰는 fMRI 프레임 2~7
 #  피험자별 ViT(<enc_dir>/subNN_encoder.pt) · Semantic · Variational + 공유 Temporal Stem · SV Encoder · Perceptive · 디코더, 배치마다 피험자 같은 수, 저장에서 ViT 제외
 #  손실 = λ_tok·(MSE + (1−cos)) + λ_proto·CE(범주 텍스트 프로토타입) + λ_var·(scale + ratio | center + scale + rot) + λ_subj·CE(피험자). 저장: model_latest.pt · model_final.pt
+#  --var_heads sil|view (11-09): V = 변하는 정보. build_view_targets.py가 만든 --view_tgt npz(물체 평균 · 프레임별 train 평균을 빼고 train 표준편차로 나눈 값)를 프레임마다 맞춤
+#  --lam_vadv λ (11-09): V에서 범주 정보 빼기 — Variational Features → GRL → 범주 분류기. 분류기 손실은 1배, 앞단으로 가는 기울기는 −λ·s(p) (s = DANN 일정 2/(1+e^(−10p))−1)
 #  --fold k/n (11-09, 토큰 prior용 교차 학습): train 목록(annotations 순서)에서 i % n == k인 물체를 학습에서 뺌 → infer_prism.py --split train --fold k/n로 그 물체의 '안 본' 예측을 만듦
 #  이전 기준선(prism_nop_feat · value)을 다시 학습하려면 --arch res --sem_clip back --var_heads csr
 import os, sys, math, time, argparse, numpy as np, torch
@@ -31,7 +33,9 @@ p.add_argument('--print_every', type=int, default=20); p.add_argument('--val_eve
 p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', action='store_true')
 p.add_argument('--var_mode', default='feat', choices=['feat', 'value'])   # Variational → Aggregate 입력: LayerNorm 특징 / 실제 값 임베딩
 p.add_argument('--sem_clip', default='front', choices=['front', 'back'])   # front: CLIP Projection이 Semantic 경로 앞 (11-06 구조도) / back: 이전 곁가지
-p.add_argument('--var_heads', default='sr', choices=['sr', 'csr'])   # sr: Scale + 3D 크기 비율 (11-06) / csr: 이전 Center · Scale · Rotate
+p.add_argument('--var_heads', default='sr', choices=['sr', 'csr', 'sil', 'view'])   # sr: Scale + 3D 크기 비율 (11-06) / csr: 이전 Center · Scale · Rotate / sil · view: 변하는 정보 (11-09)
+p.add_argument('--view_tgt', default='')      # sil · view 정답 npz (build_view_targets.py)
+p.add_argument('--lam_vadv', type=float, default=0.0)   # > 0이면 V 범주 GRL
 p.add_argument('--arch', default='fig', choices=['fig', 'res'])   # fig: 11-06 구조도 Temporal Stem · SV Encoder / res: 이전 구현
 p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자별 ViT · S · V만 지원 (11-04 사용자 결정). 기록용으로 args에 남김 (build_from_ckpt가 확인)
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
@@ -39,6 +43,11 @@ p.add_argument('--fold', default='')       # 'k/n': train에서 i % n == k 물�
 p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
 a = p.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
+VT, a.vdim = {}, 0
+if a.var_heads in ('sil', 'view'):                                                   # uid → ([6, vdim], ok)
+    _z = np.load(a.view_tgt); _y = _z[a.var_heads].astype(np.float32); _ok = _z[a.var_heads + '_ok']
+    VT = {str(k).split('/')[-1]: (_y[i], bool(_ok[i])) for i, k in enumerate(_z['keys'])}; a.vdim = int(_y.shape[-1])
+    print(f'[view] {a.var_heads} 정답 {len(VT)}개 (정상 {int(_ok.sum())}), vdim {a.vdim}', flush=True)
 dev = 'cuda'
 SUBS = a.subs.split(',')
 
@@ -67,7 +76,8 @@ def load_item(si, k):
             'cond_tokens': torch.from_numpy(np.load(f'{a.tgt}/dino/{uid}.npy')),
             'center': torch.from_numpy(np.stack([t['cx'][vf], t['cy'][vf]], -1)), 'scale': torch.from_numpy(t['scale'][vf]),
             'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k,
-            **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False))}
+            **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False)),
+            **(lambda v: {'vt': torch.from_numpy(v[0]), 'vt_ok': v[1]})(VT.get(uid, (np.zeros((len(FRAMES), max(a.vdim, 1)), np.float32), False)))}
 
 
 class ShapeSet(Dataset):
@@ -101,7 +111,8 @@ cfg = OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))
 ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
 enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
-model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads).to(dev)
+model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
+              vdim=a.vdim, grl_v=a.lam_vadv > 0).to(dev)
 STATE = lambda: model.trainable_state_dict()
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
@@ -130,7 +141,7 @@ if a.resume and os.path.exists(latest):
     ck = torch.load(latest, map_location='cpu'); check_load(model, ck['model'])   # 구조 옵션이 다르면 멈춤
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
-KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'subj', 'subj_acc']
+KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'vt', 'v_adv', 'v_adv_acc', 'subj', 'subj_acc']
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
     log.write('step,split,total,' + ','.join(KEYS) + ',lr\n')
@@ -142,7 +153,8 @@ def to_dev(b):
 
 
 TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambda L: W['proto'] * L['proto'],
-         'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio']), 'subj': lambda L: W['subj'] * L['subj']}
+         'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio'] + L['vt']), 'subj': lambda L: W['subj'] * L['subj'],
+         'vadv': lambda L: L['v_adv']}
 
 
 def total_loss(L):
@@ -166,7 +178,7 @@ def validate():
         for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
     L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
     print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
-          f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
+          f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
 
@@ -175,6 +187,7 @@ while not done:
     ep += 1
     for b in tl:
         b = to_dev(b)
+        model.grl_lam = a.lam_vadv * (2 / (1 + math.exp(-10 * step / a.max_step)) - 1)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
         L = prism_losses(out, b); tot = total_loss(L)
@@ -183,6 +196,7 @@ while not done:
             write('train', L, float(tot))
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
+                  f'vt {float(L["vt"]):.4f} v_adv_acc {float(L["v_adv_acc"]):.3f} grl {model.grl_lam:.3f} '
                   f'subj_acc {float(L["subj_acc"]):.3f} lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
         if step % a.val_every == 0: validate()
         if step % a.save_every == 0 or step >= a.max_step:
