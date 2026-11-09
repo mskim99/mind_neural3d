@@ -11,6 +11,8 @@ SUBS=sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008
 source $(dirname $0)/common.sh || exit 1
 ENC=$W/weights/MinD-3D-pp/fMRI-Shape; PY=$W/venv/bin/python; P1=$W/prism_prior1; FIG=$W/prism_fig/model_final.pt
 step() { echo "=== $1 $(date +%H:%M:%S)"; }
+# 인자는 함수 위치 인자로 넘김: mg_guard.sh가 안에서 변수 v를 덮어써서 (11-09 dino_v 0개 원인) source 뒤에 $v를 쓰면 안 됨
+trel() { (cd $MG && source $MG/mg_guard.sh && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 cd $W/run; mkdir -p $P1; [ -f $FIG ] || { echo "fig 체크포인트 없음 $FIG"; exit 1; }
 
 step "0 디스크"
@@ -18,9 +20,10 @@ df -h $W | tail -1; AV=$(df -BG --output=avail $W | tail -1 | tr -dc 0-9)
 [ $AV -ge 30 ] || { echo "남은 용량 ${AV}G < 30G → 멈춤 (정리 후 다시)"; exit 1; }
 
 step "1 프레임 1~5 토큰 (뒤에서, 로그 logs/prism_dino_v.log)"
-( for v in 1 2 3 4 5; do
-    (cd $MG && source $MG/mg_guard.sh && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py dino --frames $TGT/frames --out $TGT/dino_v$v --view $v) | grep -E "DINO_DONE|Error|dino"
-    echo "dino_v$v $(ls $TGT/dino_v$v/*.npy 2>/dev/null | wc -l)개 $(date +%H:%M:%S)"
+( for vw in 1 2 3 4 5; do
+    n=$(ls $TGT/dino_v$vw/*.npy 2>/dev/null | wc -l)
+    [ $n -ge 1404 ] || trel dino --frames $TGT/frames --out $TGT/dino_v$vw --view $vw 2>&1 | grep -E "DINO_DONE|Error|error|dino"
+    echo "dino_v$vw $(ls $TGT/dino_v$vw/*.npy 2>/dev/null | wc -l)개 $(date +%H:%M:%S)"
   done ) > $W/logs/prism_dino_v.log 2>&1 &
 DV=$!
 
@@ -41,14 +44,17 @@ done
 
 step "3 안 본 train 예측 (fold k 모델 → i % 2 == k 물체, 7명)"
 for k in 0 1; do
+  [ $(ls $P1/oof$k/sub-*_keep/components.npz 2>/dev/null | wc -l) -ge 7 ] && { echo "이미 있음 oof$k"; continue; }
   $PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $P1/fold$k/model_final.pt --out $P1/oof$k --split train --fold $k/2 \
     --perceptive keep --tok_pool 1 --save_tokens 0 | grep -E "범주|DONE|Error"
 done
 
 step "4 fig test 예측 sub-0001 · sub-0002 (토큰 + 요약)"
+[ -f $P1/infer_fig/sub-0002_keep/components.npz ] && echo "이미 있음 infer_fig" || \
 $PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $FIG --out $P1/infer_fig --subs sub-0001,sub-0002 --perceptive keep --tok_pool 1 | grep -E "범주|DONE|Error"
 
 step "5 프레임 토큰 기다림"
 wait $DV; grep -E "^dino_v|Error" $W/logs/prism_dino_v.log
 N=$(ls $P1/oof*/sub-*_keep/components.npz 2>/dev/null | wc -l); echo "조건 파일 $N개 (예상 14 = 2겹 × 7명)"; df -h $W | tail -1; [ $N -eq 14 ] || { echo "조건 파일 수가 다름"; exit 1; }
+for vw in 1 2 3 4 5; do [ $(ls $TGT/dino_v$vw/*.npy 2>/dev/null | wc -l) -ge 1404 ] || { echo "dino_v$vw 부족 → logs/prism_dino_v.log"; exit 1; }; done
 step "PRIOR1_DATA_DONE"
