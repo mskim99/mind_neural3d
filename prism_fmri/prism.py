@@ -159,9 +159,9 @@ class Prism(nn.Module):
             self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
         # Variational (피험자별 K벌)
-        assert var_heads in ('csr', 'sr', 'sil', 'view'); self.var_heads = var_heads
-        if var_heads in ('sil', 'view'):                                    # 11-09: V = 변하는 정보 (물체 평균 · 프레임 평균을 뺀 실루엣 / 시점 특징), head 하나
-            assert vdim > 0, 'sil · view는 vdim 필요'
+        assert var_heads in ('csr', 'sr', 'sil', 'view', 'shape'); self.var_heads = var_heads
+        if var_heads in ('sil', 'view', 'shape'):           # shape (11-09): 범주 안 개체 형상 차이 (물체마다 고정, 프레임마다 같은 정답)                                    # 11-09: V = 변하는 정보 (물체 평균 · 프레임 평균을 뺀 실루엣 / 시점 특징), head 하나
+            assert vdim > 0, 'sil · view · shape는 vdim 필요'
             self.vhead = nn.ModuleList([PoseHead(2 * dv, vdim, head_dim) for _ in range(K)])
         else:
             self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(K)])
@@ -237,7 +237,7 @@ class Prism(nn.Module):
             out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
         # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Scale · Ratio (csr: Center · Scale · Rotate) → Aggregate → Variational Features [B, T, dc]
         vin = torch.cat([v[:, :, 0], v[:, :, 1:].mean(2)], -1)
-        if self.var_heads in ('sil', 'view'):
+        if self.var_heads in ('sil', 'view', 'shape'):
             q, fq = _route(self.vhead, subj, vin); out['vt'] = q                    # [B, T, vdim] 표준화된 변화량
             feats = [fq]; vals = [q]
         else:

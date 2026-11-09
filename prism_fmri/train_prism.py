@@ -33,7 +33,7 @@ p.add_argument('--print_every', type=int, default=20); p.add_argument('--val_eve
 p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', action='store_true')
 p.add_argument('--var_mode', default='feat', choices=['feat', 'value'])   # Variational → Aggregate 입력: LayerNorm 특징 / 실제 값 임베딩
 p.add_argument('--sem_clip', default='front', choices=['front', 'back'])   # front: CLIP Projection이 Semantic 경로 앞 (11-06 구조도) / back: 이전 곁가지
-p.add_argument('--var_heads', default='sr', choices=['sr', 'csr', 'sil', 'view'])   # sr: Scale + 3D 크기 비율 (11-06) / csr: 이전 Center · Scale · Rotate / sil · view: 변하는 정보 (11-09)
+p.add_argument('--var_heads', default='sr', choices=['sr', 'csr', 'sil', 'view', 'shape'])   # sr: Scale + 3D 크기 비율 (11-06) / csr: 이전 Center · Scale · Rotate / sil · view: 변하는 정보 (11-09)
 p.add_argument('--view_tgt', default='')      # sil · view 정답 npz (build_view_targets.py)
 p.add_argument('--lam_vadv', type=float, default=0.0)   # > 0이면 V 범주 GRL
 p.add_argument('--arch', default='fig', choices=['fig', 'res'])   # fig: 11-06 구조도 Temporal Stem · SV Encoder / res: 이전 구현
@@ -44,7 +44,7 @@ p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encod
 a = p.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
 VT, a.vdim = {}, 0
-if a.var_heads in ('sil', 'view'):                                                   # uid → ([6, vdim], ok)
+if a.var_heads in ('sil', 'view', 'shape'):                                          # uid → ([6, vdim], ok)
     _z = np.load(a.view_tgt); _y = _z[a.var_heads].astype(np.float32); _ok = _z[a.var_heads + '_ok']
     VT = {str(k).split('/')[-1]: (_y[i], bool(_ok[i])) for i, k in enumerate(_z['keys'])}; a.vdim = int(_y.shape[-1])
     print(f'[view] {a.var_heads} 정답 {len(VT)}개 (정상 {int(_ok.sum())}), vdim {a.vdim}', flush=True)

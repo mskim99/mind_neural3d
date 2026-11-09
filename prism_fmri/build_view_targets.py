@@ -24,6 +24,11 @@ R = {'keys': np.array(KEYS)}
 S = z['sil'].astype(np.float64); sok = ~np.isnan(S).any((1, 2)); S = np.nan_to_num(S)
 Sd, m = dcenter(S, sok); sd = Sd[m].reshape(-1, S.shape[-1]).std(0) + 1e-8
 R['sil'] = (Sd / sd).astype(np.float32); R['sil_ok'] = sok
+# shape (11-09): 범주 안 개체 형상 차이 — 물체 평균 실루엣 [cy, w, h, area](cx는 fMRI로 안 읽혀 뺌, V변화_전제확인.md) − train 범주 평균, train 표준편차로 나눔, 6프레임에 같은 값
+cat = np.array([k.split('/')[0] for k in KEYS]); So = S.mean(1)[:, 1:]; cm = {c: So[itr & sok & (cat == c)].mean(0) for c in set(cat[itr & sok])}
+Sr = So - np.stack([cm.get(c, So[itr & sok].mean(0)) for c in cat]); ssd = Sr[itr & sok].std(0) + 1e-8
+R['shape'] = np.repeat((Sr / ssd)[:, None], S.shape[1], 1).astype(np.float32); R['shape_ok'] = sok
+print(f'[shape] 범주 안 개체 차이 표준편차 ' + ' '.join(f'{n} {v:.4f}' for n, v in zip(['cy', 'w', 'h', 'area'], ssd)), flush=True)
 print(f'[sil] 물체 {len(KEYS)} (정상 {int(sok.sum())}, train {int(m.sum())}) | 변하는 부분 표준편차 ' + ' '.join(f'{n} {v:.4f}' for n, v in zip(['cx', 'cy', 'w', 'h', 'area'], sd)), flush=True)
 if a.dino:
     D = np.zeros((len(KEYS), len(FR), 50 * 1024), np.float32); vok = np.ones(len(KEYS), bool)
