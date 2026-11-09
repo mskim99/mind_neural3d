@@ -41,6 +41,16 @@ def _mea_cutlass(q, k, v, attn_bias=None, p=0.0, scale=None, *, op=None, **kw):
     return _mea(q, k, v, attn_bias, p, scale, op=op if op is not None else (fmha.cutlass.FwOp, fmha.cutlass.BwOp), **kw)
 xops.memory_efficient_attention = _mea_cutlass; fmha.memory_efficient_attention = _mea_cutlass
 sys.path.insert(0, a.trellis_repo)
+# torch.hub.load('facebookresearch/dinov2', …)는 캐시가 있어도 GitHub에 브랜치를 물어봄 → 가끔 HTTP 504로 GLB 0개 (11-09 sub-0008)
+#  → 캐시 폴더가 있으면 source='local'로 (같은 코드 · 같은 가중치 캐시, 네트워크 안 씀)
+_hub_load = torch.hub.load
+def _hub_load_local(repo, model, *args, **kw):
+    d = os.path.join(torch.hub.get_dir(), repo.replace('/', '_') + '_main')
+    if isinstance(repo, str) and not os.path.isdir(repo) and os.path.isdir(d) and kw.get('source', 'github') == 'github':
+        kw.pop('trust_repo', None); kw.pop('force_reload', None); kw.pop('skip_validation', None); kw['source'] = 'local'
+        return _hub_load(d, model, *args, **kw)
+    return _hub_load(repo, model, *args, **kw)
+torch.hub.load = _hub_load_local
 from PIL import Image
 from trellis.pipelines import TrellisImageTo3DPipeline
 

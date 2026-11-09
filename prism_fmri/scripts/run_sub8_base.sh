@@ -22,6 +22,7 @@ for n in fig_s8 slat_gt_s8; do
   g=$O/glb/$n; extra=""; [ $n = slat_gt_s8 ] && extra="--slat_pred $TGT/dino"
   [ $(ls $g/*/*.glb 2>/dev/null | wc -l) -ge 104 ] || trel gen --pred $I/tokens $extra --out $g | grep -E "GEN_DONE|Error|없음"
   echo "GLB $n $(ls $g/*/*.glb 2>/dev/null | wc -l)개 $(date +%H:%M:%S)"
+  [ $(ls $g/*/*.glb 2>/dev/null | wc -l) -ge 104 ] || { echo "GLB $n 104개 미만 → 멈춤 (로그 위쪽 Error 확인)"; exit 1; }
   [ -n "$EV" ] && wait $EV
   (cd $SPP_ROOT && bash run_spp.sh $n $g glb $CUDA_VISIBLE_DEVICES > $W/logs/spp_$n.log 2>&1; echo "EVAL $n 끝 | $(tail -2 $W/logs/spp_$n.log | head -1)") &
   EV=$!
