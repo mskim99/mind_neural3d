@@ -7,6 +7,7 @@
 # 사용: blender -b -P render_b.py -- --mode calib --root <shapenet_b> --list <uid 목록> --out <폴더> --fovs 20,24,... --yaws 0,90,180,270
 #       blender -b -P render_b.py -- --mode render --root <shapenet_b> --list <uid 목록> --out <폴더> --fov F --yaw Y [--shard k/n]
 import bpy, sys, os, math, argparse, time
+import numpy as np
 from mathutils import Vector
 argv = sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else []
 ap = argparse.ArgumentParser()
@@ -48,7 +49,7 @@ else:
     R.engine = 'CYCLES'; sc.cycles.device = 'GPU'; sc.cycles.samples = a.samples; sc.cycles.use_denoising = True
     pr = bpy.context.preferences.addons['cycles'].preferences; pr.compute_device_type = 'OPTIX'; pr.get_devices()
     for d in pr.devices: d.use = d.type != 'CPU'
-    R.film_transparent = False; R.image_settings.color_mode = 'RGB'
+    R.film_transparent = True; R.image_settings.color_mode = 'RGBA'   # 배경은 투명으로 렌더 → 흰색 위에 합성 (월드 세기와 배경 색을 떼려고)
     sc.view_settings.view_transform = 'Standard'
     w = sc.world or bpy.data.worlds.new('w'); sc.world = w; w.use_nodes = True
     bg = w.node_tree.nodes['Background']; bg.inputs[0].default_value = (1, 1, 1, 1); bg.inputs[1].default_value = a.light
@@ -82,6 +83,7 @@ def load(uid):
     root2 = bpy.data.objects.new('yaw', None); sc.collection.objects.link(root2); root.parent = root2
     return root2
 
+TMP = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'render_b_{k}of{n}_rgba.png')
 t0 = time.time()
 for i, uid in enumerate(ids):
     od = os.path.join(a.out, uid.replace('/', '_'))
@@ -97,6 +99,11 @@ for i, uid in enumerate(ids):
                 bpy.ops.render.render(write_still=True)
     else:
         yawobj.rotation_euler = (0, 0, math.radians(a.yaw)); cam.data.angle = math.radians(a.fov)
-        R.filepath = os.path.join(od, '0.png'); bpy.ops.render.render(write_still=True)
+        R.filepath = TMP; bpy.ops.render.render(write_still=True)       # 임시 RGBA는 shard마다 한 파일을 덮어씀 (지우지 않음)
+        im = bpy.data.images.load(R.filepath); px = np.array(im.pixels[:], np.float32).reshape(im.size[1], im.size[0], 4)
+        rgb = px[..., :3] * px[..., 3:] + (1 - px[..., 3:])         # 흰 배경 위 합성 (sRGB 저장값 기준)
+        out = bpy.data.images.new('w', im.size[0], im.size[1], alpha=False)
+        out.pixels[:] = np.concatenate([rgb, np.ones_like(px[..., 3:])], -1).ravel(); out.filepath_raw = os.path.join(od, '0.png'); out.file_format = 'PNG'; out.save()
+        bpy.data.images.remove(im); bpy.data.images.remove(out)
     if (i + 1) % 20 == 0 or i == 0: print(f'[{a.mode} {i + 1}/{len(ids)}] {uid} {time.time() - t0:.0f}s', flush=True)
 print('RENDER_B_DONE', flush=True)

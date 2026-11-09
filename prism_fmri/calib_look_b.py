@@ -13,6 +13,9 @@ for d in a.dirs.split(','):
     for u in sorted(os.listdir(d)):
         g = [f for f in fr if u.split('_')[1].startswith(f)]
         if not g or not os.path.exists(f'{d}/{u}/0.png'): continue
+        xs = np.asarray(Image.open(f'{a.frames}/{g[0]}/0.png').convert('RGB').resize((256, 256))).astype(np.int16); fg = xs.min(2) < 235
+        mag = fg & (xs[..., 0] > 120) & (xs[..., 2] > 120) & (xs[..., 1] < 0.5 * np.minimum(xs[..., 0], xs[..., 2])) & (np.abs(xs[..., 0] - xs[..., 2]) < 70)
+        if mag.sum() > 0.05 * max(fg.sum(), 1): continue          # 자극에 자홍(텍스처 없음 추정)이 있는 물체는 색 비교에서 뺌
         sr, sb, sc = stat(f'{a.frames}/{g[0]}/0.png'); rr, rb, rc = stat(f'{d}/{u}/0.png')
         rows.append((rb, sb, rc, sc, np.abs(rr - sr).mean()))
     r = np.array(rows)
