@@ -25,7 +25,7 @@ if a.fold: fk, fn = map(int, a.fold.split('/')); ids = [k for i, k in enumerate(
 if a.names: _w = {l.split()[-1] for l in open(a.names) if l.strip()}; ids = [k for k in ids if k.split('/')[1] in _w]
 for sub in (a.subs.split(',') if a.subs else SUBS):
     od = f'{a.out}/{sub}_{a.perceptive}'; os.makedirs(f'{od}/tokens', exist_ok=True); si = SUBS.index(sub)
-    comp = {k: [] for k in ('name', 'sem', 'var', 'perc', 'cls_pred', 'cls_score', 'cls', 'subj_pred', 'tok_pool')}
+    comp = {k: [] for k in ('name', 'sem', 'var', 'perc', 'cls_pred', 'cls_score', 'cls', 'subj_pred', 'tok_pool', 'img')}
     for i in range(0, len(ids), a.bs):
         ks = ids[i:i + a.bs]
         x = torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, sub, 'npy_data', k + '.npy')).astype(np.float32)[FRAMES] for k in ks])).cuda()
@@ -39,8 +39,9 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
         comp['sem'].append(out['sem_vec'].float().cpu()); comp['var'].append(out['var_vec'].float().cpu()); comp['perc'].append(out['perc_vec'].float().cpu())
         sc = (out['sem_clip'].float() @ model.prototypes.t()).cpu(); comp['cls_score'].append(sc)   # CLIP 텍스트 프로토타입과 cos
         comp['cls_pred'].append(sc.argmax(-1)); comp['subj_pred'].append(out['subj_logit'].argmax(-1).cpu())
+        if 'sem_img' in out: comp['img'].append(out['sem_img'].float().cpu())             # 11-10 A안: 예측 이미지 임베딩 (정규화 전)
     np.savez(f'{od}/components.npz', name=np.array(comp['name']), cls=np.array(comp['cls']), classes=np.array(SYN),
-             **{k: torch.cat(comp[k]).numpy() for k in ('sem', 'var', 'perc', 'cls_pred', 'cls_score', 'subj_pred', 'tok_pool') if comp[k]})
+             **{k: torch.cat(comp[k]).numpy() for k in ('sem', 'var', 'perc', 'cls_pred', 'cls_score', 'subj_pred', 'tok_pool', 'img') if comp[k]})
     acc = float((torch.cat(comp['cls_pred']).numpy() == np.array(comp['cls'])).mean())
     print(f'{sub} {a.perceptive}: {len(ids)} 물체 → {od}, {a.split} 범주 정확도 {acc:.3f}', flush=True)
 print('INFER_DONE', flush=True)

@@ -131,7 +131,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False):
         super().__init__()
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
@@ -158,6 +158,9 @@ class Prism(nn.Module):
             self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(K)])
             self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
+        if img_head:                                                        # 11-10 A안: Semantic 안 이미지 임베딩 head (CLIP Projection 출력 평균 → OpenCLIP ViT-H 이미지 임베딩 1024, unCLIP 입력)
+            assert sem_clip == 'front', 'img_head는 sem_clip front에서만'
+            self.sem_img = nn.ModuleList([nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])
         # Variational (피험자별 K벌)
         assert var_heads in ('csr', 'sr', 'sil', 'view', 'shape'); self.var_heads = var_heads
         if var_heads in ('sil', 'view', 'shape'):           # shape (11-09): 범주 안 개체 형상 차이 (물체마다 고정, 프레임마다 같은 정답)                                    # 11-09: V = 변하는 정보 (물체 평균 · 프레임 평균을 뺀 실루엣 / 시점 특징), head 하나
@@ -231,6 +234,7 @@ class Prism(nn.Module):
         if self.sem_clip == 'front':
             st = _route(self.sem_clip_proj, subj, st)                                # CLIP 공간 [B, 256, 1024]
             out['sem_clip'] = F.normalize(st.mean(1), dim=-1)
+            if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, st.mean(1))   # [B, 1024] (정규화 전)
         sem_feat = _route(self.sem_enc, subj, st.transpose(1, 2).reshape(B, -1, 16, 16)).flatten(2).transpose(1, 2)
         out['sem_vec'] = sem_feat.mean(1)
         if self.sem_clip == 'back':
@@ -289,7 +293,8 @@ def build_from_ckpt(ck, repo):
     model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']),
                   var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'),
                   sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'),
-                  vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0)
+                  vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
+                  img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0)
     check_load(model, ck['model'])
     return model
 
@@ -329,6 +334,13 @@ def prism_losses(out, batch, proto_temp=0.07):
         L['v_adv'] = F.cross_entropy(out['v_adv_logit'], batch['cls']); L['v_adv_acc'] = (out['v_adv_logit'].argmax(-1) == batch['cls']).float().mean()
     else:
         L['v_adv'] = z; L['v_adv_acc'] = z
+    if 'sem_img' in out and 'img_emb' in batch:                                     # 11-10 A안: 이미지 임베딩 (1 − cos) + 배치 InfoNCE (양방향, 온도 0.07)
+        e = F.normalize(out['sem_img'], dim=-1); t = F.normalize(batch['img_emb'].float(), dim=-1)
+        L['img_cos'] = (1 - (e * t).sum(-1)).mean()
+        lg = e @ t.t() / 0.07; y = torch.arange(len(e), device=e.device)
+        L['img_nce'] = (F.cross_entropy(lg, y) + F.cross_entropy(lg.t(), y)) / 2; L['img_r1'] = (lg.argmax(-1) == y).float().mean()
+    else:
+        L['img_cos'] = z; L['img_nce'] = z; L['img_r1'] = z
     if out['subj_logit'].shape[-1] > 1:
         L['subj'] = F.cross_entropy(out['subj_logit'], batch['subj']); L['subj_acc'] = (out['subj_logit'].argmax(-1) == batch['subj']).float().mean()
     else:

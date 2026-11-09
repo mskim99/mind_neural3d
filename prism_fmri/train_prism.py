@@ -36,6 +36,9 @@ p.add_argument('--sem_clip', default='front', choices=['front', 'back'])   # fro
 p.add_argument('--var_heads', default='sr', choices=['sr', 'csr', 'sil', 'view', 'shape'])   # sr: Scale + 3D 크기 비율 (11-06) / csr: 이전 Center · Scale · Rotate / sil · view: 변하는 정보 (11-09)
 p.add_argument('--view_tgt', default='')      # sil · view 정답 npz (build_view_targets.py)
 p.add_argument('--lam_vadv', type=float, default=0.0)   # > 0이면 V 범주 GRL
+p.add_argument('--lam_img', type=float, default=0.0)       # 11-10 A안: > 0이면 Semantic 이미지 임베딩 head + (1 − cos) 손실 가중치
+p.add_argument('--lam_img_nce', type=float, default=0.0)   # 같은 head의 배치 InfoNCE 가중치
+p.add_argument('--img_tgt', default='')                    # 정답 임베딩 폴더 <uid>.npy (비우면 <tgt>/clipimg), 자극 프레임 0의 unCLIP 이미지 인코더 임베딩
 p.add_argument('--arch', default='fig', choices=['fig', 'res'])   # fig: 11-06 구조도 Temporal Stem · SV Encoder / res: 이전 구현
 p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자별 ViT · S · V만 지원 (11-04 사용자 결정). 기록용으로 args에 남김 (build_from_ckpt가 확인)
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
@@ -48,6 +51,7 @@ if a.var_heads in ('sil', 'view', 'shape'):                                     
     _z = np.load(a.view_tgt); _y = _z[a.var_heads].astype(np.float32); _ok = _z[a.var_heads + '_ok']
     VT = {str(k).split('/')[-1]: (_y[i], bool(_ok[i])) for i, k in enumerate(_z['keys'])}; a.vdim = int(_y.shape[-1])
     print(f'[view] {a.var_heads} 정답 {len(VT)}개 (정상 {int(_ok.sum())}), vdim {a.vdim}', flush=True)
+IMG = a.lam_img > 0 or a.lam_img_nce > 0; IMG_TGT = a.img_tgt or f'{a.tgt}/clipimg'
 dev = 'cuda'
 SUBS = a.subs.split(',')
 
@@ -77,7 +81,8 @@ def load_item(si, k):
             'center': torch.from_numpy(np.stack([t['cx'][vf], t['cy'][vf]], -1)), 'scale': torch.from_numpy(t['scale'][vf]),
             'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k,
             **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False)),
-            **(lambda v: {'vt': torch.from_numpy(v[0]), 'vt_ok': v[1]})(VT.get(uid, (np.zeros((len(FRAMES), max(a.vdim, 1)), np.float32), False)))}
+            **(lambda v: {'vt': torch.from_numpy(v[0]), 'vt_ok': v[1]})(VT.get(uid, (np.zeros((len(FRAMES), max(a.vdim, 1)), np.float32), False))),
+            **({'img_emb': torch.from_numpy(np.load(f'{IMG_TGT}/{uid}.npy').astype(np.float32))} if IMG else {})}
 
 
 class ShapeSet(Dataset):
@@ -112,7 +117,7 @@ ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
 enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG).to(dev)
 STATE = lambda: model.trainable_state_dict()
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
@@ -142,6 +147,7 @@ if a.resume and os.path.exists(latest):
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
 KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'vt', 'v_adv', 'v_adv_acc', 'subj', 'subj_acc']
+if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
     log.write('step,split,total,' + ','.join(KEYS) + ',lr\n')
@@ -154,7 +160,7 @@ def to_dev(b):
 
 TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambda L: W['proto'] * L['proto'],
          'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio'] + L['vt']), 'subj': lambda L: W['subj'] * L['subj'],
-         'vadv': lambda L: L['v_adv']}
+         'vadv': lambda L: L['v_adv'], 'img': lambda L: a.lam_img * L['img_cos'] + a.lam_img_nce * L['img_nce']}
 
 
 def total_loss(L):
@@ -178,7 +184,8 @@ def validate():
         for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
     L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
     print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
-          f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} | 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
+          f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} '
+          + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
 
