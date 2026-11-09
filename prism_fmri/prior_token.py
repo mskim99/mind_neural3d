@@ -29,6 +29,7 @@ p.add_argument('--cfg', type=float, default=2.0); p.add_argument('--n_steps', ty
 p.add_argument('--data_root', default='')   # sample: copy_check용 train 목록 (비우면 copy_check 안 함)
 p.add_argument('--uncond_dir', default='')   # 11-10 B안: 조건 없는 prior (이 폴더의 토큰만)
 p.add_argument('--uncond_n', type=int, default=0)   # sample: 조건 없이 N개
+p.add_argument('--temp', type=float, default=1.0)   # sample(조건 없음): 시작 노이즈 배율 (< 1 = 낮은 온도)
 p.add_argument('--ln', type=int, default=1)    # sample: 생성 토큰에 토큰별 affine 없는 layer_norm (TRELLIS get_cond 출력과 같은 정규화)
 a = p.parse_args()
 dev = 'cuda' if torch.cuda.is_available() else 'cpu'   # cpu는 로컬 점검용
@@ -170,7 +171,7 @@ else:
     if a.uncond_n:                                     # 11-10 B안: 조건 없이 N개 + 복사 검사 (학습 렌더 토큰 vs 검증 렌더 토큰 기준)
         os.makedirs(a.out, exist_ok=True); g = torch.Generator(device=dev).manual_seed(a.seed); gen = []; sd_tok = []
         for b in range(0, a.uncond_n, 16):
-            B = min(16, a.uncond_n - b); x = torch.randn(B, 1374, 1024, device=dev, generator=g)
+            B = min(16, a.uncond_n - b); x = a.temp * torch.randn(B, 1374, 1024, device=dev, generator=g)
             ct = torch.zeros(B, 54, 1024, device=dev); cs = torch.zeros(B, NC, device=dev); dr = torch.ones(B, dtype=torch.bool, device=dev)
             ts = torch.linspace(1, 0, a.n_steps + 1, device=dev)
             with torch.no_grad(), torch.autocast(dev, dtype=torch.bfloat16):
