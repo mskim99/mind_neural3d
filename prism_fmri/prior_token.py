@@ -5,6 +5,8 @@
 #  정답: 그 물체 자극 영상 프레임 6장 중 하나의 실제 토큰 (<tgt>/dino = 프레임 0, <tgt>/dino_v1~5)
 #  모델: 정답 토큰 → token_util.merge (앞 5 + 패치 2×2 묶음 361) → DiT (조건 55토큰을 앞에 붙임, 시간은 adaLN-Zero) → 속도 v. 채널별 표준화 (train 정답 통계)
 #  flow: x_t = (1 − t)·x0 + t·ε, v = ε − x0, t ~ logit-normal. 조건은 확률 p_drop으로 비움 (CFG). 조건 노이즈 증강 --cond_noise
+#  조건 없음 (11-10 B안): train --uncond_dir <토큰 폴더 *.npy> (ShapeNet 렌더 토큰, 조건 항상 비움) / sample --uncond_n N --ckpt … --out …
+#          복사 검사 기준 = 학습에서 뺀 검증 렌더 토큰이 학습 토큰과 갖는 최대 cos
 #  train : python prior_token.py train --tgt <shape_targets> --oof <comp.npz,...> --out <폴더> [--steps 60000 --bs 32]
 #  sample: python prior_token.py sample --ckpt <폴더>/prior_final.pt --comp <components.npz> --out <tokens 폴더> [--cfg 2 --steps 50 --names <uid 목록>]
 #          → <out>/<uid>.npy (fp16, 토큰별 layer_norm 다시 적용 --ln 1 = 실제 조건 토큰과 같은 정규화) + <out>/copy_check.json:
@@ -25,6 +27,8 @@ p.add_argument('--resume', action='store_true')
 p.add_argument('--ckpt', default=''); p.add_argument('--comp', default=''); p.add_argument('--names', default='')
 p.add_argument('--cfg', type=float, default=2.0); p.add_argument('--n_steps', type=int, default=50); p.add_argument('--seed', type=int, default=0)
 p.add_argument('--data_root', default='')   # sample: copy_check용 train 목록 (비우면 copy_check 안 함)
+p.add_argument('--uncond_dir', default='')   # 11-10 B안: 조건 없는 prior (이 폴더의 토큰만)
+p.add_argument('--uncond_n', type=int, default=0)   # sample: 조건 없이 N개
 p.add_argument('--ln', type=int, default=1)    # sample: 생성 토큰에 토큰별 affine 없는 layer_norm (TRELLIS get_cond 출력과 같은 정규화)
 a = p.parse_args()
 dev = 'cuda' if torch.cuda.is_available() else 'cpu'   # cpu는 로컬 점검용
@@ -83,12 +87,17 @@ def ld(f): return torch.from_numpy(np.load(f).astype(np.float32))
 
 if a.mode == 'train':
     os.makedirs(a.out, exist_ok=True)
-    views = [int(v) for v in a.views.split(',')]
-    vdir = lambda v: f'{a.tgt}/dino' if v == 0 else f'{a.tgt}/dino_v{v}'
-    C_TOK, C_SC, NAMES = [], [], []
-    for f in a.oof.split(','):                         # 피험자 · fold별 components.npz (안 본 train 물체)
-        z = np.load(f); C_TOK.append(z['tok_pool']); C_SC.append(z['cls_score']); NAMES += [k.split('/')[1] for k in z['name']]
-    C_TOK = np.concatenate(C_TOK); C_SC = np.concatenate(C_SC).astype(np.float32)
+    if a.uncond_dir:                                   # 조건 없음: 토큰 폴더 전부, 조건은 0 (어차피 항상 null로 바뀜)
+        views = [0]; vdir = lambda v: a.uncond_dir; a.p_drop = 1.0
+        NAMES = sorted(f[:-4] for f in os.listdir(a.uncond_dir) if f.endswith('.npy'))
+        C_TOK = np.zeros((1, 54, 1024), np.float16); C_SC = np.zeros((1, NC), np.float32)
+    else:
+        views = [int(v) for v in a.views.split(',')]
+        vdir = lambda v: f'{a.tgt}/dino' if v == 0 else f'{a.tgt}/dino_v{v}'
+        C_TOK, C_SC, NAMES = [], [], []
+        for f in a.oof.split(','):                     # 피험자 · fold별 components.npz (안 본 train 물체)
+            z = np.load(f); C_TOK.append(z['tok_pool']); C_SC.append(z['cls_score']); NAMES += [k.split('/')[1] for k in z['name']]
+        C_TOK = np.concatenate(C_TOK); C_SC = np.concatenate(C_SC).astype(np.float32)
     ok = [i for i, u in enumerate(NAMES) if all(os.path.exists(f'{vdir(v)}/{u}.npy') for v in views)]
     objs = sorted({NAMES[i] for i in ok}); rng = np.random.RandomState(0)
     val_objs = set(rng.choice(objs, max(1, int(len(objs) * a.val_frac)), replace=False))
@@ -106,7 +115,8 @@ if a.mode == 'train':
         def __len__(s): return len(s.idx)
         def __getitem__(s, j):
             i = s.idx[j]; v = views[np.random.randint(len(views))]
-            return ld(f'{vdir(v)}/{NAMES[i]}.npy'), torch.from_numpy(C_TOK[i].astype(np.float32)), torch.from_numpy(C_SC[i])
+            ci = 0 if a.uncond_dir else i
+            return ld(f'{vdir(v)}/{NAMES[i]}.npy'), torch.from_numpy(C_TOK[ci].astype(np.float32)), torch.from_numpy(C_SC[ci])
 
     tl = torch.utils.data.DataLoader(DS(tr), batch_size=a.bs, shuffle=True, drop_last=True, num_workers=a.workers, persistent_workers=a.workers > 0)
     vl = torch.utils.data.DataLoader(DS(va), batch_size=a.bs, shuffle=False, num_workers=min(2, a.workers))
@@ -127,7 +137,7 @@ if a.mode == 'train':
             ct = ct + a.cond_noise * torch.randn_like(ct); cs = cs + a.cond_noise * cs.std() * torch.randn_like(cs)
         t = torch.sigmoid(torch.randn(B, device=dev))  # logit-normal
         e = torch.randn_like(x0); xt = (1 - t[:, None, None]) * x0 + t[:, None, None] * e
-        drop = (torch.rand(B, device=dev) < a.p_drop) if train else torch.zeros(B, dtype=torch.bool, device=dev)
+        drop = (torch.rand(B, device=dev) < a.p_drop) if train else torch.full((B,), bool(a.uncond_dir), dtype=torch.bool, device=dev)
         with torch.autocast(dev, dtype=torch.bfloat16):
             v = net(xt, t, ct, cs, drop)
         return F.mse_loss(v.float(), e - x0)
@@ -157,6 +167,33 @@ else:
     ck = torch.load(a.ckpt, map_location='cpu'); ar = ck['args']
     net = PriorNet(ar['dim'], ar['depth'], ar['heads']).to(dev).eval(); net.load_state_dict(ck['net'])
     MU, SD = ck['mu'].to(dev), ck['sd'].to(dev)
+    if a.uncond_n:                                     # 11-10 B안: 조건 없이 N개 + 복사 검사 (학습 렌더 토큰 vs 검증 렌더 토큰 기준)
+        os.makedirs(a.out, exist_ok=True); g = torch.Generator(device=dev).manual_seed(a.seed); gen = []; sd_tok = []
+        for b in range(0, a.uncond_n, 16):
+            B = min(16, a.uncond_n - b); x = torch.randn(B, 1374, 1024, device=dev, generator=g)
+            ct = torch.zeros(B, 54, 1024, device=dev); cs = torch.zeros(B, NC, device=dev); dr = torch.ones(B, dtype=torch.bool, device=dev)
+            ts = torch.linspace(1, 0, a.n_steps + 1, device=dev)
+            with torch.no_grad(), torch.autocast(dev, dtype=torch.bfloat16):
+                for t, tp in zip(ts[:-1], ts[1:]): x = x - (t - tp) * net(x, t.expand(B), ct, cs, dr).float()
+            x = x.float() * SD + MU; sd_tok.append(float(x.std(-1).mean()))
+            if a.ln: x = F.layer_norm(x, (x.shape[-1],))
+            for j in range(B):
+                np.save(f'{a.out}/gen_{b + j:04d}.npy', x[j].half().cpu().numpy()); gen.append(x[j].cpu())
+        print(f'생성 {len(gen)}개 (조건 없음, {a.n_steps} steps, LN 전 표준편차 {np.mean(sd_tok):.3f})', flush=True)
+        def rep(t):
+            t = t.float(); t = (t - t.mean(-1, keepdim=True)) / torch.sqrt(t.var(-1, keepdim=True, unbiased=False) + 1e-5); return t.mean(0)
+        cdir = os.path.dirname(os.path.abspath(a.ckpt)); ud = ar['uncond_dir']; bank_f = f'{cdir}/copy_bank.pt'
+        if os.path.exists(bank_f): BK = torch.load(bank_f)
+        else:
+            objs = [l.strip() for l in open(f'{cdir}/train_objs.txt') if l.strip()]
+            BK = {'rep': torch.stack([rep(ld(f'{ud}/{u}.npy')) for u in objs]), 'rows': objs}; torch.save(BK, bank_f)
+        TM = BK['rep'].mean(0); nz = lambda v: F.normalize(v - TM, dim=-1); TRn = nz(BK['rep'])
+        gc = [float((TRn @ nz(rep(x))).max()) for x in gen]
+        vo = [l.strip() for l in open(f'{cdir}/val_objs.txt') if l.strip()][:200]
+        rc = [float((TRn @ nz(rep(ld(f'{ud}/{u}.npy')))).max()) for u in vo]
+        json.dump({'mean_gen': float(np.mean(gc)), 'mean_real_val': float(np.mean(rc)), 'gen': gc, 'real_val': rc, 'bank': len(BK['rows'])}, open(f'{a.out}/copy_check.json', 'w'), indent=1)
+        print(f'COPY 가장 가까운 학습 토큰 cos ({len(BK["rows"])}개 중): 생성 {np.mean(gc):.3f} (최소 {np.min(gc):.3f} 최대 {np.max(gc):.3f}) | 검증 실제 렌더 토큰 {np.mean(rc):.3f} | 복사면 1.000', flush=True)
+        print('PRIOR_SAMPLE_DONE', flush=True); sys.exit()
     z = np.load(a.comp); names = [k.split('/')[1] for k in z['name']]
     want = [l.split()[-1] for l in open(a.names) if l.strip()] if a.names else names
     idx = [names.index(u) for u in want if u in names]
