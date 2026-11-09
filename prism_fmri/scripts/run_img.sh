@@ -7,7 +7,7 @@
 SUBS=sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008
 GPU=${GPU:-0} source $(dirname $0)/common.sh || exit 1
 PY=$W/venv/bin/python; UPY=$W/venv_unclip/bin/python; ENC=$W/weights/MinD-3D-pp/fMRI-Shape
-M=$W/prism_img; I=$M/infer; CK=$M/model_final.pt; Q=$PR/scripts/qual14_uids.txt; STEPS=${STEPS:-40000}
+M=${M:-$W/prism_img}; I=$M/infer; CK=$M/model_final.pt; Q=$PR/scripts/qual14_uids.txt; STEPS=${STEPS:-40000}
 step() { echo "=== $1 $(date +%H:%M:%S)"; }
 trel() { (cd $MG && source $MG/mg_guard.sh >/dev/null && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 cd $W/run; mkdir -p $M; export HF_HUB_OFFLINE=1
@@ -18,10 +18,10 @@ $UPY $PR/unclip_tools.py embed --frames $TGT/frames --out $TGT/clipimg | grep -E
 step "2 학습 ($STEPS 스텝)"
 if [ ! -f $CK ]; then
   $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --bs 14 --max_step $STEPS --per_subject 1 --enc_dir $ENC \
-    --arch fig --sem_clip front --var_heads sr --var_mode feat --lam_img 1 --lam_img_nce 1 --out_dir $M > $W/logs/prism_img_train.log 2>&1
+    --arch fig --sem_clip front --var_heads sr --var_mode feat --lam_img 1 --lam_img_nce 1 --out_dir $M > $M/train.log 2>&1
 fi
-[ -f $CK ] || { echo "학습 실패"; tail -20 $W/logs/prism_img_train.log; exit 1; }
-grep -E "^\[val\]" $W/logs/prism_img_train.log | tail -2
+[ -f $CK ] || { echo "학습 실패"; tail -20 $M/train.log; exit 1; }
+grep -E "^\[val\]" $M/train.log | tail -2
 
 step "3 sub-0001 추론 · 임베딩 평가"
 $PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $CK --out $I --subs sub-0001 --perceptive keep | grep -E "범주|DONE"
