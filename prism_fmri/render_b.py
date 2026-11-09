@@ -20,10 +20,13 @@ ap.add_argument('--res', type=int, default=1024); ap.add_argument('--samples', t
 ap.add_argument('--light', type=float, default=3.0)   # 월드(환경) 조명 세기 — 흰 하늘빛 + 해 1개
 ap.add_argument('--sun', type=float, default=2.0)
 ap.add_argument('--shard', default='0/1')
+ap.add_argument('--device', default='CUDA')   # 11-10: OPTIX는 5090(sm_120) Blender 4.2.3에서 장치가 안 잡혀 CPU로 넘어감 → CUDA
+ap.add_argument('--reverse', type=int, default=0)   # 1이면 목록 뒤에서부터 (돌고 있는 렌더와 반대쪽에서 만나게)
 ap.add_argument('--opaque', type=int, default=1)   # ShapeNet mtl의 d(투명도)·텍스처 알파 무시 → 면 빠짐 방지 (자극 영상은 불투명으로 보임)
 a = ap.parse_args(argv)
 ids = [l.strip() for l in open(a.list) if l.strip()]
 k, n = map(int, a.shard.split('/')); ids = ids[k::n]
+if a.reverse: ids = ids[::-1]
 sc = bpy.context.scene; R = sc.render
 
 def clear():
@@ -47,8 +50,10 @@ if a.mode == 'calib':
     R.engine = 'BLENDER_WORKBENCH'; R.film_transparent = True; R.image_settings.color_mode = 'RGBA'
 else:
     R.engine = 'CYCLES'; sc.cycles.device = 'GPU'; sc.cycles.samples = a.samples; sc.cycles.use_denoising = True
-    pr = bpy.context.preferences.addons['cycles'].preferences; pr.compute_device_type = 'OPTIX'; pr.get_devices()
-    for d in pr.devices: d.use = d.type != 'CPU'
+    pr = bpy.context.preferences.addons['cycles'].preferences; pr.compute_device_type = a.device; pr.get_devices()
+    for d in pr.devices: d.use = d.type == a.device
+    used = [(d.name, d.type) for d in pr.devices if d.use]; print('DEVICES', used, flush=True)
+    assert used, f'{a.device} 장치 없음 → CPU로 넘어가지 않게 멈춤'
     R.film_transparent = True; R.image_settings.color_mode = 'RGBA'   # 배경은 투명으로 렌더 → 흰색 위에 합성 (월드 세기와 배경 색을 떼려고)
     sc.view_settings.view_transform = 'Standard'
     w = sc.world or bpy.data.worlds.new('w'); sc.world = w; w.use_nodes = True
