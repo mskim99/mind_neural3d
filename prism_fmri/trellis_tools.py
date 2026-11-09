@@ -29,6 +29,7 @@ p.add_argument('--names', default='')   # gscheck: 이 목록의 이름만
 p.add_argument('--slat_text', default='')   # 외형 = 텍스트판, {이름: 문장} json
 p.add_argument('--text_model', default='microsoft/TRELLIS-text-base')
 p.add_argument('--pool', type=int, default=0)   # dino: 1이면 토큰 [1374, 1024] 대신 token_util.pool 요약 [54, 1024]만 저장 (V 시점 특징 정답용, 11-09)
+p.add_argument('--rembg', type=int, default=0)   # dino: 1이면 흰 배경 문턱값 대신 TRELLIS preprocess_image의 rembg로 배경 제거 (unCLIP 생성 이미지용, 11-09)
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
 os.environ.setdefault('SPCONV_ALGO', 'native')
@@ -117,9 +118,12 @@ if a.mode == 'dino':
     for i, uid in enumerate(dirs):
         o = f'{a.out}/{uid}.npy'
         if os.path.exists(o): continue
-        rgb = np.asarray(Image.open(f'{a.frames}/{uid}/{a.view}.png').convert('RGB'))
-        alpha = ((rgb.min(2) < 235) * 255).astype(np.uint8)
-        img = pipe.preprocess_image(Image.fromarray(np.dstack([rgb, alpha]), 'RGBA'))
+        if a.rembg:   # RGB로 넘기면 TRELLIS가 rembg(u2net)로 배경을 지움
+            img = pipe.preprocess_image(Image.open(f'{a.frames}/{uid}/{a.view}.png').convert('RGB'))
+        else:
+            rgb = np.asarray(Image.open(f'{a.frames}/{uid}/{a.view}.png').convert('RGB'))
+            alpha = ((rgb.min(2) < 235) * 255).astype(np.uint8)
+            img = pipe.preprocess_image(Image.fromarray(np.dstack([rgb, alpha]), 'RGBA'))
         if i == 0: img.save(f'{a.out}/_check_preprocessed.png')
         cond = pipe.get_cond([img])['cond'][0]
         if a.pool:
