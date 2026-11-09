@@ -10,10 +10,19 @@ import os, json, argparse, numpy as np
 p = argparse.ArgumentParser()
 p.add_argument('--data_root', required=True); p.add_argument('--sil', required=True); p.add_argument('--out', required=True)
 p.add_argument('--subs', default='sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008'); p.add_argument('--perm', type=int, default=200)
+p.add_argument('--vt', default='')     # build_view_targets.py npz를 정답으로 (예: --vt view_targets.npz --key view = DINO 시점 특징 변화, 이미 이중 중심화 · 표준화됨)
+p.add_argument('--key', default='view'); p.add_argument('--ncol', type=int, default=10)   # 앞 주성분 몇 개를 볼지
+p.add_argument('--static_only', type=int, default=0)   # 1: 고정 정보만 — 물체 평균 실루엣에서 train 범주 평균을 뺀 잔차(범주를 넘는 개체 차이)를 물체 평균 fMRI로 맞춤 (11-09)
 a = p.parse_args()
 NAMES = ['cx', 'cy', 'w', 'h', 'area']; FRAMES = list(range(2, 8)); ALPHA_REL = [10.0 ** k for k in np.arange(-3, 3.01, 0.5)]
 rng = np.random.default_rng(0)
 z = np.load(a.sil); KEYS = list(z['keys']); SIL = z['sil'].astype(np.float64)
+if a.vt:                                                                        # 정답을 vt npz[key]로 교체 (NaN = 정답 없는 물체)
+    v = np.load(a.vt); vk = [str(k) for k in v['keys']]; Y0 = v[a.key][:, :, :a.ncol].astype(np.float64); okv = v[a.key + '_ok']
+    SIL = np.full((len(KEYS), Y0.shape[1], Y0.shape[2]), np.nan)
+    for i, k in enumerate(KEYS):
+        if k in vk and okv[vk.index(k)]: SIL[i] = Y0[vk.index(k)]
+    NAMES = [f'pc{j}' for j in range(Y0.shape[2])]
 lst = lambda sp: [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{sp}_list.txt')) if l.strip()]
 TR, TE = set(lst('train')), set(lst('test'))
 
@@ -49,16 +58,29 @@ for sub in a.subs.split(','):
     Xo, Yo = X.mean(1), Y.mean(1)
     Zo = (Xo - Xo[istr].mean(0)) / (Xo[istr].std(0) + 1e-6); Ko = (Zo @ Zo.T).astype(np.float64) / Zo.shape[1]
     r_static = r_cols(kridge(Ko, np.where(istr)[0], np.where(iste)[0], Yo), Yo[iste])
+    if a.static_only:                                                           # 범주를 넘는 개체 차이: train 범주 평균을 뺀 잔차, 범주 안 순열로 p
+        cat = np.array([k.split('/')[0] for k in keys]); cm = {c: Yo[istr & (cat == c)].mean(0) for c in set(cat[istr])}
+        Yr = Yo - np.stack([cm.get(c, Yo[istr].mean(0)) for c in cat]); te = np.where(iste)[0]
+        Pr = kridge(Ko, np.where(istr)[0], te, Yr); rr_ = r_cols(Pr, Yr[te]); null = []
+        for _ in range(a.perm):
+            q = Pr.copy()
+            for c in set(cat[te]):
+                ii = np.where(cat[te] == c)[0]; q[ii] = Pr[rng.permutation(ii)]
+            null.append(r_cols(q, Yr[te]))
+        null = np.array(null); pv = [float(((null[:, j] >= rr_[j]).sum() + 1) / (a.perm + 1)) for j in range(5)]
+        R[sub] = {'r_static_resid': np.round(rr_, 3).tolist(), 'p_static_resid': pv, 'r_static_ref': np.round(r_static, 3).tolist()}
+        print(f'PROBE_STATIC {sub} | 범주 넘는 고정 형상 r ' + ' '.join(f'{n} {v:+.3f}(p {q:.3f})' for n, v, q in zip(NAMES, rr_, pv)), flush=True)
+        json.dump(R, open(a.out, 'w', encoding='utf-8'), indent=1, ensure_ascii=False); continue
     # 변하는 정보: 이중 중심화
     Xd = X - X.mean(1, keepdims=True); Xd = Xd - Xd[istr].mean(0, keepdims=True)
     Yd = Y - Y.mean(1, keepdims=True); Yd = Yd - Yd[istr].mean(0, keepdims=True)
-    F = Xd.reshape(-1, Xd.shape[-1]); T = Yd.reshape(-1, 5); smp_tr = np.repeat(istr, 6); smp_te = np.repeat(iste, 6)
+    F = Xd.reshape(-1, Xd.shape[-1]); T = Yd.reshape(-1, Yd.shape[-1]); smp_tr = np.repeat(istr, 6); smp_te = np.repeat(iste, 6)
     Zs = (F - F[smp_tr].mean(0)) / (F[smp_tr].std(0) + 1e-6); K = (Zs @ Zs.T).astype(np.float64) / Zs.shape[1]; del Zs, F
     P = kridge(K, np.where(smp_tr)[0], np.where(smp_te)[0], T); Tt = T[smp_te]
-    r = r_cols(P, Tt); nte = int(iste.sum()); Pr = P.reshape(nte, 6, 5); null = []
+    r = r_cols(P, Tt); nte = int(iste.sum()); Pr = P.reshape(nte, 6, -1); null = []
     for _ in range(a.perm):
-        q = np.stack([Pr[i, rng.permutation(6)] for i in range(nte)]).reshape(-1, 5); null.append(r_cols(q, Tt))
-    null = np.array(null); pv = [float(((null[:, j] >= r[j]).sum() + 1) / (a.perm + 1)) for j in range(5)]
+        q = np.stack([Pr[i, rng.permutation(6)] for i in range(nte)]).reshape(-1, Pr.shape[-1]); null.append(r_cols(q, Tt))
+    null = np.array(null); pv = [float(((null[:, j] >= r[j]).sum() + 1) / (a.perm + 1)) for j in range(len(r))]
     R[sub] = {'r_change': np.round(r, 3).tolist(), 'p_change': pv, 'r_static_ref': np.round(r_static, 3).tolist(), 'n_train': int(istr.sum()), 'n_test': nte, 'dim': int(m.sum())}
     print(f'PROBE_VIEW {sub} | 변하는 정보 r ' + ' '.join(f'{n} {v:+.3f}(p {q:.3f})' for n, v, q in zip(NAMES, r, pv)) +
           ' | 고정 정보(참고) r ' + ' '.join(f'{n} {v:+.3f}' for n, v in zip(NAMES, r_static)), flush=True)
