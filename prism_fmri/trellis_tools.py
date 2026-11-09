@@ -10,6 +10,8 @@
 #  --slat_t0 t (0 < t < 1, --slat_pred와 같이): 외형 단계 SDEdit (11-09, prior 0단계). 예측 토큰으로 만든 SLat을 정규화 공간에서 시점 t까지 노이즈를 넣고
 #       (x_t = (1 − t)·x0 + (σmin + (1 − σmin)·t)·ε, TRELLIS FlowEulerSampler와 같은 식) --slat_pred 조건으로 t → 0까지 같은 sampler(sample_once, 같은 step 표 · cfg)로 되돌림
 #       t = 1이면 보통 외형 분리와 같음. t가 작을수록 예측 SLat을 더 남김
+#  --slat_text <json> (11-09, 외형 = 텍스트판): 1단계(형상, SS)는 --pred 토큰, 2단계(외형, SLat)는 TRELLIS 텍스트판(--text_model)의 SLat flow가
+#       json의 문장({이름: "a chair"})을 CLIP 텍스트 조건으로 생성. 디코더는 이미지판 것 (텍스트판도 image-large의 VAE를 씀 → 시작할 때 정규화 · 디코더 일치 확인)
 #  sm_120에서 xformers 기본 커널(FA3)이 오류 → op 미지정 호출만 CUTLASS로 보냄 (run_trellis.py와 같은 처리, 계산식 동일)
 # 사용: python trellis_tools.py dino --frames <tgt>/frames --out <tgt>/dino [--view 0]
 #       python trellis_tools.py gen --pred <tokens 폴더> --out <glb 폴더> [--seed 42]
@@ -24,6 +26,8 @@ p.add_argument('--trellis_repo', default='/home/oem/jhj/meshgen_tools/repo/third
 p.add_argument('--slat_pred', default='')   # 비우면 두 단계 모두 --pred 토큰
 p.add_argument('--slat_t0', type=float, default=1.0)   # < 1이면 외형 단계 SDEdit
 p.add_argument('--names', default='')   # gscheck: 이 목록의 이름만
+p.add_argument('--slat_text', default='')   # 외형 = 텍스트판, {이름: 문장} json
+p.add_argument('--text_model', default='microsoft/TRELLIS-text-base')
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
 os.environ.setdefault('SPCONV_ALGO', 'native')
@@ -48,6 +52,16 @@ pipe = TrellisImageTo3DPipeline.from_pretrained(a.model); pipe.cuda()
 for f in ('preprocess_image', 'get_cond', 'sample_sparse_structure', 'sample_slat', 'decode_slat'):
     assert hasattr(pipe, f), f'TRELLIS API에 {f} 없음'
 print('기본 sampler', pipe.sparse_structure_sampler_params, pipe.slat_sampler_params, type(pipe.slat_sampler).__name__, flush=True)
+TP, PROMPT = None, {}
+if a.slat_text:
+    import json
+    from trellis.pipelines import TrellisTextTo3DPipeline
+    PROMPT = json.load(open(a.slat_text, encoding='utf-8'))
+    TP = TrellisTextTo3DPipeline.from_pretrained(a.text_model); TP.cuda()
+    same = {k: bool(np.allclose(np.array(pipe.slat_normalization[k]), np.array(TP.slat_normalization[k]))) for k in ('mean', 'std')}
+    dec = {k: bool(all(torch.equal(x, y) for x, y in zip(pipe.models[k].state_dict().values(), TP.models[k].state_dict().values()))) for k in pipe.models if k.startswith('slat_decoder') and k in TP.models}
+    print('텍스트판', a.text_model, '| SLat 정규화 같음', same, '| 디코더 같음', dec, '| sampler', TP.slat_sampler_params, '| 문장', len(PROMPT), flush=True)
+    assert all(same.values()) and dec and all(dec.values()), '텍스트판과 이미지판의 SLat 공간이 다름 → 외형만 바꿔 끼울 수 없음'
 if a.slat_t0 < 1: assert a.slat_pred and hasattr(pipe.slat_sampler, 'sample_once') and hasattr(pipe.slat_sampler, 'sigma_min'), 'SDEdit은 --slat_pred와 FlowEuler sampler 필요'
 def make_cond(c):
     return {'cond': c, 'neg_cond': torch.zeros_like(c)}      # TRELLIS get_cond와 같은 형식 (neg_cond = 0)
@@ -67,7 +81,9 @@ def sdedit(slat0, cond2, t0):   # 정규화 공간에서 t0까지 노이즈 → 
 
 def generate(cond, cond2):
     coords = pipe.sample_sparse_structure(cond, 1)
-    if a.slat_pred and a.slat_t0 < 1:
+    if TP is not None:
+        slat = TP.sample_slat(TP.get_cond([cond2]), coords)                   # cond2 = 문장
+    elif a.slat_pred and a.slat_t0 < 1:
         slat = sdedit(pipe.sample_slat(cond, coords), cond2, a.slat_t0)
     else:
         slat = pipe.sample_slat(cond2, coords)
@@ -77,6 +93,7 @@ def generate(cond, cond2):
 def load_conds(name):   # (형상 조건, 외형 조건). --slat_pred 없으면 같은 것, 외형 토큰이 없으면 None
     ld = lambda f: make_cond(torch.from_numpy(np.load(f)).float().cuda()[None])
     c1 = ld(f'{a.pred}/{name}.npy')
+    if a.slat_text: return c1, PROMPT.get(name)
     if not a.slat_pred: return c1, c1
     f2 = f'{a.slat_pred}/{name}.npy'
     return (c1, ld(f2)) if os.path.exists(f2) else (c1, None)
