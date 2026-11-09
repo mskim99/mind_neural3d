@@ -19,6 +19,7 @@ ap.add_argument('--res', type=int, default=1024); ap.add_argument('--samples', t
 ap.add_argument('--light', type=float, default=3.0)   # 월드(환경) 조명 세기 — 흰 하늘빛 + 해 1개
 ap.add_argument('--sun', type=float, default=2.0)
 ap.add_argument('--shard', default='0/1')
+ap.add_argument('--opaque', type=int, default=1)   # ShapeNet mtl의 d(투명도)·텍스처 알파 무시 → 면 빠짐 방지 (자극 영상은 불투명으로 보임)
 a = ap.parse_args(argv)
 ids = [l.strip() for l in open(a.list) if l.strip()]
 k, n = map(int, a.shard.split('/')); ids = ids[k::n]
@@ -59,6 +60,15 @@ def load(uid):
     f = os.path.join(a.root, uid, 'models', 'model_normalized.obj')
     bpy.ops.wm.obj_import(filepath=f)                    # 기본: ShapeNet y 위 → Blender z 위
     ms = [o for o in sc.objects if o.type == 'MESH']
+    if a.opaque:
+        for m in bpy.data.materials:
+            if not m.use_nodes: continue
+            for nd in m.node_tree.nodes:
+                if nd.type == 'BSDF_PRINCIPLED':
+                    for l in list(nd.inputs['Alpha'].links): m.node_tree.links.remove(l)
+                    nd.inputs['Alpha'].default_value = 1.0
+                    if 'Transmission Weight' in nd.inputs: nd.inputs['Transmission Weight'].default_value = 0.0
+            m.blend_method = 'OPAQUE'
     lo = Vector((1e9,) * 3); hi = Vector((-1e9,) * 3)
     for o in ms:
         for c in o.bound_box:
