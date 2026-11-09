@@ -17,6 +17,7 @@ p.add_argument('--model', default='sd2-community/stable-diffusion-2-1-unclip')
 p.add_argument('--seed', type=int, default=42); p.add_argument('--noise_level', type=int, default=0)
 p.add_argument('--steps', type=int, default=20); p.add_argument('--cfg', type=float, default=10.0)   # diffusers StableUnCLIPImg2ImgPipeline 기본값
 p.add_argument('--prompt', default='')
+p.add_argument('--gamma', type=float, default=1.0)   # gen: < 1이면 저장 이미지를 밝게 (x^γ). 11-10 진단: unCLIP 물체가 어두워 외형이 어두움 → 0.5가 가장 나음
 a = p.parse_args()
 names = [l.strip() for l in open(a.names) if l.strip()] if a.names else sorted(os.listdir(a.frames))
 frame = lambda n: Image.open(f'{a.frames}/{n}/{a.view}.png').convert('RGB')
@@ -66,6 +67,7 @@ else:
         g = torch.Generator(dev).manual_seed(a.seed)
         img = pipe(image_embeds=e[None].half(), prompt=a.prompt, noise_level=a.noise_level, num_inference_steps=a.steps,
                    guidance_scale=a.cfg, generator=g).images[0]
+        if a.gamma != 1.0: img = Image.fromarray((np.clip((np.asarray(img).astype(np.float32) / 255) ** a.gamma, 0, 1) * 255).astype(np.uint8))
         os.makedirs(os.path.dirname(o), exist_ok=True); img.save(o)
         print(f'[unclip {i + 1}/{len(names)}] {n} {img.size} {time.time() - t1:.1f}s', flush=True)
     if saved and not a.embeds: np.savez(f'{a.out}/embeds_gt.npz', **saved)
