@@ -45,7 +45,10 @@ p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자�
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
 p.add_argument('--fold', default='')       # 'k/n': train에서 i % n == k 물체를 뺌 (교차 학습). 비우면 전부
 p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
+p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
+if a.seed >= 0:
+    import random; random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed); torch.cuda.manual_seed_all(a.seed)
 os.makedirs(a.out_dir, exist_ok=True)
 VT, a.vdim = {}, 0
 if a.var_heads in ('sil', 'view', 'shape'):                                          # uid → ([6, vdim], ok)
