@@ -52,7 +52,8 @@ def view(o, S=160):                                    # 점유 → 깊이 그�
     if len(c) == 0: return Image.new('RGB', (S, S), 'white')
     az, el = np.radians(45), np.radians(30)
     Rz = np.array([[np.cos(az), -np.sin(az), 0], [np.sin(az), np.cos(az), 0], [0, 0, 1]]); Rx = np.array([[1, 0, 0], [0, np.cos(el), -np.sin(el)], [0, np.sin(el), np.cos(el)]])
-    q = c @ Rz.T @ Rx.T; u = ((q[:, 0] / 64 + 0.5) * (S - 1)).astype(int); v = ((0.5 - q[:, 2] / 64) * (S - 1)).astype(int); d = q[:, 1]
+    q = c @ Rz.T @ Rx.T; W = 64 * 1.75                 # 회전하면 모서리가 ±32√3까지 나감
+    u = np.clip(((q[:, 0] / W + 0.5) * (S - 1)).astype(int), 0, S - 1); v = np.clip(((0.5 - q[:, 2] / W) * (S - 1)).astype(int), 0, S - 1); d = q[:, 1]
     img = np.full((S, S), np.inf); o_ = np.argsort(-d); img[v[o_], u[o_]] = d[o_]      # 가까운 점(작은 d)이 마지막에 덮음
     out = np.full((S, S, 3), 255, np.uint8); m = np.isfinite(img)
     sh = (img[m] - img[m].min()) / max(1e-6, np.ptp(img[m])); out[m] = np.stack([60 + 150 * sh] * 3, -1).astype(np.uint8)
