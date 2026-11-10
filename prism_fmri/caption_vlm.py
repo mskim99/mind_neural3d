@@ -1,4 +1,4 @@
-# 자극 영상 프레임 → 캡션 (11-10, TRELLIS 텍스트판의 풍부한 문장용) — venv_unclip (transformers 4.46.3), GPU
+# 자극 영상 프레임 → 캡션 (11-10, TRELLIS 텍스트판의 풍부한 문장용) — transformers 4.46.3 (5090 venv_unclip / Pro6000 venv + pylib_cap), GPU
 #  모델 Qwen/Qwen2-VL-7B-Instruct (4.46.3에서 되는 Qwen2-VL, 2.5는 4.49+ 필요). HF 캐시는 $W/cache/hf
 #  입력: <frames>/<uid>/{0,2,4}.png (prep_shape_targets.py가 만든 영상 프레임 0 · 64 · 128 = 방위 0° · 120° · 240°, 피험자가 본 자극 그대로)
 #  정답 범주 이름을 같이 줌 (train 캡션 = 학습 정답, test 캡션은 상한 확인에만 씀 — 방법에 쓰지 않음)

@@ -9,17 +9,21 @@
 # 사용: nohup bash run_caption.sh > $W/logs/prism_caption.log 2>&1 < /dev/null & disown      (VARS="oracle_color oracle_nocolor"처럼 고를 수 있음)
 source $(dirname $0)/common.sh || exit 1
 VARS=${VARS:-"oracle_color oracle_nocolor retr_nocolor retr_rand_nocolor retr_color"}
-FE=${FE:-$W/fair_eval}; PY=$W/venv/bin/python; UPY=$W/venv_unclip/bin/python; TM=${TEXT_MODEL:-microsoft/TRELLIS-text-base}
+FE=${FE:-$W/fair_eval}; PY=$W/venv/bin/python; TM=${TEXT_MODEL:-microsoft/TRELLIS-text-base}
 CK=$W/prism_vshape/vshape_g0/model_final.pt; VT=$TGT/view_targets_shape.npz; O=$W/prism_caption; I=$O/infer/sub-0001_keep
 BASE=$W/prism_vshape/text/glb/vt_s1      # 이미 있는 vshape_g0 + "a {예측 범주}" GLB (run_vshape_text.sh)
 export FE_PY=$PY FE_WORKERS=${FE_WORKERS:-6} TORCH_HOME=$W/cache/torch FE_BLENDER=${FE_BLENDER:-$W/tools/blender-4.2.3-linux-x64/blender}
 trel() { (cd $MG && source $MG/mg_guard.sh && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 step() { echo "=== $1 $(date +%H:%M:%S)"; }
-[ -f $CK ] && [ -f $VT ] && [ -f $FE/run_temp.sh ] && [ -x $UPY ] || { echo "없음: $CK · $VT · $FE/run_temp.sh · $UPY 중 하나"; exit 1; }
+# 캡션 파이썬 (11-11): Pro6000 venv는 transformers 4.34.1이라 Qwen2-VL 없음 → venv_unclip이 있으면 그것, 없으면 venv + $W/pylib_cap(transformers 4.46.3만 --target 설치)
+if [ -x $W/venv_unclip/bin/python ]; then CAPRUN="$W/venv_unclip/bin/python"
+elif [ -d $W/pylib_cap/transformers ]; then CAPRUN="env PYTHONPATH=$W/pylib_cap $PY"
+else echo "캡션 파이썬 없음: $W/venv_unclip 또는 $W/pylib_cap"; exit 1; fi
+[ -f $CK ] && [ -f $VT ] && [ -f $FE/run_temp.sh ] || { echo "없음: $CK · $VT · $FE/run_temp.sh 중 하나"; exit 1; }
 cd $W/run; mkdir -p $O
 
 step "1 캡션 (train + test, 자극 프레임)"
-HF_HOME=$W/cache/hf $UPY $PR/caption_vlm.py --frames $TGT/frames --list $DR/annotations/core_train_list.txt $DR/annotations/core_test_list.txt \
+HF_HOME=$W/cache/hf $CAPRUN $PR/caption_vlm.py --frames $TGT/frames --list $DR/annotations/core_train_list.txt $DR/annotations/core_test_list.txt \
   --out $O/captions.jsonl --bs 8 2>&1 | grep --line-buffered -E "^\[cap\]|CAPTION_DONE|Error|error|Traceback|File "
 grep -q . $O/captions.jsonl 2>/dev/null || { echo "캡션 없음 → 멈춤"; exit 1; }
 
