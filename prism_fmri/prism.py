@@ -131,8 +131,9 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True):
         super().__init__()
+        self.use_film = film                                                # False: ablation — Perceptive FiLM 보정 끔 (모듈은 남기되 안 씀)
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
         self.encoders = nn.ModuleList([e.requires_grad_(False).eval() for e in encs])   # MinD-3D++ fMRI ViT (패치 16, 256×256 → 16×16 + CLS), 고정
@@ -267,8 +268,9 @@ class Prism(nn.Module):
         out['subj_logit'] = self.subj_cls(h); out['perc_vec'] = pv
         # 재구성 (공유): [Semantic ; Variational] Features (Perceptive FiLM 보정) → 조건 토큰
         mem = torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
-        gamma, beta = self.film(h).chunk(2, -1)
-        mem = mem * (1 + gamma[:, None]) + beta[:, None]
+        if self.use_film:
+            gamma, beta = self.film(h).chunk(2, -1)
+            mem = mem * (1 + gamma[:, None]) + beta[:, None]
         out['cond_tokens'] = self.tok_out(self.dec(self.query.expand(B, -1, -1), mem))   # [B, 1374, 1024]
         return out
 
@@ -294,7 +296,8 @@ def build_from_ckpt(ck, repo):
                   var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'),
                   sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'),
                   vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
-                  img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0)
+                  img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
+                  film=bool(int(args.get('film', 1))))
     check_load(model, ck['model'])
     return model
 

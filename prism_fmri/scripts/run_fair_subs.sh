@@ -3,9 +3,9 @@
 #  기본 sub-0003 · sub-0002 (test 범주 정확도 0.423 · 0.337, sub-0001 다음으로 높음). GLB는 차례로, 평가는 GLB 끝난 피험자부터 뒤에서
 #  GLB 경로는 run_vshape_allsub.sh와 같음 (이미 있으면 건너뜀)
 #  → $FE/out/vshape_g0_<sub>/values.txt, 묶음 $FE/fair_subs.tar (FAIR_SUBS_DONE)
-# 사용: [SUBS="sub-0003 sub-0002"] nohup bash run_fair_subs.sh > $W/logs/fair_subs.log 2>&1 < /dev/null & disown
+# 사용: [FSUBS="sub-0003 sub-0002"] nohup bash run_fair_subs.sh > $W/logs/fair_subs.log 2>&1 < /dev/null & disown
 source $(dirname $0)/common.sh || exit 1
-SUBS=${SUBS:-"sub-0003 sub-0002"}
+FSUBS=${FSUBS:-"sub-0003 sub-0002"}   # common.sh의 SUBS(학습 피험자)와 이름이 겹치지 않게 (11-10 버그 수정)
 FE=$W/fair_eval; G=$CUDA_VISIBLE_DEVICES; PY=$W/venv/bin/python
 CK=$W/prism_vshape/vshape_g0/model_final.pt; I=$W/prism_vshape/infer/vshape_g0
 export FE_PY=$PY FE_BLENDER=$W/tools/blender-4.2.3-linux-x64/blender FE_WORKERS=${FE_WORKERS:-6} FE_THREADS=${FE_THREADS:-6} TORCH_HOME=$W/cache/torch
@@ -20,7 +20,7 @@ ev() {   # 피험자
   echo "=== 평가 끝 $n $(date +%H:%M:%S) | $(grep -E '예측 파일 없음' $W/logs/fair_$n.log)"
 }
 EJ=""
-for s in $SUBS; do
+for s in $FSUBS; do
   [ -f $I/${s}_keep/components.npz ] || $PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $CK --out $I --subs $s --perceptive keep | grep -E "범주|DONE|Error"
   [ $(ls $I/${s}_keep/glb/*/*.glb 2>/dev/null | wc -l) -ge 104 ] || trel gen --pred $I/${s}_keep/tokens --out $I/${s}_keep/glb | grep -E "GEN_DONE|Error"
   echo "GLB $s $(ls $I/${s}_keep/glb/*/*.glb 2>/dev/null | wc -l)개 $(date +%H:%M:%S)"
@@ -29,6 +29,6 @@ for s in $SUBS; do
 done
 wait $EJ
 echo "=== 결과"
-for s in $SUBS; do echo "--- $s"; grep -E "^R2\|(2way|10way|LPIPS|PSNR|SSIM)|^P2\|(CD|EMD)\s|^FPD\s" $FE/out/vshape_g0_$s/values.txt 2>/dev/null | tr '\n' ' '; echo; done
-cd $FE && tar cf fair_subs.tar $(for s in $SUBS; do echo out/vshape_g0_$s/values.txt; done) 2>/dev/null; echo "PACK $(tar tf fair_subs.tar | wc -l)개"
+for s in $FSUBS; do echo "--- $s"; grep -E "^R2\|(2way|10way|LPIPS|PSNR|SSIM)|^P2\|(CD|EMD)\s|^FPD\s" $FE/out/vshape_g0_$s/values.txt 2>/dev/null | tr '\n' ' '; echo; done
+cd $FE && tar cf fair_subs.tar $(for s in $FSUBS; do echo out/vshape_g0_$s/values.txt; done) 2>/dev/null; echo "PACK $(tar tf fair_subs.tar | wc -l)개"
 echo "=== FAIR_SUBS_DONE $(date +%H:%M:%S)"

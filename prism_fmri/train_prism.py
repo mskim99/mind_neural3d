@@ -29,6 +29,7 @@ p.add_argument('--bs', type=int, default=8); p.add_argument('--max_step', type=i
 p.add_argument('--warmup', type=int, default=500); p.add_argument('--workers', type=int, default=8)
 p.add_argument('--lam_tok', type=float, default=1.0); p.add_argument('--lam_proto', type=float, default=1.0)
 p.add_argument('--lam_var', type=float, default=1.0); p.add_argument('--lam_subj', type=float, default=0.1)
+p.add_argument('--film', type=int, default=1, choices=[0, 1])   # 0: ablation — Perceptive FiLM 끔 (P 빼기 = --lam_subj 0 --film 0)
 p.add_argument('--print_every', type=int, default=20); p.add_argument('--val_every', type=int, default=1000); p.add_argument('--save_every', type=int, default=2000)
 p.add_argument('--limit', type=int, default=0); p.add_argument('--resume', action='store_true')
 p.add_argument('--var_mode', default='feat', choices=['feat', 'value'])   # Variational → Aggregate 입력: LayerNorm 특징 / 실제 값 임베딩
@@ -117,7 +118,7 @@ ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
 enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film)).to(dev)
 STATE = lambda: model.trainable_state_dict()
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
