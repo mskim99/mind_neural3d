@@ -49,7 +49,7 @@ J=""; for n in $ABL; do one $n & J="$J $!"; sleep 90; done
 wait $J
 echo "=== 결과"; for n in $ABL; do echo "$n$SUF $(grep -E '^P2\|(CD|EMD)\s|^FPD\s|^R2\|(2way|10way)\s' $FE/out/abl_$n$SUF/values.txt $FE/out/abl8_$n$SUF/values.txt 2>/dev/null | tr '\n' ' ')"; done
 T=$O/abl_$(echo $ABL | tr ' ' '_')$SUF.tar
-tar cf $T -C $FE $(for n in $ABL; do ls -d out/abl_$n$SUF/values.txt out/abl8_$n$SUF/values.txt 2>/dev/null | sed 's#^#./#;s#^\./##'; done) 2>/dev/null
+tar cf $T -C $FE $(cd $FE && for n in $ABL; do ls -d out/abl_$n$SUF/values.txt out/abl8_$n$SUF/values.txt 2>/dev/null; done) 2>/dev/null
 tar rf $T -C $W $(for n in $ABL; do echo logs/prism_abl_$n$SUF.log; done) 2>/dev/null
 echo "PACK $T $(tar tf $T 2>/dev/null | wc -l)개"
 echo "=== ABL_DONE $(date +%H:%M:%S)"
