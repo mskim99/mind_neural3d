@@ -1,9 +1,10 @@
 #!/bin/bash
 # B안 3단계 확인 (11-10, 5090): 형상 잠재 prior 생성 z → TRELLIS 2단계(외형 = 텍스트판 "a {가장 가까운 학습 범주}") → glb + 스냅샷
 #  생성 32 (T 1.0, gen_0000~0031) + 실제 검증 물체 z 8 (같은 경로 상한, 문장 = 정답 범주)
+# G=<생성 폴더(check/occ_check.json 포함)> D=<출력> 로 바꿀 수 있음
 # 사용: GPU=0 nohup bash run_b_ss_glb.sh > $W/logs/prism_b_ss_glb.log 2>&1 < /dev/null & disown
 GPU=${GPU:-0} source $(dirname $0)/common.sh || exit 1
-PY=$W/venv/bin/python; O=$W/prism_b; S=$O/ss; G=$O/ss_prior/gen_t1.0; D=$O/ss_glb
+PY=$W/venv/bin/python; O=$W/prism_b; S=$O/ss; G=${G:-$O/ss_prior/gen_t1.0}; D=${D:-$O/ss_glb}
 trel() { (cd $MG && source $MG/mg_guard.sh >/dev/null && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 step() { echo "=== $1 $(date +%H:%M:%S)"; }
 mkdir -p $D/z
