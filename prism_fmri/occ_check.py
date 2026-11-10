@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 p = argparse.ArgumentParser()
 p.add_argument('--train_occ', required=True); p.add_argument('--train_objs', required=True); p.add_argument('--val_objs', required=True)
 p.add_argument('--gen_occ', required=True); p.add_argument('--out', required=True); p.add_argument('--tag', default='')
+p.add_argument('--gen_cls', default='')   # 범주 조건 생성 (11-11): {gen 이름: synset} json → 조건 범주 = 가장 가까운 학습 물체 범주 비율 (실제 검증의 같은 비율이 상한)
 a = p.parse_args(); dev = 'cuda'; N3 = 64 ** 3
 CAT = {'02691156': 'airplane', '02828884': 'bench', '02933112': 'cabinet', '02958343': 'car', '03001627': 'chair', '03211117': 'monitor', '03636649': 'lamp',
        '03691459': 'speaker', '04090263': 'rifle', '04256520': 'sofa', '04379243': 'table', '04401088': 'telephone', '04530566': 'watercraft'}
@@ -42,6 +43,14 @@ gcat = Counter(CAT.get(tr[j].split('_')[0], '?') for j in ga); vcat = Counter(CA
 R = {'tag': a.tag, 'gen_n': len(G), 'gen_nn_iou': float(gi.mean()), 'val_nn_iou': float(vi.mean()), 'gen_pair_iou': pair_iou(G[:64]), 'val_pair_iou': pair_iou(V[V16[:64]]),
      'gen_occ_mean': float(G.sum(1).mean()), 'val_occ_mean': float(V.sum(1).mean()), 'gen_empty': int((G.sum(1) < 50).sum()),
      'gen_nn_cat': dict(gcat.most_common()), 'val_cat': dict(vcat.most_common()), 'gen_nn_iou_each': gi.round(3).tolist(), 'gen_nn_uid': [tr[j] for j in ga]}
+R['val_cls_match'] = float(np.mean([tr[j].split('_')[0] == u.split('_')[0] for j, u in zip(vaa, va)]))
+if a.gen_cls:
+    GC = json.load(open(a.gen_cls)); ok = [tr[j].split('_')[0] == GC[n] for j, n in zip(ga, gn)]
+    R['gen_cls_match'] = float(np.mean(ok)); R['gen_cls'] = [GC[n] for n in gn]
+    per = {}
+    for n, o in zip(gn, ok): per.setdefault(CAT.get(GC[n], GC[n]), []).append(o)
+    R['gen_cls_match_per'] = {k: round(float(np.mean(v)), 2) for k, v in sorted(per.items())}
+    print(f"CLS [{a.tag}] 조건 범주 = 가장 가까운 학습 범주: 생성 {R['gen_cls_match']:.3f} vs 실제 검증 {R['val_cls_match']:.3f} | 범주별 {R['gen_cls_match_per']}", flush=True)
 os.makedirs(a.out, exist_ok=True); json.dump(R, open(f'{a.out}/occ_check.json', 'w'), indent=1)
 print(f"OCC [{a.tag}] 가장 가까운 학습 IoU: 생성 {R['gen_nn_iou']:.3f} vs 실제 검증 {R['val_nn_iou']:.3f} | 서로 IoU: 생성 {R['gen_pair_iou']:.3f} vs 실제 {R['val_pair_iou']:.3f} | 점유 수 {R['gen_occ_mean']:.0f} vs {R['val_occ_mean']:.0f} | 빈 것 {R['gen_empty']}", flush=True)
 print('  가장 가까운 범주(생성):', dict(gcat.most_common()), flush=True)
@@ -63,7 +72,9 @@ def view(o, S=160):                                    # 점유 → 깊이 그�
 S = 160; cv = Image.new('RGB', (S * 16, 30 + S * 3 + 20), 'white'); d = ImageDraw.Draw(cv)
 d.text((4, 4), f'{a.tag}: rows 1-2 = prior samples (number = nearest-train IoU, nearest category), row 3 = real held-out', fill='black')
 for i in range(min(32, len(G))):
-    r, c = divmod(i, 16); cv.paste(view(G[i]), (c * S, 30 + r * S)); d.text((c * S + 3, 30 + r * S + 3), f'{gi[i]:.2f} {CAT.get(tr[ga[i]].split("_")[0], "?")}', fill='blue')
+    r, c = divmod(i, 16); cv.paste(view(G[i]), (c * S, 30 + r * S))
+    cond = f'[{CAT.get(R["gen_cls"][i], "?")}] ' if a.gen_cls else ''
+    d.text((c * S + 3, 30 + r * S + 3), f'{cond}{gi[i]:.2f} {CAT.get(tr[ga[i]].split("_")[0], "?")}', fill='blue')
 for k, i in enumerate(V16[:16]):
     i = int(i); cv.paste(view(V[i]), (k * S, 30 + 2 * S + 20)); d.text((k * S + 3, 30 + 2 * S + 23), f'{vi[i]:.2f} {CAT.get(va[i].split("_")[0], "?")}', fill='green')
 cv.save(f'{a.out}/occ_check.png'); print('MONTAGE', f'{a.out}/occ_check.png')

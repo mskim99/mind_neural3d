@@ -15,9 +15,10 @@ NAME = {'02691156': 'airplane', '02828884': 'bench', '02933112': 'cabinet', '029
         '03636649': 'lamp', '03691459': 'loudspeaker', '04090263': 'rifle', '04256520': 'sofa', '04379243': 'table', '04401088': 'telephone', '04530566': 'boat'}
 art = lambda w: ('an ' if w[0] in 'aeiou' else 'a ') + w
 R = json.load(open('$G/check/occ_check.json')); P = {}
+GC = json.load(open('$G/cls.json')) if os.path.exists('$G/cls.json') else None   # 범주 조건 생성이면 문장 = 조건 범주
 for k in range(32):
     n = f'gen_{k:04d}'; os.symlink('$G/' + n + '.npy', '$D/z/' + n + '.npy') if not os.path.exists('$D/z/' + n + '.npy') else None
-    P[n] = art(NAME[R['gen_nn_uid'][k].split('_')[0]])
+    P[n] = art(NAME[GC[n] if GC else R['gen_nn_uid'][k].split('_')[0]])
 va = [l.strip() for l in open('$O/prior_u/val_objs.txt') if l.strip() and os.path.exists('$S/z/' + l.strip() + '.npy')]
 for u in [va[i] for i in sorted(np.random.RandomState(0).choice(len(va), 8, replace=False))]:
     n = 'real_' + u; os.symlink('$S/z/' + u + '.npy', '$D/z/' + n + '.npy') if not os.path.exists('$D/z/' + n + '.npy') else None
