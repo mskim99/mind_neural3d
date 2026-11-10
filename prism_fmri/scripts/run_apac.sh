@@ -4,7 +4,7 @@
 #  MinD-3D++: PPS_CKPT(공개 가중치 Shape sub01 전체 체크포인트)가 있으면 같은 fMRI로 공식 절차 추론(LoRA 미적용, infer_mind3dpp_batch.py) → OBJ → fe_shape
 #  준비(로컬에서 올림): $DR/sub-0009 · $DR/sub-0011 (npy_data), $DR/annotations/apac_list.txt, APAC GT 점구름 apac_gt_p2.tar → $FE/gt_pc/P2/ 에 풂
 #  → $FE/out/{ours,pps}_{AP,APAC}/values.txt, 묶음 $FE/apac.tar (APAC_DONE)
-# 사용: [PPS_CKPT=<경로>] nohup bash run_apac.sh > $W/logs/apac.log 2>&1 < /dev/null & disown
+# 사용: [PPS_CKPT=<경로>] [PPS_ONLY=1 (MinD-3D++만, 예: GPU=0)] nohup bash run_apac.sh > $W/logs/apac.log 2>&1 < /dev/null & disown
 source $(dirname $0)/common.sh || exit 1
 source $(dirname $0)/fe_shape.sh
 FE=${FE:-$W/fair_eval}; PY=$W/venv/bin/python; CK=$W/prism_vshape/vshape_g0/model_final.pt; I=$W/prism_apac/ours
@@ -32,6 +32,7 @@ pps() {   # MinD-3D++ (뒤에서)
   done
 }
 pps & PJ=$!
+[ -n "$PPS_ONLY" ] && { wait $PJ; echo "=== APAC_DONE (MinD-3D++만) $(date +%H:%M:%S)"; exit 0; }
 
 for x in AP APAC; do
   d=$I/${FS[$x]}_as01_keep
