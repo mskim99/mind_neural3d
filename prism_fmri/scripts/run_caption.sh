@@ -15,6 +15,7 @@ BASE=$W/prism_vshape/text/glb/vt_s1      # 이미 있는 vshape_g0 + "a {예측 
 export FE_PY=$PY FE_WORKERS=${FE_WORKERS:-6} TORCH_HOME=$W/cache/torch FE_BLENDER=${FE_BLENDER:-$W/tools/blender-4.2.3-linux-x64/blender}
 trel() { (cd $MG && source $MG/mg_guard.sh && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 step() { echo "=== $1 $(date +%H:%M:%S)"; }
+# 캡션 묶음 (11-11): 4.46.3 시각 인코더는 묶음 안 이미지 전체에 attention 행렬을 한 번에 만듦 → bs 8(이미지 24장)이면 36 GiB OOM, 기본 bs 2
 # 캡션 파이썬 (11-11): Pro6000 venv는 transformers 4.34.1이라 Qwen2-VL 없음 → venv_unclip이 있으면 그것, 없으면 venv + $W/pylib_cap(transformers 4.46.3만 --target 설치)
 if [ -x $W/venv_unclip/bin/python ]; then CAPRUN="$W/venv_unclip/bin/python"
 elif [ -d $W/pylib_cap/transformers ]; then CAPRUN="env PYTHONPATH=$W/pylib_cap $PY"
@@ -24,7 +25,7 @@ cd $W/run; mkdir -p $O
 
 step "1 캡션 (train + test, 자극 프레임)"
 HF_HOME=$W/cache/hf $CAPRUN $PR/caption_vlm.py --frames $TGT/frames --list $DR/annotations/core_train_list.txt $DR/annotations/core_test_list.txt \
-  --out $O/captions.jsonl --bs 8 2>&1 | grep --line-buffered -E "^\[cap\]|CAPTION_DONE|Error|error|Traceback|File "
+  --out $O/captions.jsonl --bs ${CAP_BS:-2} 2>&1 | grep --line-buffered -E "^\[cap\]|CAPTION_DONE|Error|error|Traceback|File "
 grep -q . $O/captions.jsonl 2>/dev/null || { echo "캡션 없음 → 멈춤"; exit 1; }
 
 step "2 vshape_g0 sub-0001 추론 (components에 vt · clip) → 문장"
