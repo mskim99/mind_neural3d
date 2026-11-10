@@ -12,6 +12,9 @@
 #       t = 1이면 보통 외형 분리와 같음. t가 작을수록 예측 SLat을 더 남김
 #  --slat_text <json> (11-09, 외형 = 텍스트판): 1단계(형상, SS)는 --pred 토큰, 2단계(외형, SLat)는 TRELLIS 텍스트판(--text_model)의 SLat flow가
 #       json의 문장({이름: "a chair"})을 CLIP 텍스트 조건으로 생성. 디코더는 이미지판 것 (텍스트판도 image-large의 VAE를 씀 → 시작할 때 정규화 · 디코더 일치 확인)
+#  ss    (11-10 B안 3단계): 조건 토큰 → TRELLIS 1단계(형상) flow만 → SS 잠재 z [8, 16³] → <out>/z/<name>.npy (fp16)
+#         + 디코더 점유 64³ (> 0) → <out>/occ/<name>.npy (np.packbits). 배치 --bs, 나눠 돌리기 --shard i/n
+#  ssdec : <pred>/*.npy의 SS 잠재 → 디코더 점유 → <out>/occ/<name>.npy (prior 생성물 확인용)
 #  sm_120에서 xformers 기본 커널(FA3)이 오류 → op 미지정 호출만 CUTLASS로 보냄 (run_trellis.py와 같은 처리, 계산식 동일)
 # 사용: python trellis_tools.py dino --frames <tgt>/frames --out <tgt>/dino [--view 0]
 #       python trellis_tools.py gen --pred <tokens 폴더> --out <glb 폴더> [--seed 42]
@@ -19,7 +22,8 @@
 import os, sys, glob, time, argparse
 import numpy as np
 p = argparse.ArgumentParser()
-p.add_argument('mode', choices=['dino', 'gen', 'gscheck'])
+p.add_argument('mode', choices=['dino', 'gen', 'gscheck', 'ss', 'ssdec'])
+p.add_argument('--bs', type=int, default=8); p.add_argument('--shard', default='0/1')   # ss
 p.add_argument('--frames'); p.add_argument('--pred'); p.add_argument('--out', required=True)
 p.add_argument('--view', type=int, default=0); p.add_argument('--seed', type=int, default=42); p.add_argument('--limit', type=int, default=0)
 p.add_argument('--trellis_repo', default='/home/oem/jhj/meshgen_tools/repo/third_party/TRELLIS')
@@ -133,6 +137,29 @@ if a.mode == 'dino':
         np.save(o, cond.half().cpu().numpy())
         if (i + 1) % 100 == 0: print(f'[dino {i + 1}/{len(dirs)}] {uid} {time.time() - t0:.0f}s', flush=True)
     print('DINO_DONE', flush=True)
+elif a.mode in ('ss', 'ssdec'):
+    dec = pipe.models['sparse_structure_decoder']; os.makedirs(f'{a.out}/occ', exist_ok=True); os.makedirs(f'{a.out}/z', exist_ok=True)
+    names = [l.split()[-1] for l in open(a.names) if l.strip()] if a.names else [os.path.basename(f)[:-4] for f in sorted(glob.glob(f'{a.pred}/*.npy'))]
+    si, sn = map(int, a.shard.split('/')); names = [n for k, n in enumerate(names[: a.limit or None]) if k % sn == si]
+    names = [n for n in names if not os.path.exists(f'{a.out}/occ/{n}.npy')]
+    print(a.mode, '할 것', len(names), '| sampler', pipe.sparse_structure_sampler_params, flush=True)
+    fm = pipe.models['sparse_structure_flow_model']; R = fm.resolution
+    for b in range(0, len(names), a.bs):
+        nb = names[b:b + a.bs]
+        X = torch.stack([torch.from_numpy(np.load(f'{a.pred}/{n}.npy')).float() for n in nb]).cuda()
+        with torch.no_grad():
+            if a.mode == 'ss':
+                torch.manual_seed(a.seed)
+                noise = torch.randn(len(nb), fm.in_channels, R, R, R, device='cuda')
+                z = pipe.sparse_structure_sampler.sample(fm, noise, **make_cond(X), **pipe.sparse_structure_sampler_params, verbose=False).samples
+            else:
+                z = X
+            occ = (dec(z) > 0)[:, 0].cpu().numpy()
+        for j, n in enumerate(nb):
+            if a.mode == 'ss': np.save(f'{a.out}/z/{n}.npy', z[j].half().cpu().numpy())
+            np.save(f'{a.out}/occ/{n}.npy', np.packbits(occ[j].reshape(-1)))
+        if (b // a.bs) % 50 == 0: print(f'[{a.mode} {b + len(nb)}/{len(names)}] 점유 평균 {occ.reshape(len(nb), -1).sum(1).mean():.0f} {time.time() - t0:.0f}s', flush=True)
+    print('SS_DONE', flush=True)
 elif a.mode == 'gscheck':
     import json
     from trellis.utils import postprocessing_utils, render_utils
