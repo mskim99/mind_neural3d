@@ -15,6 +15,9 @@
 #  ss    (11-10 B안 3단계): 조건 토큰 → TRELLIS 1단계(형상) flow만 → SS 잠재 z [8, 16³] → <out>/z/<name>.npy (fp16)
 #         + 디코더 점유 64³ (> 0) → <out>/occ/<name>.npy (np.packbits). 배치 --bs, 나눠 돌리기 --shard i/n
 #  ssdec : <pred>/*.npy의 SS 잠재 → 디코더 점유 → <out>/occ/<name>.npy (prior 생성물 확인용)
+#  yawsel (11-11, GT 없이 방향 고르기): <frames>/<이름>/{0..n-1}.png = 생성물을 자극 카메라(거리 1.5 · FOV 56 · 고도 30)로 방위 0 · 360/n · …에서 렌더(RGBA)
+#         → dino와 같은 전처리 · get_cond → <pred>/<이름>.npy(예측 토큰 = 자극 프레임 0 DINO 흉내)와 토큰별 cos 평균 → 가장 비슷한 방위 φ
+#         → 고칠 수평 회전 = −φ (render.py 카메라 방위는 반시계, yaw_check.py 각도와 같은 방향) → <out>/yawsel.json
 #  sm_120에서 xformers 기본 커널(FA3)이 오류 → op 미지정 호출만 CUTLASS로 보냄 (run_trellis.py와 같은 처리, 계산식 동일)
 # 사용: python trellis_tools.py dino --frames <tgt>/frames --out <tgt>/dino [--view 0]
 #       python trellis_tools.py gen --pred <tokens 폴더> --out <glb 폴더> [--seed 42]
@@ -22,7 +25,8 @@
 import os, sys, glob, time, argparse
 import numpy as np
 p = argparse.ArgumentParser()
-p.add_argument('mode', choices=['dino', 'gen', 'gscheck', 'ss', 'ssdec'])
+p.add_argument('mode', choices=['dino', 'gen', 'gscheck', 'ss', 'ssdec', 'yawsel'])
+p.add_argument('--nview', type=int, default=12)   # yawsel: 방위 0 · 360/n · … 렌더 개수
 p.add_argument('--bs', type=int, default=8); p.add_argument('--shard', default='0/1')   # ss
 p.add_argument('--frames'); p.add_argument('--pred'); p.add_argument('--out', required=True)
 p.add_argument('--view', type=int, default=0); p.add_argument('--seed', type=int, default=42); p.add_argument('--limit', type=int, default=0)
@@ -141,6 +145,23 @@ if a.mode == 'dino':
         np.save(o, cond.half().cpu().numpy())
         if (i + 1) % 100 == 0: print(f'[dino {i + 1}/{len(dirs)}] {uid} {time.time() - t0:.0f}s', flush=True)
     print('DINO_DONE', flush=True)
+elif a.mode == 'yawsel':
+    import json
+    names = sorted(os.path.basename(f)[:-4] for f in glob.glob(f'{a.pred}/*.npy') if os.path.isdir(f'{a.frames}/{os.path.basename(f)[:-4]}'))[: a.limit or None]
+    print('yawsel 할 것', len(names), '| 방위', a.nview, flush=True); R = {}
+    for i, n in enumerate(names):
+        fs = [f'{a.frames}/{n}/{k}.png' for k in range(a.nview)]
+        if not all(os.path.exists(f) for f in fs): print('렌더 없음', n, flush=True); continue
+        imgs = [pipe.preprocess_image(Image.open(f).convert('RGBA')) for f in fs]
+        with torch.no_grad():
+            c = pipe.get_cond(imgs)['cond'].float()                                   # [n, 1374, 1024]
+            t = torch.from_numpy(np.load(f'{a.pred}/{n}.npy')).float().cuda()[None]
+            sc = torch.nn.functional.cosine_similarity(c, t, dim=-1).mean(-1).cpu().numpy()
+        k = int(sc.argmax()); phi = 360 * k / a.nview
+        R[n] = {'phi': phi, 'yaw_fix': (360 - phi) % 360, 'score': [float(x) for x in sc]}
+        if i == 0: imgs[0].save(f'{a.out}/_check_yawsel.png')
+        if (i + 1) % 20 == 0: print(f'[yawsel {i + 1}/{len(names)}] {n} φ {phi:.0f} | {np.round(sc, 3).tolist()}', flush=True)
+    json.dump(R, open(f'{a.out}/yawsel.json', 'w'), indent=1); print('YAWSEL_DONE', len(R), flush=True)
 elif a.mode in ('ss', 'ssdec'):
     dec = pipe.models['sparse_structure_decoder']; os.makedirs(f'{a.out}/occ', exist_ok=True); os.makedirs(f'{a.out}/z', exist_ok=True)
     names = [l.split()[-1] for l in open(a.names) if l.strip()] if a.names else [os.path.basename(f)[:-4] for f in sorted(glob.glob(f'{a.pred}/*.npy'))]
