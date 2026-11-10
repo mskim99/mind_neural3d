@@ -34,6 +34,7 @@ p.add_argument('--slat_text', default='')   # 외형 = 텍스트판, {이름: �
 p.add_argument('--text_model', default='microsoft/TRELLIS-text-base')
 p.add_argument('--pool', type=int, default=0)   # dino: 1이면 토큰 [1374, 1024] 대신 token_util.pool 요약 [54, 1024]만 저장 (V 시점 특징 정답용, 11-09)
 p.add_argument('--rembg', type=int, default=0)   # dino: 1이면 흰 배경 문턱값 대신 TRELLIS preprocess_image의 rembg로 배경 제거 (unCLIP 생성 이미지용, 11-09)
+p.add_argument('--ss_z', default='')   # gen (11-10, B 3단계): 1단계(형상)를 건너뛰고 이 폴더의 형상 잠재 z [8,16³] → 디코더 > 0 → coords. 외형은 --slat_text 필수, 각 z 옆 흰 배경 스냅샷 png도 저장
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
 os.environ.setdefault('SPCONV_ALGO', 'native')
@@ -95,8 +96,11 @@ def sdedit(slat0, cond2, t0):   # 정규화 공간에서 t0까지 노이즈 → 
     return x.replace(x.feats * std + mean)
 
 
-def generate(cond, cond2):
-    coords = pipe.sample_sparse_structure(cond, 1)
+def generate(cond, cond2, z=None):
+    if z is not None:   # TRELLIS sample_sparse_structure의 마지막 줄과 같은 식
+        coords = torch.argwhere(pipe.models['sparse_structure_decoder'](z) > 0)[:, [0, 2, 3, 4]].int()
+    else:
+        coords = pipe.sample_sparse_structure(cond, 1)
     if TP is not None:
         slat = TP.sample_slat(TP.get_cond([cond2]), coords)                   # cond2 = 문장
     elif a.slat_pred and a.slat_t0 < 1:
@@ -190,19 +194,26 @@ elif a.mode == 'gscheck':
         Image.fromarray(np.concatenate(list(w.astype(np.uint8)), 1)).save(f'{a.out}/{name}_gs.png')
     print('GSCHECK_DONE', flush=True)
 else:
-    from trellis.utils import postprocessing_utils
-    files = sorted(glob.glob(f'{a.pred}/*.npy'))[: a.limit or None]
+    from trellis.utils import postprocessing_utils, render_utils
+    if a.ss_z: assert TP is not None, '--ss_z는 --slat_text와 같이'
+    files = sorted(glob.glob(f'{a.ss_z or a.pred}/*.npy'))[: a.limit or None]
     for i, f in enumerate(files):
         name = os.path.basename(f)[:-4]; od = f'{a.out}/{name}'
         if os.path.exists(f'{od}/{name}.glb'): continue
         t1 = time.time()
-        cond, cond2 = load_conds(name)
+        if a.ss_z:
+            cond, cond2, z = None, PROMPT.get(name), torch.from_numpy(np.load(f)).float().cuda()[None]
+        else:
+            (cond, cond2), z = load_conds(name), None
         if cond2 is None: print('외형 토큰 없음', name, flush=True); continue
         torch.manual_seed(a.seed)
         with torch.no_grad():
-            outs = generate(cond, cond2)
+            outs = generate(cond, cond2, z)
         os.makedirs(od, exist_ok=True)
         glb = postprocessing_utils.to_glb(outs['gaussian'][0], outs['mesh'][0], simplify=0.95, texture_size=1024, verbose=False)
         glb.export(f'{od}/{name}.glb')
+        if a.ss_z:
+            snap = render_utils.render_snapshot(outs['gaussian'][0], resolution=384, bg_color=(1, 1, 1), verbose=False)['color']
+            Image.fromarray(np.concatenate([np.asarray(s) for s in snap[:2]], 1).astype(np.uint8)).save(f'{od}/{name}_snap.png')
         print(f'[gen {i + 1}/{len(files)}] {name} {time.time() - t1:.1f}s', flush=True)
     print('GEN_DONE', flush=True)
