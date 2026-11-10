@@ -14,7 +14,7 @@ p.add_argument('--comp', required=True); p.add_argument('--tok', required=True);
 p.add_argument('--out', required=True)
 p.add_argument('--steps', type=int, default=30000); p.add_argument('--bs', type=int, default=64); p.add_argument('--lr', type=float, default=2e-4)
 p.add_argument('--width', type=int, default=2048); p.add_argument('--depth', type=int, default=8); p.add_argument('--heads', type=int, default=8)
-p.add_argument('--dropout', type=float, default=0.1)
+p.add_argument('--dropout', type=float, default=0.1); p.add_argument('--white', type=int, default=1)   # glob: 1 = 주성분별 백색화, 0 = 한 배율 (분산 비율 유지, 꼬리 잡음 안 키움)
 p.add_argument('--n', type=int, default=64); p.add_argument('--n_steps', type=int, default=50); p.add_argument('--temp', type=float, default=1.0)
 p.add_argument('--ckpt', default=''); p.add_argument('--gauss', type=int, default=0); p.add_argument('--seed', type=int, default=0)
 a = p.parse_args()
@@ -40,6 +40,7 @@ def dec(z):                                            # [B, 5 + g², d] → LN 
 
 if a.space == 'glob':
     GB = torch.load(f'{a.comp}/glob_{a.cfg}.pt'); W = GB['W'][:, :a.k].to(dev); m = GB['m'].to(dev); sdv = GB['ev'][:a.k].to(dev).sqrt() / math.sqrt(len(GB['objs']))
+    if not a.white: sdv = sdv.pow(2).mean().sqrt().expand_as(sdv).clone()   # 전체 분산 = k
     to_lat = lambda c: c / sdv                          # 코드 → 백색 잠재
     from_lat = lambda y: dec(_unflat((y * sdv) @ W.T + m))
 
@@ -151,11 +152,12 @@ if a.mode == 'train':
 else:
     os.makedirs(a.out, exist_ok=True); g = torch.Generator(device=dev).manual_seed(a.seed); gen = []
     if a.gauss:
-        y = a.temp * torch.randn(a.n, a.k, device=dev, generator=g); tag = f'가우시안 (학습 없음) k={a.k}'
+        y = a.temp * torch.randn(a.n, a.k, device=dev, generator=g) * (GB['ev'][:a.k].to(dev).sqrt() / math.sqrt(len(GB['objs'])) / sdv); tag = f'가우시안 (학습 없음) k={a.k}'
         with torch.no_grad(): gen = [x.cpu() for b in range(0, a.n, 16) for x in from_lat(y[b:b + 16])]
     else:
         ck = torch.load(a.ckpt, map_location='cpu')   # --space · --cfg · --k는 학습 때와 같게 넘김
         for kk in ('width', 'depth', 'heads'): setattr(a, kk, ck['args'][kk])
+        assert ck['args'].get('white', 1) == a.white, '--white를 학습 때와 같게'
         net = make_net().eval(); net.load_state_dict(ck['net']); MU, SD = ck['MU'].to(dev), ck['SD'].to(dev)
         shape = (a.k,) if a.space == 'glob' else (NP + gs * gs, d_ch); tag = f'prior {a.space} {a.cfg} k={a.k} T={a.temp}'
         ts = torch.linspace(1, 0, a.n_steps + 1, device=dev)
