@@ -98,35 +98,47 @@ def erank(Z):
 
 
 R = {'name': a.name, 'n': N, 'n_subj': len(a.comp), 'n_obj': int(len(uo)), 'chance_cls': float(np.bincount(cls).max() / N)}
-for k in ('sem', 'var', 'perc'):
-    R[f'cls_lin_{k}'] = probe(X[k], cls, 'lin'); R[f'cls_mlp_{k}'] = probe(X[k], cls, 'mlp')
-    if len(a.comp) > 1:
-        R[f'subj_lin_{k}'] = probe(X[k], subj, 'lin'); R[f'subj_mlp_{k}'] = probe(X[k], subj, 'mlp')
-    if VT is not None: R[f'shape_r2_{k}'] = ridge_r2(X[k], VT[0], VT[1])
-    R[f'erank_{k}'] = erank(X[k])
-    print(f'SEP|{k} 범주 선형 {R[f"cls_lin_{k}"]:.3f} MLP {R[f"cls_mlp_{k}"]:.3f}'
-          + (f' | 피험자 선형 {R[f"subj_lin_{k}"]:.3f} MLP {R[f"subj_mlp_{k}"]:.3f}' if len(a.comp) > 1 else '')
-          + (f' | 형상 R² {R[f"shape_r2_{k}"]:.3f}' if VT is not None else '') + f' | 유효 랭크 {R[f"erank_{k}"]:.1f}', flush=True)
-if len(a.comp) > 1: R['chance_subj'] = float(np.bincount(subj).max() / N)
-for x, y in (('sem', 'var'), ('sem', 'perc'), ('var', 'perc')):
-    R[f'cka_lin_{x}_{y}'] = cka_lin(X[x], X[y]); R[f'cka_rbf_{x}_{y}'] = cka_rbf(X[x], X[y])
-# CKA 기준선: 같은 피험자 안에서 물체만 섞은 짝 (편향 추정량이라 독립이어도 0이 아님 → 이 값과 비교), 10번 평균
-def shuffled_idx(rs):
-    idx = np.arange(N)
-    for s in np.unique(subj):
-        m = np.where(subj == s)[0]; idx[m] = m[rs.permutation(len(m))]
-    return idx
-for x, y in (('sem', 'var'), ('sem', 'perc'), ('var', 'perc')):
-    bl, br = [], []
-    for t in range(10):
-        ix = shuffled_idx(np.random.RandomState(100 + t)); bl.append(cka_lin(X[x], X[y][ix])); br.append(cka_rbf(X[x], X[y][ix]))
-    R[f'cka_lin_{x}_{y}_base'] = float(np.mean(bl)); R[f'cka_rbf_{x}_{y}_base'] = float(np.mean(br))
-print('SEP|CKA 섞은 기준선 선형 S-V {:.3f} S-P {:.3f} V-P {:.3f} | RBF S-V {:.3f} S-P {:.3f} V-P {:.3f}'.format(
-    R['cka_lin_sem_var_base'], R['cka_lin_sem_perc_base'], R['cka_lin_var_perc_base'], R['cka_rbf_sem_var_base'], R['cka_rbf_sem_perc_base'], R['cka_rbf_var_perc_base']), flush=True)
-nb = {k: v / np.linalg.norm(v - v.mean(0)) for k, v in X.items()}
-R['erank_sum'] = sum(erank(nb[k]) for k in nb); R['erank_joint'] = erank(np.hstack([nb[k] for k in ('sem', 'var', 'perc')]))
-print('SEP|CKA 선형 S-V {:.3f} S-P {:.3f} V-P {:.3f} | RBF S-V {:.3f} S-P {:.3f} V-P {:.3f} | 유효 랭크 합 {:.1f} vs 붙임 {:.1f} | 우연 범주 {:.3f}'.format(
-    R['cka_lin_sem_var'], R['cka_lin_sem_perc'], R['cka_lin_var_perc'], R['cka_rbf_sem_var'], R['cka_rbf_sem_perc'], R['cka_rbf_var_perc'],
-    R['erank_sum'], R['erank_joint'], R['chance_cls']) + (f' 피험자 {R["chance_subj"]:.3f}' if 'chance_subj' in R else ''), flush=True)
+# 피험자 평균 빼기 (11-11): 피험자별 ViT · S · V라 갈래마다 피험자 평균 쏠림이 있어 원 특징은 피험자 탐침이 늘 1.0
+#  → 원 특징('')과 피험자 평균을 뺀 특징('_c') 둘 다 판정. 분리 비교는 '_c'로 (Slot3D 11-05: 평균만 빼면 피험자 정보 사라짐)
+def judge(X, T):
+    Q = {}
+    for k in ('sem', 'var', 'perc'):
+        Q[f'cls_lin_{k}'] = probe(X[k], cls, 'lin'); Q[f'cls_mlp_{k}'] = probe(X[k], cls, 'mlp')
+        if len(a.comp) > 1:
+            Q[f'subj_lin_{k}'] = probe(X[k], subj, 'lin'); Q[f'subj_mlp_{k}'] = probe(X[k], subj, 'mlp')
+        if VT is not None: Q[f'shape_r2_{k}'] = ridge_r2(X[k], VT[0], VT[1])
+        Q[f'erank_{k}'] = erank(X[k])
+        print(f'SEP|{k} 범주 선형 {Q[f"cls_lin_{k}"]:.3f} MLP {Q[f"cls_mlp_{k}"]:.3f}'
+              + (f' | 피험자 선형 {Q[f"subj_lin_{k}"]:.3f} MLP {Q[f"subj_mlp_{k}"]:.3f}' if len(a.comp) > 1 else '')
+              + (f' | 형상 R² {Q[f"shape_r2_{k}"]:.3f}' if VT is not None else '') + f' | 유효 랭크 {Q[f"erank_{k}"]:.1f}', flush=True)
+    if len(a.comp) > 1: Q['chance_subj'] = float(np.bincount(subj).max() / N)
+    for x, y in (('sem', 'var'), ('sem', 'perc'), ('var', 'perc')):
+        Q[f'cka_lin_{x}_{y}'] = cka_lin(X[x], X[y]); Q[f'cka_rbf_{x}_{y}'] = cka_rbf(X[x], X[y])
+    # CKA 기준선: 같은 피험자 안에서 물체만 섞은 짝 (편향 추정량이라 독립이어도 0이 아님 → 이 값과 비교), 10번 평균
+    def shuffled_idx(rs):
+        idx = np.arange(N)
+        for s in np.unique(subj):
+            m = np.where(subj == s)[0]; idx[m] = m[rs.permutation(len(m))]
+        return idx
+    for x, y in (('sem', 'var'), ('sem', 'perc'), ('var', 'perc')):
+        bl, br = [], []
+        for t in range(10):
+            ix = shuffled_idx(np.random.RandomState(100 + t)); bl.append(cka_lin(X[x], X[y][ix])); br.append(cka_rbf(X[x], X[y][ix]))
+        Q[f'cka_lin_{x}_{y}_base'] = float(np.mean(bl)); Q[f'cka_rbf_{x}_{y}_base'] = float(np.mean(br))
+    print('SEP|CKA 섞은 기준선 선형 S-V {:.3f} S-P {:.3f} V-P {:.3f} | RBF S-V {:.3f} S-P {:.3f} V-P {:.3f}'.format(
+        Q['cka_lin_sem_var_base'], Q['cka_lin_sem_perc_base'], Q['cka_lin_var_perc_base'], Q['cka_rbf_sem_var_base'], Q['cka_rbf_sem_perc_base'], Q['cka_rbf_var_perc_base']), flush=True)
+    nb = {k: v / np.linalg.norm(v - v.mean(0)) for k, v in X.items()}
+    Q['erank_sum'] = sum(erank(nb[k]) for k in nb); Q['erank_joint'] = erank(np.hstack([nb[k] for k in ('sem', 'var', 'perc')]))
+    print('SEP|CKA 선형 S-V {:.3f} S-P {:.3f} V-P {:.3f} | RBF S-V {:.3f} S-P {:.3f} V-P {:.3f} | 유효 랭크 합 {:.1f} vs 붙임 {:.1f} | 우연 범주 {:.3f}'.format(
+        Q['cka_lin_sem_var'], Q['cka_lin_sem_perc'], Q['cka_lin_var_perc'], Q['cka_rbf_sem_var'], Q['cka_rbf_sem_perc'], Q['cka_rbf_var_perc'],
+        Q['erank_sum'], Q['erank_joint'], R['chance_cls']) + (f' 피험자 {Q["chance_subj"]:.3f}' if 'chance_subj' in Q else ''), flush=True)
+    return {k + T: v for k, v in Q.items()}
+
+
+Xc = {k: v.copy() for k, v in X.items()}
+for k in Xc:
+    for s_ in np.unique(subj): Xc[k][subj == s_] -= Xc[k][subj == s_].mean(0)
+for T, XX in (('', X), ('_c', Xc)):
+    print(f'SEP|=== {"원 특징" if T == "" else "피험자 평균 뺀 특징"}', flush=True); R.update(judge(XX, T))
 os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True); json.dump(R, open(a.out, 'w'), indent=1)
 print('SEP_DONE', a.out, flush=True)
