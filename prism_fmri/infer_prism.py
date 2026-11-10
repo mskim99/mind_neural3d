@@ -4,6 +4,7 @@
 #  --fold k/n (11-09): 목록(annotations 순서)에서 i % n == k인 물체만 (train_prism.py --fold k/n이 뺀 물체 = 안 본 물체)
 #  --names <uid 목록>: 그 물체만
 #  --tok_pool 1: components.npz에 예측 토큰 요약 tok_pool [N, 54, 1024] fp16 (token_util.pool, 토큰 prior 조건), --save_tokens 0이면 토큰 파일은 안 씀
+#  11-10: components.npz에 clip(S CLIP 벡터 [N, 1024]) · vt(V 예측 프레임 평균, var_heads sil · view · shape일 때)도 저장
 #  2단계(GLB)는 meshgen venv의 trellis_tools.py gen
 import os, sys, argparse, numpy as np, torch
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,7 +30,7 @@ if a.names: _w = {l.split()[-1] for l in open(a.names) if l.strip()}; ids = [k f
 for sub in (a.subs.split(',') if a.subs else SUBS):
     dsub = a.fmri_sub or sub                                    # fMRI를 읽는 피험자 폴더
     od = f'{a.out}/{dsub}_{a.perceptive}' if not a.fmri_sub else f'{a.out}/{dsub}_as{sub[-2:]}_{a.perceptive}'; os.makedirs(f'{od}/tokens', exist_ok=True); si = SUBS.index(sub)
-    comp = {k: [] for k in ('name', 'sem', 'var', 'perc', 'cls_pred', 'cls_score', 'cls', 'subj_pred', 'tok_pool', 'img')}
+    comp = {k: [] for k in ('name', 'sem', 'var', 'perc', 'cls_pred', 'cls_score', 'cls', 'subj_pred', 'tok_pool', 'img', 'clip', 'vt')}
     for i in range(0, len(ids), a.bs):
         ks = ids[i:i + a.bs]
         x = torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, dsub, 'npy_data', k + '.npy')).astype(np.float32)[FRAMES] for k in ks])).cuda()
@@ -43,9 +44,11 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
         comp['sem'].append(out['sem_vec'].float().cpu()); comp['var'].append(out['var_vec'].float().cpu()); comp['perc'].append(out['perc_vec'].float().cpu())
         sc = (out['sem_clip'].float() @ model.prototypes.t()).cpu(); comp['cls_score'].append(sc)   # CLIP 텍스트 프로토타입과 cos
         comp['cls_pred'].append(sc.argmax(-1)); comp['subj_pred'].append(out['subj_logit'].argmax(-1).cpu())
-        if 'sem_img' in out: comp['img'].append(out['sem_img'].float().cpu())             # 11-10 A안: 예측 이미지 임베딩 (정규화 전)
+        if 'sem_img' in out: comp['img'].append(out['sem_img'].float().cpu())
+        comp['clip'].append(out['sem_clip'].float().cpu())                                  # 11-10: S의 CLIP 벡터 (정규화, 프로토타입 공간)
+        if 'vt' in out: comp['vt'].append(out['vt'].float().mean(1).cpu())               # 11-10: V 예측 (shape면 개체 형상 [cy, w, h, area] 표준화, 프레임 평균)             # 11-10 A안: 예측 이미지 임베딩 (정규화 전)
     np.savez(f'{od}/components.npz', name=np.array(comp['name']), cls=np.array(comp['cls']), classes=np.array(SYN),
-             **{k: torch.cat(comp[k]).numpy() for k in ('sem', 'var', 'perc', 'cls_pred', 'cls_score', 'subj_pred', 'tok_pool', 'img') if comp[k]})
+             **{k: torch.cat(comp[k]).numpy() for k in ('sem', 'var', 'perc', 'cls_pred', 'cls_score', 'subj_pred', 'tok_pool', 'img', 'clip', 'vt') if comp[k]})
     cl = np.array(comp['cls']); kn = cl >= 0
     acc = float((torch.cat(comp['cls_pred']).numpy()[kn] == cl[kn]).mean()) if kn.any() else float('nan')
     print(f'{dsub} ({sub} 갈래) {a.perceptive}: {len(ids)} 물체 → {od}, 범주 정확도 {acc:.3f} (13범주 안 {int(kn.sum())}개)', flush=True)

@@ -8,12 +8,14 @@
 #  --var_heads sil|view (11-09): V = 변하는 정보. build_view_targets.py가 만든 --view_tgt npz(물체 평균 · 프레임별 train 평균을 빼고 train 표준편차로 나눈 값)를 프레임마다 맞춤
 #  --lam_vadv λ (11-09): V에서 범주 정보 빼기 — Variational Features → GRL → 범주 분류기. 분류기 손실은 1배, 앞단으로 가는 기울기는 −λ·s(p) (s = DANN 일정 2/(1+e^(−10p))−1)
 #  --fold k/n (11-09, 토큰 prior용 교차 학습): train 목록(annotations 순서)에서 i % n == k인 물체를 학습에서 뺌 → infer_prism.py --split train --fold k/n로 그 물체의 '안 본' 예측을 만듦
+#  --lam_tc λ · --lam_hsic λ (11-10): S · V · P 분리 — 결합-섞기 판별기(총상관) · RBF CKA 합 (sep_losses.py). 판별기는 모델 밖, latest에만 저장
 #  이전 기준선(prism_nop_feat · value)을 다시 학습하려면 --arch res --sem_clip back --var_heads csr
 import os, sys, math, time, argparse, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from omegaconf import OmegaConf
 from prism import Prism, prism_losses, load_encoder, check_load
+from sep_losses import TCDisc, tc_enc, tc_disc_update, hsic_loss
 
 CLASSES = {'02691156': 'airplane', '02828884': 'bench', '02933112': 'cabinet', '02958343': 'car', '03001627': 'chair', '03211117': 'display',
            '03636649': 'lamp', '03691459': 'loudspeaker', '04090263': 'rifle', '04256520': 'sofa', '04379243': 'table', '04401088': 'telephone',
@@ -45,6 +47,9 @@ p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자�
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
 p.add_argument('--fold', default='')       # 'k/n': train에서 i % n == k 물체를 뺌 (교차 학습). 비우면 전부
 p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
+p.add_argument('--lam_tc', type=float, default=0.0)     # 11-10: > 0이면 결합-섞기 판별기 총상관 손실 가중치 (sep_losses.py A)
+p.add_argument('--lam_hsic', type=float, default=0.0)   # 11-10: > 0이면 갈래 쌍 RBF CKA 합 가중치 (sep_losses.py C, 대조)
+p.add_argument('--tc_lr', type=float, default=1e-4)     # 판별기 학습률 (Adam β 0.5, 0.9)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 if a.seed >= 0:
@@ -123,6 +128,10 @@ print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
               vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film)).to(dev)
 STATE = lambda: model.trainable_state_dict()
+SEP = a.lam_tc > 0 or a.lam_hsic > 0
+disc = TCDisc().to(dev) if a.lam_tc > 0 else None
+d_opt = torch.optim.Adam(disc.parameters(), lr=a.tc_lr, betas=(0.5, 0.9)) if disc is not None else None
+PARTS = lambda o: [o['sem_vec'], o['var_vec'], o['perc_vec']]
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
 print(f'trainable {sum(q.numel() for q in params) / 1e6:.1f}M, subjects {SUBS}, bs {a.bs}, steps {a.max_step}', flush=True)
@@ -149,9 +158,11 @@ step = 0; latest = f'{a.out_dir}/model_latest.pt'
 if a.resume and os.path.exists(latest):
     ck = torch.load(latest, map_location='cpu'); check_load(model, ck['model'])   # 구조 옵션이 다르면 멈춤
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
+    if disc is not None and 'disc' in ck: disc.load_state_dict(ck['disc']); d_opt.load_state_dict(ck['d_opt'])
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
 KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'vt', 'v_adv', 'v_adv_acc', 'subj', 'subj_acc']
-if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']                                   # 끈 학습은 csv 열 그대로
+if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']
+if SEP: KEYS += ['tc', 'd_loss', 'd_acc', 'hsic']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
     log.write('step,split,total,' + ','.join(KEYS) + ',lr\n')
@@ -164,7 +175,8 @@ def to_dev(b):
 
 TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambda L: W['proto'] * L['proto'],
          'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio'] + L['vt']), 'subj': lambda L: W['subj'] * L['subj'],
-         'vadv': lambda L: L['v_adv'], 'img': lambda L: a.lam_img * L['img_cos'] + a.lam_img_nce * L['img_nce']}
+         'vadv': lambda L: L['v_adv'], 'img': lambda L: a.lam_img * L['img_cos'] + a.lam_img_nce * L['img_nce'],
+         'sep': lambda L: a.lam_tc * L.get('tc', 0.0) + a.lam_hsic * L.get('hsic', 0.0)}
 
 
 def total_loss(L):
@@ -172,7 +184,7 @@ def total_loss(L):
 
 
 def write(split, L, tot):
-    log.write(f'{step},{split},{tot:.5f},' + ','.join(f'{float(L[k]):.5f}' for k in KEYS) + f',{sched.get_last_lr()[0]:.3e}\n'); log.flush()
+    log.write(f'{step},{split},{tot:.5f},' + ','.join(f'{float(L.get(k, 0.0)):.5f}' for k in KEYS) + f',{sched.get_last_lr()[0]:.3e}\n'); log.flush()
 
 
 @torch.no_grad()
@@ -183,13 +195,17 @@ def validate():
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
         L = prism_losses(out, b)
+        if SEP and len(b['cls']) > 2:
+            pt = PARTS(out); L['hsic'] = hsic_loss(pt)
+            if disc is not None: L['tc'] = tc_enc(disc, pt); L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt, train=False)
         for k, v in L.items(): acc.setdefault(k, []).append(float(v))
         hit = ((out['sem_clip'].float() @ model.prototypes.t()).argmax(-1) == b['cls']).float()
         for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
     L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
     print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
           f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} '
-          + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
+          + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '')
+          + (f'tc {L.get("tc", 0):.4f} d_acc {L.get("d_acc", 0):.3f} hsic {L.get("hsic", 0):.4f} ' if SEP else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
 
@@ -201,18 +217,25 @@ while not done:
         model.grl_lam = a.lam_vadv * (2 / (1 + math.exp(-10 * step / a.max_step)) - 1)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
-        L = prism_losses(out, b); tot = total_loss(L)
+        L = prism_losses(out, b)
+        if SEP:
+            pt = PARTS(out)
+            if disc is not None: L['tc'] = tc_enc(disc, pt)
+            if a.lam_hsic > 0: L['hsic'] = hsic_loss(pt)
+        tot = total_loss(L)
         opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); sched.step(); step += 1
+        if disc is not None: L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt)   # 본 backward 뒤 (판별기를 먼저 바꾸면 그래프가 깨짐)
         if step % a.print_every == 0:
             write('train', L, float(tot))
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
                   f'vt {float(L["vt"]):.4f} v_adv_acc {float(L["v_adv_acc"]):.3f} grl {model.grl_lam:.3f} '
-                  f'subj_acc {float(L["subj_acc"]):.3f} lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
+                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
         if step % a.val_every == 0: validate()
         if step % a.save_every == 0 or step >= a.max_step:
             torch.save({'model': STATE(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'step': step, 'args': vars(a),
-                        'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, latest + '.tmp')
+                        'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS,
+                        **({'disc': disc.state_dict(), 'd_opt': d_opt.state_dict()} if disc is not None else {})}, latest + '.tmp')
             os.replace(latest + '.tmp', latest); print(f'saved step {step}', flush=True)
         if step >= a.max_step: done = True; break
 validate()
