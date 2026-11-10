@@ -10,7 +10,8 @@ source $(dirname $0)/fe_shape.sh
 FE=${FE:-$W/fair_eval}; PY=$W/venv/bin/python; CK=$W/prism_vshape/vshape_g0/model_final.pt; I=$W/prism_apac/ours
 export FE_PY=$PY FE_WORKERS=${FE_WORKERS:-6}
 trel() { (cd $MG && source $MG/mg_guard.sh && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
-declare -A FS=([AP]=sub-0009 [APAC]=sub-0011) LS=([AP]=$DR/annotations/core_test_list.txt [APAC]=$DR/annotations/apac_list.txt) NN=([AP]=104 [APAC]=220)
+declare -A FS=([AP]=sub-0009 [APAC]=sub-0011) LS=([AP]=$DR/annotations/core_test_list.txt [APAC]=$DR/annotations/apac_sub0011_list.txt) NN=([AP]=104 [APAC]=220) TG=([AP]=AP [APAC]=APAC220)
+# APAC 목록 (11-10 수정): apac_list.txt 220 중 2개(04530566/1eac28fe… · 02933112/1aa76e87…)는 sub-0011 fMRI · 자극 영상에 없고, 대신 sub-0011에 2개(02933112/2b376f6d… · 04530566/fcf21e11…)가 있음 → sub-0011 실제 파일 220개 목록을 씀 (4090 10-24 MinD-3D APAC도 실제 파일 목록). 결과 이름 APAC220
 for x in AP APAC; do
   [ $(find $DR/${FS[$x]}/npy_data -name '*.npy' 2>/dev/null | wc -l) -ge ${NN[$x]} ] || { echo "fMRI 없음: $DR/${FS[$x]}"; exit 1; }
   [ -f ${LS[$x]} ] || { echo "목록 없음 ${LS[$x]}"; exit 1; }
@@ -28,7 +29,7 @@ pps() {   # MinD-3D++ (뒤에서)
         --unet_path $PPS_CKPT --z123 $W/weights/zero123plus-v1.2 --lrm_ckpt $W/weights/InstantMesh/instant_mesh_large.ckpt --out_dir $o > $W/logs/apac_pps_$x.log 2>&1)
     fi
     echo "OBJ pps_$x $(ls $o/meshes/*.obj 2>/dev/null | wc -l)개 $(date +%H:%M:%S)"
-    fe_shape pps_$x $o/meshes obj ${LS[$x]}
+    fe_shape pps_${TG[$x]} $o/meshes obj ${LS[$x]}
   done
 }
 pps & PJ=$!
@@ -39,9 +40,9 @@ for x in AP APAC; do
   [ -f $d/components.npz ] || $PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $CK --out $I --subs sub-0001 --fmri_sub ${FS[$x]} --list ${LS[$x]} --perceptive keep | grep -E "범주|DONE|Error"
   [ $(ls $d/glb/*/*.glb 2>/dev/null | wc -l) -ge ${NN[$x]} ] || trel gen --pred $d/tokens --out $d/glb | grep -E "GEN_DONE|Error"
   echo "GLB ours_$x $(ls $d/glb/*/*.glb 2>/dev/null | wc -l)개 (예상 ${NN[$x]}) $(date +%H:%M:%S)"
-  fe_shape ours_$x $d/glb glb ${LS[$x]}
+  fe_shape ours_${TG[$x]} $d/glb glb ${LS[$x]}
 done
 wait $PJ
-echo "=== 결과"; for n in ours_AP ours_APAC pps_AP pps_APAC; do echo "$n $(grep -E '^P2\|(CD|EMD)\s|^FPD\s|n_objects' $FE/out/$n/values.txt 2>/dev/null | tr '\n' ' ')"; done
-cd $FE && tar cf apac.tar $(ls -d out/{ours,pps}_{AP,APAC}/values.txt 2>/dev/null) && echo "PACK $(tar tf apac.tar | wc -l)개"
+echo "=== 결과"; for n in ours_AP ours_APAC220 pps_AP pps_APAC220; do echo "$n $(grep -E '^P2\|(CD|EMD)\s|^FPD\s|n_objects' $FE/out/$n/values.txt 2>/dev/null | tr '\n' ' ')"; done
+cd $FE && tar cf apac.tar $(ls -d out/{ours,pps}_{AP,APAC220}/values.txt 2>/dev/null) && echo "PACK $(tar tf apac.tar | wc -l)개"
 echo "=== APAC_DONE $(date +%H:%M:%S)"
