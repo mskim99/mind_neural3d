@@ -13,6 +13,7 @@
 #    var_mode  'feat' head의 LayerNorm 특징 → Aggregate / 'value' head가 낸 값 → MLP 임베딩 (11-06 비교 결과 feat 권고)
 #  피험자: ViT · Semantic · Variational은 피험자별(자기 데이터로만 학습), Temporal Stem · SV Encoder · Perceptive(FiLM) · 디코더는 공유
 #  읽는 체크포인트: per_subject 1 · temporal 1 · P 없음 (c7ae1f8 이후). P가 있던 이전 체크포인트(prism_shape_ps7 등)는 못 읽음 (지표는 이미 있음)
+#  11-11 P = 버리는 나머지 (사용자 제안, `.보고 자료/261112_9차보고/PRISM_분리/P나머지_설계.md`): film 0(디코더에 P 안 넣음) + 피험자 간 일치 손실 + remainder(P가 나머지 복원)
 #  구조도에 없어 정한 것: ConvNeXt 블록 수 2 · 채널 512, head 은닉 256, SV Encoder 뒤 MLP 은닉 1024, Perceptive 입력 방식 FiLM
 import torch
 import torch.nn as nn
@@ -131,7 +132,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False):
         super().__init__()
         self.use_film = film                                                # False: ablation — Perceptive FiLM 보정 끔 (모듈은 남기되 안 씀)
         assert sum(splits) == d
@@ -186,6 +187,9 @@ class Prism(nn.Module):
         self.subj_proj = nn.Sequential(nn.Linear(dp, 256), nn.BatchNorm1d(256), nn.GELU())
         self.subj_cls = nn.Linear(256, max(n_subjects, 1))
         self.film = nn.Linear(256, 2 * dc); nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)   # 처음엔 보정 없음
+        if remainder:                                                       # 11-11 P = 나머지: 고정 ViT 특징 중 S · V로 설명 안 되는 부분을 P가 복원 (sep_losses.rem_losses)
+            self.rem_g = nn.Sequential(nn.Linear(2 * dc, 1024), nn.GELU(), nn.Linear(1024, d))   # [S ; V](기울기 끊음) → 인코더 특징
+            self.rem_r = nn.Sequential(nn.Linear(dp, 1024), nn.GELU(), nn.Linear(1024, d))       # P → 나머지
         # 재구성 (TRELLIS 조건 토큰, 공유)
         self.type_emb = nn.Parameter(torch.zeros(2, dc))                 # Semantic / Variational 토큰 구분
         self.time_emb = nn.Embedding(n_frames, dc)
@@ -223,6 +227,7 @@ class Prism(nn.Module):
             subj = torch.zeros(fmri.shape[0], dtype=torch.long, device=fmri.device)
         tok = self.encode_frames(fmri, subj).float()
         B, T, N, D = tok.shape
+        enc_vec = tok.mean((1, 2)).detach()                                          # 고정 ViT 특징 (프레임 · 패치 평균), 나머지 복원 정답
         if self.arch == 'fig':
             x = self.temporal(tok, self.frame_emb(frame_idx))                        # LN → + Frame Emb. → 프레임 축 conv
         else:
@@ -266,6 +271,8 @@ class Prism(nn.Module):
             pv = pv.mean(0, keepdim=True).expand_as(pv) if isinstance(perceptive_override, str) else perceptive_override
         h = self.subj_proj(pv)
         out['subj_logit'] = self.subj_cls(h); out['perc_vec'] = pv
+        if hasattr(self, 'rem_g'):
+            out['enc_vec'] = enc_vec; out['rem_sv'] = self.rem_g(torch.cat([out['sem_vec'], out['var_vec']], -1).detach()); out['rem_p'] = self.rem_r(pv)
         # 재구성 (공유): [Semantic ; Variational] Features (Perceptive FiLM 보정) → 조건 토큰
         mem = torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
         if self.use_film:
@@ -297,7 +304,7 @@ def build_from_ckpt(ck, repo):
                   sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'),
                   vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
-                  film=bool(int(args.get('film', 1))))
+                  film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0)
     check_load(model, ck['model'])
     return model
 

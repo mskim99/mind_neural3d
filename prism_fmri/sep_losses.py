@@ -69,3 +69,23 @@ def hsic_loss(parts):
     """갈래 쌍 RBF CKA 합 (S-V, S-P, V-P)."""
     s, v, p = parts
     return rbf_cka(s, v) + rbf_cka(s, p) + rbf_cka(v, p)
+
+
+# ---- 11-11 P = 버리는 나머지 (`.보고 자료/261112_9차보고/PRISM_분리/P나머지_설계.md`)
+def share_loss(z, obj, temp=0.07):
+    """피험자 간 일치 (대조 손실): 같은 물체 · 다른 피험자의 벡터가 양성, 배치 안 다른 물체가 음성. z [B, D], obj [B] 물체 번호.
+    배치에 같은 물체가 2번 이상 있어야 함 (PairedBatches). 반환 (손실, 양성을 1등으로 고른 비율)."""
+    z = F.normalize(z.float(), dim=-1); lg = z @ z.t() / temp
+    eye = torch.eye(len(z), dtype=torch.bool, device=z.device); pos = (obj[:, None] == obj[None]) & ~eye
+    assert pos.any(1).all(), '짝 없는 표본이 있음 (같은 물체가 배치에 한 번뿐)'
+    lg = lg.masked_fill(eye, float('-inf')); lp = lg.log_softmax(-1)
+    loss = -(lp.masked_fill(~pos, 0).sum(1) / pos.sum(1)).mean()
+    return loss, pos.gather(1, lg.argmax(-1, keepdim=True)).float().mean()
+
+
+def rem_losses(out):
+    """P = 나머지: 정답 h = 고정 ViT 특징(표본마다 LayerNorm). rem_sv = g([S ; V], 기울기 끊음) → h, rem_p = r(P) → h − g(...) (g 쪽 기울기 끊음).
+    반환 (L_g, L_rem, S · V만의 설명 비율, P를 더한 설명 비율). S · V 갈래에는 기울기가 가지 않음 (P 채널 · 공유 앞단에는 감)."""
+    h = F.layer_norm(out['enc_vec'].float(), out['enc_vec'].shape[-1:]); g = out['rem_sv'].float(); r = out['rem_p'].float()
+    lg = F.mse_loss(g, h); lr_ = F.mse_loss(g.detach() + r, h); var = h.var(0).mean().clamp_min(1e-8) if len(h) > 1 else h.new_tensor(1.0)
+    return lg, lr_, 1 - lg.detach() / var, 1 - lr_.detach() / var

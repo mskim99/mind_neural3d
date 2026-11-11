@@ -15,7 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from omegaconf import OmegaConf
 from prism import Prism, prism_losses, load_encoder, check_load
-from sep_losses import TCDisc, tc_enc, tc_disc_update, hsic_loss
+from sep_losses import TCDisc, tc_enc, tc_disc_update, hsic_loss, share_loss, rem_losses
 
 CLASSES = {'02691156': 'airplane', '02828884': 'bench', '02933112': 'cabinet', '02958343': 'car', '03001627': 'chair', '03211117': 'display',
            '03636649': 'lamp', '03691459': 'loudspeaker', '04090263': 'rifle', '04256520': 'sofa', '04379243': 'table', '04401088': 'telephone',
@@ -50,6 +50,12 @@ p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encod
 p.add_argument('--lam_tc', type=float, default=0.0)     # 11-10: > 0이면 결합-섞기 판별기 총상관 손실 가중치 (sep_losses.py A)
 p.add_argument('--lam_hsic', type=float, default=0.0)   # 11-10: > 0이면 갈래 쌍 RBF CKA 합 가중치 (sep_losses.py C, 대조)
 p.add_argument('--tc_lr', type=float, default=1e-4)     # 판별기 학습률 (Adam β 0.5, 0.9)
+p.add_argument('--lam_share', type=float, default=0.0)   # 11-11: > 0이면 피험자 간 일치 손실 (같은 물체 · 다른 피험자의 S(· V)를 가깝게, sep_losses.share_loss) → 짝 배치
+p.add_argument('--share_on', default='s', choices=['s', 'sv'])   # 일치 손실을 거는 갈래: S(sem_vec)만 / S · V(var_vec) 둘 다
+p.add_argument('--share_temp', type=float, default=0.07)
+p.add_argument('--paired', type=int, default=0, choices=[0, 1])   # 1: 짝 배치만 (일치 손실 없이, 배치 구성 대조군). lam_share > 0이면 자동으로 짝 배치
+p.add_argument('--pair_k', type=int, default=2)           # 물체 하나를 배치에 넣는 피험자 수 (bs 14 → 물체 7 × 피험자 2)
+p.add_argument('--lam_rem', type=float, default=0.0)      # 11-11: > 0이면 P = 나머지 복원 (sep_losses.rem_losses), S · V 갈래에는 기울기 안 감
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 if a.seed >= 0:
@@ -81,11 +87,14 @@ def ratio_target(uid):
     return np.array(ext, np.float32), True
 
 
+OBJ = {}   # 물체 이름 → 번호 (일치 손실의 짝 찾기용, ShapeSet이 작업자를 띄우기 전에 채움)
+
+
 def load_item(si, k):
     syn, uid = k.split('/')
     x = np.load(os.path.join(a.data_root, SUBS[si], 'npy_data', k + '.npy')).astype(np.float32)[FRAMES]
     t = np.load(f'{a.tgt}/targets/{uid}.npz'); vf = [min(191, round(19.2 * f)) for f in FRAMES]
-    return {'fmri': torch.from_numpy(x), 'frame_idx': torch.tensor(FRAMES), 'cls': SYN.index(syn), 'subj': si,
+    return {'fmri': torch.from_numpy(x), 'frame_idx': torch.tensor(FRAMES), 'cls': SYN.index(syn), 'subj': si, 'obj': OBJ[k],
             'cond_tokens': torch.from_numpy(np.load(f'{a.tgt}/dino/{uid}.npy')),
             'center': torch.from_numpy(np.stack([t['cx'][vf], t['cy'][vf]], -1)), 'scale': torch.from_numpy(t['scale'][vf]),
             'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k,
@@ -101,6 +110,7 @@ class ShapeSet(Dataset):
             fk, fn = map(int, a.fold.split('/')); ids = [k for i, k in enumerate(ids) if i % fn != fk]   # 목록 순서 기준 (infer_prism.py --fold와 같음)
         ids = [k for k in ids if os.path.exists(f'{a.tgt}/dino/{k.split("/")[1]}.npy')]
         ids = ids[:a.limit] if a.limit else ids
+        for k in ids: OBJ.setdefault(k, len(OBJ))
         self.items = [(si, k) for si, s in enumerate(SUBS) for k in ids
                       if os.path.exists(os.path.join(a.data_root, s, 'npy_data', k + '.npy'))]
         print(f'[{split}] {len(ids)} objects × {len(SUBS)} subjects = {len(self.items)}', flush=True)
@@ -126,7 +136,7 @@ ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
 enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
@@ -151,8 +161,29 @@ class BalancedBatches(torch.utils.data.Sampler):
             yield [int(i) for s in sorted(perm) for i in perm[s][b * self.per:(b + 1) * self.per]]
 
 
+class PairedBatches(torch.utils.data.Sampler):
+    """11-11 짝 배치: 배치 = 물체 (bs / k)개 × 피험자 k명. 물체 j는 피험자 순열의 (j + c·shift)번째 k명에게서 가져옴 →
+    물체 수가 피험자 수의 배수면 배치 안 피험자 수가 같음 (bs 14 · k 2 · 7명 → 피험자마다 2개). 모든 피험자에 있는 물체만 씀."""
+    def __init__(self, items, bs, k):
+        self.idx = {}
+        for i, (si, key) in enumerate(items): self.idx.setdefault(key, {})[si] = i
+        self.S = sorted({si for si, _ in items}); self.keys = [key for key, d in self.idx.items() if len(d) == len(self.S)]
+        assert 2 <= k <= len(self.S) and bs % k == 0, f'bs {bs} · pair_k {k} · 피험자 {len(self.S)}'
+        self.k = k; self.m = bs // k; self.n = len(self.keys) // self.m
+        print(f'[pair] 물체 {len(self.keys)} (전 피험자 공통) · 배치 = 물체 {self.m} × 피험자 {k} · 한 바퀴 {self.n} 배치', flush=True)
+    def __len__(self): return self.n
+    def __iter__(self):
+        order = np.random.permutation(len(self.keys)); ns = len(self.S)
+        for b in range(self.n):
+            sp = np.random.permutation(self.S); sh = np.random.randint(1, ns) if ns > self.k else 1; out = []
+            for j, oi in enumerate(order[b * self.m:(b + 1) * self.m]):
+                for c in range(self.k): out.append(int(self.idx[self.keys[oi]][int(sp[(j + c * sh) % ns])]))
+            yield out
+
+
+PAIRED = a.paired == 1 or a.lam_share > 0
 train_set = ShapeSet('train')
-tl = DataLoader(train_set, batch_sampler=BalancedBatches(train_set.items, a.bs), num_workers=a.workers, persistent_workers=True)
+tl = DataLoader(train_set, batch_sampler=(PairedBatches(train_set.items, a.bs, a.pair_k) if PAIRED else BalancedBatches(train_set.items, a.bs)), num_workers=a.workers, persistent_workers=True)
 vl = DataLoader(ShapeSet('test'), batch_size=a.bs, shuffle=False, num_workers=a.workers)
 step = 0; latest = f'{a.out_dir}/model_latest.pt'
 if a.resume and os.path.exists(latest):
@@ -162,6 +193,7 @@ if a.resume and os.path.exists(latest):
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
 KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'vt', 'v_adv', 'v_adv_acc', 'subj', 'subj_acc']
 if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']
+if PAIRED or a.lam_rem > 0: KEYS += ['share_s', 'share_s_acc', 'share_v', 'share_v_acc', 'rem_g', 'rem', 'rem_r2_sv', 'rem_r2_svp']   # 11-11 P = 나머지
 if SEP: KEYS += ['tc', 'd_loss', 'd_acc', 'hsic']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
@@ -176,7 +208,17 @@ def to_dev(b):
 TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambda L: W['proto'] * L['proto'],
          'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio'] + L['vt']), 'subj': lambda L: W['subj'] * L['subj'],
          'vadv': lambda L: L['v_adv'], 'img': lambda L: a.lam_img * L['img_cos'] + a.lam_img_nce * L['img_nce'],
-         'sep': lambda L: a.lam_tc * L.get('tc', 0.0) + a.lam_hsic * L.get('hsic', 0.0)}
+         'sep': lambda L: a.lam_tc * L.get('tc', 0.0) + a.lam_hsic * L.get('hsic', 0.0),
+         'share': lambda L: a.lam_share * (L.get('share_s', 0.0) + (L.get('share_v', 0.0) if a.share_on == 'sv' else 0.0)),
+         'rem': lambda L: a.lam_rem * (L.get('rem_g', 0.0) + L.get('rem', 0.0))}
+
+
+def prem_losses(out, b, L, paired):
+    """11-11: 일치 손실(짝 배치일 때만. V 값은 share_on과 상관없이 기록) · 나머지 복원."""
+    if paired:
+        L['share_s'], L['share_s_acc'] = share_loss(out['sem_vec'], b['obj'], a.share_temp)
+        L['share_v'], L['share_v_acc'] = share_loss(out['var_vec'], b['obj'], a.share_temp)
+    if a.lam_rem > 0: L['rem_g'], L['rem'], L['rem_r2_sv'], L['rem_r2_svp'] = rem_losses(out)
 
 
 def total_loss(L):
@@ -194,7 +236,7 @@ def validate():
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
-        L = prism_losses(out, b)
+        L = prism_losses(out, b); prem_losses(out, b, L, False)
         if SEP and len(b['cls']) > 2:
             pt = PARTS(out); L['hsic'] = hsic_loss(pt)
             if disc is not None: L['tc'] = tc_enc(disc, pt); L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt, train=False)
@@ -217,7 +259,7 @@ while not done:
         model.grl_lam = a.lam_vadv * (2 / (1 + math.exp(-10 * step / a.max_step)) - 1)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
-        L = prism_losses(out, b)
+        L = prism_losses(out, b); prem_losses(out, b, L, PAIRED)
         if SEP:
             pt = PARTS(out)
             if disc is not None: L['tc'] = tc_enc(disc, pt)
@@ -230,7 +272,7 @@ while not done:
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
                   f'vt {float(L["vt"]):.4f} v_adv_acc {float(L["v_adv_acc"]):.3f} grl {model.grl_lam:.3f} '
-                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
+                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
         if step % a.val_every == 0: validate()
         if step % a.save_every == 0 or step >= a.max_step:
             torch.save({'model': STATE(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'step': step, 'args': vars(a),
