@@ -6,7 +6,8 @@
 #         없으면 렌더부터 전부. 예측 폴더가 없거나 104개 미만이면 건너뜀. PAR개씩 동시에 (CPU 위주, 렌더만 GPU)
 #  기본 SETS = 확인값(MinD-3D++ 공개 가중치 추론) + 이미 v1로 잰 Ours 기준 행들
 #  → $W/fair_eval_v2/out/<이름>/values.txt (frame · 8지표), 묶음 $W/fair_eval_v2/v2_ours.tar (V2_OURS_DONE)
-# 사용: [SETS="…"] [PAR=3] nohup bash run_v2_ours.sh > $W/logs/v2_ours.log 2>&1 < /dev/null & disown
+#  WAIT=1이면 예측이 104개가 될 때까지 기다렸다가 시작 (GLB 생성과 같이 띄울 때). TAR=<이름>으로 묶음 이름을 바꿈
+# 사용: [SETS="…"] [PAR=3] [WAIT=1] nohup bash run_v2_ours.sh > $W/logs/v2_ours.log 2>&1 < /dev/null & disown
 source $(dirname $0)/common.sh || exit 1
 FE1=$W/fair_eval; FE2=$W/fair_eval_v2; PAR=${PAR:-3}; G=$CUDA_VISIBLE_DEVICES
 export FE_PY=$W/venv/bin/python FE_BLENDER=${FE_BLENDER:-$W/tools/blender-4.2.3-linux-x64/blender} FE_WORKERS=${FE_WORKERS:-8} FE_THREADS=${FE_THREADS:-8} TORCH_HOME=$W/cache/torch
@@ -22,7 +23,11 @@ mkdir -p $FE2/gt_render $FE2/gt_pc_y $FE2/out
 cd $W/run
 one() {   # 이름 · 폴더 · 형식 · v1 이름
   local n=$1 d=$2 f=$3 v1=$4 c
-  if [ $f = glb ]; then c=$(ls $d/*/*.glb 2>/dev/null | wc -l); else c=$(ls $d/*.obj 2>/dev/null | wc -l); fi
+  cntp() { if [ $f = glb ]; then ls $d/*/*.glb 2>/dev/null | wc -l; else ls $d/*.obj 2>/dev/null | wc -l; fi; }
+  c=$(cntp)
+  if [ $c -lt 104 ] && [ "${WAIT:-0}" = 1 ]; then   # WAIT=1: GLB 생성이 아직 도는 세트는 104개가 될 때까지 기다림 (마지막 파일이 다 써지게 1분 더)
+    echo "기다림 $n ($c/104) $(date +%H:%M:%S)"; until [ $(cntp) -ge 104 ]; do sleep 60; done; sleep 60; c=$(cntp)
+  fi
   [ $c -ge 104 ] || { echo "건너뜀 $n (예측 $c개, $d)"; return; }
   if [ ! -f $FE2/out/$n/values.txt ]; then
     mkdir -p $FE2/out/$n; local skip=0
@@ -40,5 +45,5 @@ for s in $SETS; do
   one $n $d $f $v1 &
 done
 wait
-cd $FE2 && tar cf v2_ours.tar $(ls -d out/*/values.txt out/*/frame.txt out/*/logs/frame.log 2>/dev/null) && echo "PACK $(tar tf v2_ours.tar | wc -l)개"
+cd $FE2 && tar cf ${TAR:-v2_ours}.tar $(ls -d out/*/values.txt out/*/frame.txt out/*/logs/frame.log 2>/dev/null) && echo "PACK ${TAR:-v2_ours}.tar $(tar tf ${TAR:-v2_ours}.tar | wc -l)개"
 echo "=== V2_OURS_DONE $(date +%H:%M:%S)"
