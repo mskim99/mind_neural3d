@@ -103,6 +103,7 @@ def sdedit(slat0, cond2, t0):   # 정규화 공간에서 t0까지 노이즈 → 
 def generate(cond, cond2, z=None):
     if z is not None:   # TRELLIS sample_sparse_structure의 마지막 줄과 같은 식
         coords = torch.argwhere(pipe.models['sparse_structure_decoder'](z) > 0)[:, [0, 2, 3, 4]].int()
+        if len(coords) == 0: return None   # 빈 형상 (prior 생성 z) → 호출한 쪽에서 건너뜀
     else:
         coords = pipe.sample_sparse_structure(cond, 1)
     if TP is not None:
@@ -230,6 +231,7 @@ else:
         torch.manual_seed(a.seed)
         with torch.no_grad():
             outs = generate(cond, cond2, z)
+        if outs is None: print('빈 형상', name, flush=True); continue
         os.makedirs(od, exist_ok=True)
         glb = postprocessing_utils.to_glb(outs['gaussian'][0], outs['mesh'][0], simplify=0.95, texture_size=1024, verbose=False)
         glb.export(f'{od}/{name}.glb')

@@ -17,7 +17,15 @@ json.dump(J, open('$D/pred_cls.json', 'w'), indent=1); print('물체', len(J), '
 step "1 형상 잠재 (CFG ${CFG:-3.0})"
 $PY $PR/prior_ss.py sample --ss $O/ss --ckpt $CK --out $D/z --cls_json $D/pred_cls.json --temp 1.0 --cfg ${CFG:-3.0} | grep -E "생성|Error"
 step "2 glb (외형 = 텍스트판, A 텍스트판과 같은 문장)"
-trel gen --ss_z $D/z --slat_text $F/prompt.json --out $D/glb | grep -E "GEN_DONE|Error|없음"
+trel gen --ss_z $D/z --slat_text $F/prompt.json --out $D/glb | grep -E "GEN_DONE|Error|없음|빈 형상"
+for k in 1 2 3; do   # 빈 형상은 그 물체만 seed를 바꿔 다시 뽑음 (정답을 보지 않는 규칙)
+  $PY -c "
+import json, os; J = json.load(open('$D/pred_cls.json')); M = {n: c for n, c in J.items() if not os.path.exists(f'$D/glb/{n}/{n}.glb')}
+json.dump(M, open('$D/retry.json', 'w')); print('빈 형상 다시 뽑기', len(M))"
+  [ "$(cat $D/retry.json)" = "{}" ] && break
+  $PY $PR/prior_ss.py sample --ss $O/ss --ckpt $CK --out $D/z --cls_json $D/retry.json --temp 1.0 --cfg ${CFG:-3.0} --seed $k | grep -E "생성|Error"
+  trel gen --ss_z $D/z --slat_text $F/prompt.json --out $D/glb | grep -E "GEN_DONE|Error|빈 형상"
+done
 echo "glb $(ls $D/glb/*/*.glb | wc -l)"
 step "3 공정평가 (잠정 R2 · P2 · FPD)"
 bash $FE/run_check.sh B_ss${TAG:-_cL}_s1 $D/glb glb $GPU > $FE/logs/B_ss${TAG:-_cL}_s1.log 2>&1
