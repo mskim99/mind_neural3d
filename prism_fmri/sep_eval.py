@@ -5,6 +5,7 @@
 #  ② 피험자 누수 : S · V · P → 피험자 (같은 탐침, 같은 겹) — 피험자 2명 이상일 때만
 #  ③ 형상 누수   : S · V · P → V 정답 [cy, w, h, area] ridge R² (같은 겹)
 #  ④ 독립성      : 갈래 쌍 선형 CKA · RBF CKA (모든 표본) + 같은 피험자 안에서 물체를 섞은 기준선 (편향 추정량이라 독립이어도 0 아님)
+#  (11-11) components.npz에 tok_pool(infer_prism.py --tok_pool 1)이 있으면 예측 토큰 요약도 같은 탐침 → 'tok' 줄
 #  ⑤ 유효 랭크   : 갈래별 · 노름 1로 맞춰 붙인 것 (Roy & Vetterli 2007)
 #  탐침 정규화 세기는 몇 값 중 가장 높은 test 겹 값을 냄 → 누수를 크게 잡는 쪽(보수적). 우연 = 가장 많은 라벨 비율
 # 사용: python sep_eval.py --comp <a/components.npz> [<b/components.npz> …] --vt <view_targets_shape.npz> --out <json> [--name 이름]
@@ -18,12 +19,15 @@ a = p.parse_args()
 torch.manual_seed(a.seed); rng = np.random.RandomState(a.seed)
 
 # ---- 읽기: 피험자마다 components.npz, 물체 이름으로 묶음
-X = {k: [] for k in ('sem', 'var', 'perc')}; cls, subj, obj = [], [], []
+X = {k: [] for k in ('sem', 'var', 'perc')}; cls, subj, obj = [], [], []; TOK = []
 for si, f in enumerate(a.comp):
     z = np.load(f, allow_pickle=True); n = len(z['name'])
     for k in X: X[k].append(z[k].astype(np.float64))
+    if 'tok_pool' in z.files: TOK.append(z['tok_pool'].astype(np.float32).reshape(n, -1))
     cls += list(z['cls']); subj += [si] * n; obj += [str(s) for s in z['name']]
 X = {k: np.concatenate(v) for k, v in X.items()}; cls = np.array(cls); subj = np.array(subj); obj = np.array(obj)
+if len(TOK) == len(a.comp):   # 11-11 검토 반영: 갈래 평균 벡터만 보면 디코더가 쓰는 토큰의 피험자 정보를 놓침 → 예측 토큰 요약도 탐침 (고정 무작위 투영 1024차원, 라벨 안 씀)
+    T_ = np.concatenate(TOK); X['tok'] = (T_ @ np.random.RandomState(1).randn(T_.shape[1], 1024).astype(np.float32) / np.sqrt(T_.shape[1])).astype(np.float64)
 keep = cls >= 0; X = {k: v[keep] for k, v in X.items()}; cls, subj, obj = cls[keep], subj[keep], obj[keep]
 N = len(cls); uo = np.unique(obj); perm = rng.permutation(len(uo)); fold_of = {o: i % a.folds for i, o in enumerate(uo[perm])}
 fold = np.array([fold_of[o] for o in obj])
@@ -102,7 +106,7 @@ R = {'name': a.name, 'n': N, 'n_subj': len(a.comp), 'n_obj': int(len(uo)), 'chan
 #  → 원 특징('')과 피험자 평균을 뺀 특징('_c') 둘 다 판정. 분리 비교는 '_c'로 (Slot3D 11-05: 평균만 빼면 피험자 정보 사라짐)
 def judge(X, T):
     Q = {}
-    for k in ('sem', 'var', 'perc'):
+    for k in [k for k in ('sem', 'var', 'perc', 'tok') if k in X]:
         Q[f'cls_lin_{k}'] = probe(X[k], cls, 'lin'); Q[f'cls_mlp_{k}'] = probe(X[k], cls, 'mlp')
         if len(a.comp) > 1:
             Q[f'subj_lin_{k}'] = probe(X[k], subj, 'lin'); Q[f'subj_mlp_{k}'] = probe(X[k], subj, 'mlp')
@@ -127,7 +131,7 @@ def judge(X, T):
         Q[f'cka_lin_{x}_{y}_base'] = float(np.mean(bl)); Q[f'cka_rbf_{x}_{y}_base'] = float(np.mean(br))
     print('SEP|CKA 섞은 기준선 선형 S-V {:.3f} S-P {:.3f} V-P {:.3f} | RBF S-V {:.3f} S-P {:.3f} V-P {:.3f}'.format(
         Q['cka_lin_sem_var_base'], Q['cka_lin_sem_perc_base'], Q['cka_lin_var_perc_base'], Q['cka_rbf_sem_var_base'], Q['cka_rbf_sem_perc_base'], Q['cka_rbf_var_perc_base']), flush=True)
-    nb = {k: v / np.linalg.norm(v - v.mean(0)) for k, v in X.items()}
+    nb = {k: X[k] / np.linalg.norm(X[k] - X[k].mean(0)) for k in ('sem', 'var', 'perc')}
     Q['erank_sum'] = sum(erank(nb[k]) for k in nb); Q['erank_joint'] = erank(np.hstack([nb[k] for k in ('sem', 'var', 'perc')]))
     print('SEP|CKA 선형 S-V {:.3f} S-P {:.3f} V-P {:.3f} | RBF S-V {:.3f} S-P {:.3f} V-P {:.3f} | 유효 랭크 합 {:.1f} vs 붙임 {:.1f} | 우연 범주 {:.3f}'.format(
         Q['cka_lin_sem_var'], Q['cka_lin_sem_perc'], Q['cka_lin_var_perc'], Q['cka_rbf_sem_var'], Q['cka_rbf_sem_perc'], Q['cka_rbf_var_perc'],

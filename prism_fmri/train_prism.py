@@ -53,6 +53,7 @@ p.add_argument('--tc_lr', type=float, default=1e-4)     # 판별기 학습률 (A
 p.add_argument('--lam_share', type=float, default=0.0)   # 11-11: > 0이면 피험자 간 일치 손실 (같은 물체 · 다른 피험자의 S(· V)를 가깝게, sep_losses.share_loss) → 짝 배치
 p.add_argument('--share_on', default='s', choices=['s', 'sv'])   # 일치 손실을 거는 갈래: S(sem_vec)만 / S · V(var_vec) 둘 다
 p.add_argument('--share_temp', type=float, default=0.07)
+p.add_argument('--share_warm', type=int, default=2000)   # 일치 손실 세기를 이 스텝 동안 0 → λ로 올림 (검토: 초기 기울기가 토큰 손실보다 훨씬 큼)
 p.add_argument('--paired', type=int, default=0, choices=[0, 1])   # 1: 짝 배치만 (일치 손실 없이, 배치 구성 대조군). lam_share > 0이면 자동으로 짝 배치
 p.add_argument('--pair_k', type=int, default=2)           # 물체 하나를 배치에 넣는 피험자 수 (bs 14 → 물체 7 × 피험자 2)
 p.add_argument('--lam_rem', type=float, default=0.0)      # 11-11: > 0이면 P = 나머지 복원 (sep_losses.rem_losses), S · V 갈래에는 기울기 안 감
@@ -209,7 +210,7 @@ TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambd
          'var': lambda L: W['var'] * (L['center'] + L['scale'] + L['rot'] + L['ratio'] + L['vt']), 'subj': lambda L: W['subj'] * L['subj'],
          'vadv': lambda L: L['v_adv'], 'img': lambda L: a.lam_img * L['img_cos'] + a.lam_img_nce * L['img_nce'],
          'sep': lambda L: a.lam_tc * L.get('tc', 0.0) + a.lam_hsic * L.get('hsic', 0.0),
-         'share': lambda L: a.lam_share * (L.get('share_s', 0.0) + (L.get('share_v', 0.0) if a.share_on == 'sv' else 0.0)),
+         'share': lambda L: a.lam_share * min(1.0, step / max(1, a.share_warm)) * (L.get('share_s', 0.0) + (L.get('share_v', 0.0) if a.share_on == 'sv' else 0.0)),
          'rem': lambda L: a.lam_rem * (L.get('rem_g', 0.0) + L.get('rem', 0.0))}
 
 
@@ -232,22 +233,34 @@ def write(split, L, tot):
 @torch.no_grad()
 def validate():
     model.eval(); acc = {}; per = {}
+    G = {k: [] for k in ('sem_vec', 'var_vec', 'obj', 'subj', 'enc_vec', 'rem_sv', 'rem_p')}   # 11-11: val은 배치가 피험자 순이라 짝이 없음 → 다 모아 끝에 한 번
     for b in vl:
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
-        L = prism_losses(out, b); prem_losses(out, b, L, False)
+        L = prism_losses(out, b)
+        if PAIRED or a.lam_rem > 0:
+            for k in G: G[k].append((out[k] if k in out else b[k]).float().cpu()) if (k in out or k in b) else None
         if SEP and len(b['cls']) > 2:
             pt = PARTS(out); L['hsic'] = hsic_loss(pt)
             if disc is not None: L['tc'] = tc_enc(disc, pt); L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt, train=False)
         for k, v in L.items(): acc.setdefault(k, []).append(float(v))
         hit = ((out['sem_clip'].float() @ model.prototypes.t()).argmax(-1) == b['cls']).float()
         for si in b['subj'].unique().tolist(): per.setdefault(si, []).extend(hit[b['subj'] == si].tolist())
-    L = {k: float(np.mean(v)) for k, v in acc.items()}; tot = float(total_loss(L)); write('val', L, tot)
+    L = {k: float(np.mean(v)) for k, v in acc.items()}
+    if G['obj']:                                                                 # 같은 물체 · 다른 피험자 검색 top-1 (다른 피험자 표본 중에서), 전체 표본 분산 기준 설명 비율
+        o_ = torch.cat(G['obj']); s_ = torch.cat(G['subj'])
+        for nm, key in (('share_s_acc', 'sem_vec'), ('share_v_acc', 'var_vec')):
+            z = torch.nn.functional.normalize(torch.cat(G[key]), dim=-1); sim = (z @ z.t()).masked_fill(s_[:, None] == s_[None], -2.0)
+            L[nm] = float((o_[sim.argmax(-1)] == o_).float().mean())
+        if G['enc_vec']:
+            h = torch.cat(G['enc_vec']); h = torch.nn.functional.layer_norm(h, h.shape[-1:]); g = torch.cat(G['rem_sv']); r = torch.cat(G['rem_p']); var = h.var(0).mean()
+            L['rem_g'] = float(((g - h) ** 2).mean()); L['rem'] = float(((g + r - h) ** 2).mean()); L['rem_r2_sv'] = float(1 - L['rem_g'] / var); L['rem_r2_svp'] = float(1 - L['rem'] / var)
+    tot = float(total_loss(L)); write('val', L, tot)
     print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
           f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} '
           + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '')
-          + (f'tc {L.get("tc", 0):.4f} d_acc {L.get("d_acc", 0):.3f} hsic {L.get("hsic", 0):.4f} ' if SEP else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
+          + (f'tc {L.get("tc", 0):.4f} d_acc {L.get("d_acc", 0):.3f} hsic {L.get("hsic", 0):.4f} ' if SEP else '') + (f'검색 S {L.get("share_s_acc", 0):.3f} V {L.get("share_v_acc", 0):.3f} rem R2 {L.get("rem_r2_sv", 0):.2f}>{L.get("rem_r2_svp", 0):.2f} ' if PAIRED or a.lam_rem > 0 else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
 
