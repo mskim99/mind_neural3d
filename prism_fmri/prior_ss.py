@@ -16,6 +16,7 @@ p.add_argument('--temp', type=float, default=1.0); p.add_argument('--seed', type
 p.add_argument('--cond', type=int, default=0)            # train: 1이면 범주 조건 (11-11, uid 앞 synset → 임베딩, 시간 임베딩에 더함)
 p.add_argument('--p_uncond', type=float, default=0.1)    # train: 범주를 '없음'으로 바꾸는 비율 (CFG용)
 p.add_argument('--cfg', type=float, default=1.0)         # sample: v = v_없음 + cfg · (v_범주 − v_없음), 1이면 조건만
+p.add_argument('--cls_json', default='')                 # sample (11-11): {이름: synset} → 이름마다 그 범주로 하나씩, <out>/<이름>.npy (--n 무시)
 a = p.parse_args()
 dev = 'cuda'; C, R, PS = 8, 16, 2; L = (R // PS) ** 3; CP = C * PS ** 3
 
@@ -104,7 +105,13 @@ else:
     net = DiT(ar['width'], ar['depth'], ar['heads'], 0.0, NC).to(dev).eval(); net.load_state_dict(ck['net'])
     MU, SD = ck['MU'].to(dev), ck['SD'].to(dev); os.makedirs(a.out, exist_ok=True)
     g = torch.Generator(device=dev).manual_seed(a.seed); ts = torch.linspace(1, 0, a.n_steps + 1, device=dev)
-    yall = torch.arange(a.n, device=dev) % max(NC, 1); gcls = {}   # 범주 조건이면 gen_k의 범주 = k mod 범주 수
+    if a.cls_json:
+        CJ = json.load(open(a.cls_json)); names = list(CJ); a.n = len(names)
+        yall = torch.tensor([CLASSES.index(CJ[n]) for n in names], device=dev)
+    else:
+        names = [f'gen_{k:04d}' for k in range(a.n)]
+        yall = torch.arange(a.n, device=dev) % max(NC, 1)   # 범주 조건이면 gen_k의 범주 = k mod 범주 수
+    gcls = {}
     for b in range(0, a.n, 32):
         B = min(32, a.n - b); x = a.temp * torch.randn(B, C, R, R, R, device=dev, generator=g); y = yall[b:b + B]
 
@@ -118,7 +125,7 @@ else:
             for t, tp in zip(ts[:-1], ts[1:]): x = x - (t - tp) * vel(x, t.expand(B))
         x = x.float() * SD + MU
         for j in range(B):
-            np.save(f'{a.out}/gen_{b + j:04d}.npy', x[j].half().cpu().numpy())
-            if NC: gcls[f'gen_{b + j:04d}'] = CLASSES[int(y[j])]
+            np.save(f'{a.out}/{names[b + j]}.npy', x[j].half().cpu().numpy())
+            if NC: gcls[names[b + j]] = CLASSES[int(y[j])]
     if NC: json.dump(gcls, open(f'{a.out}/cls.json', 'w'), indent=1)
     print(f'생성 {a.n}개 → {a.out} (T {a.temp}, {a.n_steps} steps, 범주 조건 {NC}, cfg {a.cfg})', flush=True); print('PRIOR_SAMPLE_DONE', flush=True)
