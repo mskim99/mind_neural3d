@@ -14,7 +14,7 @@ source $(dirname $0)/common.sh || exit 1
 A=$W/prism_abl/infer; T=$W/prism_vshape/text/glb; I=$W/prism_vshape/infer/vshape_g0; K=sub-0001_keep; AP=$W/prism_apac/ours
 ab() { echo "abl_$1:$A/$1/$K/glb_text:$A/$1/$K/tokens:full:v2"; }; sb() { echo "vt_s$1:$T/vt_s$1:$I/sub-000$1_keep/tokens:full:v2"; }
 case "${PRESET:-}" in   # 미리 정한 묶음 (ablation 먼저)
-  pro6000) SETS="$(ab noSVP) $(ab noP) $(sb 1) $(ab onlyP) $(sb 8) $(sb 2) $(sb 3) $(sb 5) $(sb 6) $(sb 7) ours_AP:$AP/sub-0009_as01_keep/glb:$AP/sub-0009_as01_keep/tokens:shape:v2 ours_APAC220:$AP/sub-0011_as01_keep/glb:$AP/sub-0011_as01_keep/tokens:shape:apac";;
+  pro6000) SETS="$(ab noSVP) $(ab noP) $(ab onlyP) $(sb 1) $(sb 8) $(sb 2) $(sb 3) $(sb 5) $(sb 6) $(sb 7) ours_AP:$AP/sub-0009_as01_keep/glb:$AP/sub-0009_as01_keep/tokens:shape:v2 ours_APAC220:$AP/sub-0011_as01_keep/glb:$AP/sub-0011_as01_keep/tokens:shape:apac";;
   5090)    SETS="$(ab onlyS) $(ab onlyV) $(ab noS) $(ab noV)";;
 esac
 : ${SETS:?SETS="이름:GLB 폴더:토큰 폴더:full|shape:v2|apac …"}
