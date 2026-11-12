@@ -18,12 +18,18 @@ p = argparse.ArgumentParser()
 p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--tgt', required=True)
 p.add_argument('--ckpt', required=True); p.add_argument('--out', required=True); p.add_argument('--subs', default='')
 p.add_argument('--bs', type=int, default=8); p.add_argument('--skip_a', type=int, default=0)
+p.add_argument('--hold', type=int, default=0)   # > 0: train 범주마다 목록 끝 n개(검증 물체)를 빼고 맞춘 뒤 검증 물체 · test 정확도를 따로 (A만, 값은 'hold/test')
 a = p.parse_args(); os.makedirs(a.out, exist_ok=True)
 ck = torch.load(a.ckpt, map_location='cpu'); SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8))
 model = build_from_ckpt(ck, a.repo).cuda().eval(); assert model.arch == 'fig' and model.sem_clip == 'front'
 subs = a.subs.split(',') if a.subs else SUBS
 rd = lambda s: [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{s}_list.txt')) if l.strip()]
-TR, TE = [k for k in rd('train') if k.split('/')[0] in SYN], rd('test'); ALL = TR + TE; ntr = len(TR)
+TR, TE = [k for k in rd('train') if k.split('/')[0] in SYN], rd('test'); HO = []
+if a.hold:
+    by = {}
+    for k in TR: by.setdefault(k.split('/')[0], []).append(k)
+    Hs = {k for v in by.values() for k in v[-a.hold:]}; HO = [k for k in TR if k in Hs]; TR = [k for k in TR if k not in Hs]
+ALL = TR + HO + TE; ntr = len(TR); nho = len(HO)
 cls = np.array([SYN.index(k.split('/')[0]) for k in ALL]); NC = len(SYN); Yc = np.eye(NC)[cls]
 uid = lambda k: k.split('/')[1]
 ALPHA_REL = [10.0 ** k for k in np.arange(-3, 3.01, 0.5)]
@@ -48,7 +54,8 @@ def gram(X):      # X [N, D] (GPU fp16) → K [N, ntr] float64, 차원마다 tra
 
 
 def decode(X):
-    K = gram(X); f = fit(K[:ntr], Yc[:ntr]); P = f(K[ntr:]); return float((P.argmax(1) == cls[ntr:]).mean())
+    K = gram(X); f = fit(K[:ntr], Yc[:ntr]); P = f(K[ntr:]); ok = P.argmax(1) == cls[ntr:]
+    return (float(ok[:nho].mean()), float(ok[nho:].mean())) if nho else float(ok.mean())
 
 
 def run(sub, ks):
@@ -70,9 +77,9 @@ gt = lambda k: torch.from_numpy(np.load(f'{a.tgt}/dino/{uid(k)}.npy')).float()
 CM = torch.zeros(NC, 1374, 1024); cnt = np.zeros(NC)
 for k, c in zip(TR, cls[:ntr]): CM[c] += gt(k); cnt[c] += 1
 GM = (CM.sum(0) / cnt.sum()).cuda(); CM = (CM / torch.from_numpy(cnt)[:, None, None].float()).cuda()
-GTE = torch.stack([gt(k) for k in TE]).half().cuda(); cte = torch.from_numpy(cls[ntr:]).cuda()
+GTE = torch.stack([gt(k) for k in TE]).half().cuda(); cte = torch.from_numpy(cls[ntr + nho:]).cuda()
 loss = lambda X, Y: (1 - torch.nn.functional.cosine_similarity(X.float(), Y.float(), dim=-1)).mean(-1)   # [B]
-rng = np.random.default_rng(0); cn = cls[ntr:]
+rng = np.random.default_rng(0); cn = cls[ntr + nho:]
 same = torch.from_numpy(np.array([rng.choice(np.where((cn == cn[i]) & (np.arange(len(TE)) != i))[0]) for i in range(len(TE))])).cuda()
 
 for sub in subs:
@@ -91,7 +98,10 @@ for sub in subs:
         for nm in ('vit', 'sem', 'clip', 'sfeat'):
             A[nm + '_pos'] = decode(F[nm].flatten(1)); A[nm + '_mean'] = decode(F[nm].float().mean(1).half())
         A['model'] = float((pred_te == cte).float().mean())
-        R['A'][sub] = A; print(f'A| {sub} ' + ' '.join(f'{k} {v:.3f}' for k, v in A.items()), flush=True)
+        R['A'][sub] = A; print(f'A| {sub} ' + ' '.join(f'{k} {v[0]:.3f}/{v[1]:.3f}' if isinstance(v, tuple) else f'{k} {v:.3f}' for k, v in A.items()), flush=True)
+    if a.hold:
+        A['model_hold'] = float((F['pred'][ntr:ntr + nho] == torch.from_numpy(cls[ntr:ntr + nho]).cuda()).float().mean()); print(f'A| {sub} model_hold {A["model_hold"]:.3f}', flush=True)
+        json.dump(R, open(f'{a.out}/diag.json', 'w'), indent=1); del F; torch.cuda.empty_cache(); continue
     # B
     T = F['tok']; assert len(T) == len(TE)
     B = {'ours': float(loss(T, GTE).mean()), 'catmean_gt': float(loss(CM[cte], GTE).mean()),
@@ -105,7 +115,7 @@ for sub in subs:
     del F; torch.cuda.empty_cache()
 
 for part in ('A', 'B'):
-    if R[part]:
+    if R[part] and not a.hold:
         ks = list(next(iter(R[part].values())).keys())
         print(f'{part}| 평균 ' + ' '.join(f'{k} {np.mean([R[part][s][k] for s in R[part]]):.4f}' for k in ks), flush=True)
 print('DIAG_DONE', flush=True)
