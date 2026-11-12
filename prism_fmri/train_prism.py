@@ -49,6 +49,7 @@ p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자�
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
 p.add_argument('--fold', default='')       # 'k/n': train에서 i % n == k 물체를 뺌 (교차 학습). 비우면 전부
 p.add_argument('--enc_path', default='')                # 11-12: 피험자 공통 인코더 파일 하나 (UKB 사전학습 등). 주면 --enc_dir 대신 씀
+p.add_argument('--feat_norm', type=int, default=0, choices=[0, 1])   # 인코더 출력 표준화 (피험자 · 위치 · 차원별, 학습 물체 통계)
 p.add_argument('--in_norm', type=int, default=0, choices=[0, 1])   # 인코더 입력 프레임별 z-score
 p.add_argument('--enc_dir', default='')               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
 p.add_argument('--lam_tc', type=float, default=0.0)     # 11-10: > 0이면 결합-섞기 판별기 총상관 손실 가중치 (sep_losses.py A)
@@ -157,7 +158,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm)).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
@@ -215,6 +216,17 @@ if a.resume and os.path.exists(latest):
     ck = torch.load(latest, map_location='cpu'); check_load(model, ck['model'])   # 구조 옵션이 다르면 멈춤
     opt.load_state_dict(ck['opt']); sched.load_state_dict(ck['sched']); step = ck['step']; print('resumed', step, flush=True)
     if disc is not None and 'disc' in ck: disc.load_state_dict(ck['disc']); d_opt.load_state_dict(ck['d_opt'])
+if a.feat_norm and step == 0:                                                        # 학습 물체(검증 물체 뺀 것)로 인코더 출력 평균 · 표준편차 (프레임 2~7 각각을 표본으로)
+    with torch.no_grad():
+        for si in range(len(SUBS)):
+            ks = [k for s_, k in train_set.items if s_ == si]; n = 0; s1 = torch.zeros(257, 1024, device=dev, dtype=torch.float64); s2 = torch.zeros_like(s1)
+            for i in range(0, len(ks), 16):
+                x = torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, SUBS[si], 'npy_data', k + '.npy')).astype(np.float32)[FRAMES] for k in ks[i:i + 16]])).to(dev)
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    t = model.encode_frames(x, torch.full((len(x),), si, dtype=torch.long, device=dev)).float().flatten(0, 1).double()
+                s1 += t.sum(0); s2 += (t * t).sum(0); n += len(t)
+            mu = s1 / n; model.feat_mu[si] = mu.float(); model.feat_sd[si] = ((s2 / n - mu * mu).clamp_min(0).sqrt() + 1e-6).float()
+            print(f'[feat_norm] {SUBS[si]} 표본 {n} · 평균 |mu| {float(mu.abs().mean()):.3f} · 평균 sd {float(model.feat_sd[si].mean()):.3f}', flush=True)
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
 KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'vt', 'v_adv', 'v_adv_acc', 'subj', 'subj_acc']
 if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']

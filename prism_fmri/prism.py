@@ -134,8 +134,9 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False):
         super().__init__()
+        self.feat_norm = feat_norm                                          # 11-12: 인코더 출력을 피험자 · 위치 · 차원별 train 평균 · 표준편차로 표준화 (값은 학습 스크립트가 채움, 체크포인트에 저장)
         self.in_norm = in_norm                                              # 11-12: 인코더 입력을 프레임마다 0 아닌 픽셀 기준 z-score (UKB 사전학습 인코더용, 판정용 임시)
         self.drop = nn.Dropout(dropout)                                     # 11-12: 0이면 아무 일도 안 함 (이전 체크포인트와 같음)
         self.use_film = film                                                # False: ablation — Perceptive FiLM 보정 끔 (모듈은 남기되 안 씀)
@@ -146,6 +147,8 @@ class Prism(nn.Module):
         K = n_subjects
         assert len(encs) == K, f'피험자 {K}명인데 ViT {len(encs)}개'
         self.splits = splits
+        if feat_norm:
+            self.register_buffer('feat_mu', torch.zeros(K, 257, d)); self.register_buffer('feat_sd', torch.ones(K, 257, d))
         ds, dv, dp = splits
         assert arch in ('res', 'fig'); self.arch = arch
         self.frame_emb = nn.Embedding(n_frames, d)
@@ -250,6 +253,7 @@ class Prism(nn.Module):
         if subj is None:
             subj = torch.zeros(fmri.shape[0], dtype=torch.long, device=fmri.device)
         tok = self.encode_frames(fmri, subj).float()
+        if self.feat_norm: tok = (tok - self.feat_mu[subj][:, None]) / self.feat_sd[subj][:, None]
         B, T, N, D = tok.shape
         enc_vec = tok.mean((1, 2)).detach()                                          # 고정 ViT 특징 (프레임 · 패치 평균), 나머지 복원 정답
         if self.arch == 'fig':
@@ -337,7 +341,7 @@ def build_from_ckpt(ck, repo):
                   vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
-                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)))
+                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)))
     check_load(model, ck['model'])
     return model
 

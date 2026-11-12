@@ -9,11 +9,12 @@
 # 사용: GPU=0 nohup bash run_ukb.sh > $W/logs/prism_ukb.log 2>&1 < /dev/null & disown      (TEST=1: 60스텝 동작 확인 → $W/prism_ukb/test)
 SUBS=sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008
 source $(dirname $0)/common.sh || exit 1
-N=${N:-0}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000}; n=frozen; X=""; [ $N -gt 0 ] && { n=ft$N; X="--enc_unfreeze $N --enc_lr ${ENC_LR:-1e-5}"; }
+N=${N:-0}; FN=${FN:-0}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000}; n=frozen; X=""; [ $N -gt 0 ] && { n=ft$N; X="--enc_unfreeze $N --enc_lr ${ENC_LR:-1e-5}"; }
+[ $FN = 1 ] && { n=${n}_fn; X="$X --feat_norm 1"; }   # FN=1: 인코더 출력 표준화 (frozen_fn / ft<n>_fn)
 [ "${TEST:-0}" = 1 ] && { n=test; STEPS=60; SAVE=""; X="$X --val_every 30 --limit 200"; }
 PY=$W/venv/bin/python; UKB=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=$W/prism_ukb
 cd $W/run; mkdir -p $O
-echo "=== 학습 시작 $n $(date +%H:%M:%S)"
+echo "=== 학습 시작 $n $(date +%H:%M:%S)" | tee $W/logs/prism_ukb_start_$n.txt
 $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --bs 14 --max_step $STEPS \
   --per_subject 1 --enc_path $UKB --in_norm 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
   --seed 1 --holdout 8 ${SAVE:+--save_steps $SAVE} $X --resume --out_dir $O/$n > $W/logs/prism_ukb_$n.log 2>&1
