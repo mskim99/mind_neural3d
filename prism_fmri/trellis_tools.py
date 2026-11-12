@@ -39,6 +39,7 @@ p.add_argument('--text_model', default='microsoft/TRELLIS-text-base')
 p.add_argument('--pool', type=int, default=0)   # dino: 1이면 토큰 [1374, 1024] 대신 token_util.pool 요약 [54, 1024]만 저장 (V 시점 특징 정답용, 11-09)
 p.add_argument('--rembg', type=int, default=0)   # dino: 1이면 흰 배경 문턱값 대신 TRELLIS preprocess_image의 rembg로 배경 제거 (unCLIP 생성 이미지용, 11-09)
 p.add_argument('--ss_z', default='')   # gen (11-10, B 3단계): 1단계(형상)를 건너뛰고 이 폴더의 형상 잠재 z [8,16³] → 디코더 > 0 → coords. 외형은 --slat_text 필수, 각 z 옆 흰 배경 스냅샷 png도 저장
+p.add_argument('--ss_noise', default='cuda', choices=['cuda', 'cpu'])   # ss (11-12, 판정 1c): cpu면 TRELLIS sample_sparse_structure처럼 CPU에서 noise를 뽑아 옮김 → bs 1 · 같은 seed면 gen의 1단계 z와 같음
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
 os.environ.setdefault('SPCONV_ALGO', 'native')
@@ -176,7 +177,7 @@ elif a.mode in ('ss', 'ssdec'):
         with torch.no_grad():
             if a.mode == 'ss':
                 torch.manual_seed(a.seed)
-                noise = torch.randn(len(nb), fm.in_channels, R, R, R, device='cuda')
+                noise = torch.randn(len(nb), fm.in_channels, R, R, R).cuda() if a.ss_noise == 'cpu' else torch.randn(len(nb), fm.in_channels, R, R, R, device='cuda')
                 z = pipe.sparse_structure_sampler.sample(fm, noise, **make_cond(X), **pipe.sparse_structure_sampler_params, verbose=False).samples
             else:
                 z = X

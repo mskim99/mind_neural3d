@@ -16,6 +16,8 @@ p.add_argument('--temp', type=float, default=1.0); p.add_argument('--seed', type
 p.add_argument('--cond', type=int, default=0)            # train: 1이면 범주 조건 (11-11, uid 앞 synset → 임베딩, 시간 임베딩에 더함)
 p.add_argument('--p_uncond', type=float, default=0.1)    # train: 범주를 '없음'으로 바꾸는 비율 (CFG용)
 p.add_argument('--cfg', type=float, default=1.0)         # sample: v = v_없음 + cfg · (v_범주 − v_없음), 1이면 조건만
+p.add_argument('--init_z', default='')                   # sample (11-12, 판정 1c): 이 폴더의 <이름>.npy 형상 잠재에서 출발 (SDEdit)
+p.add_argument('--t_start', type=float, default=1.0)    # sample: init_z를 t_start까지 노이즈로 섞은 뒤 t_start → 0 적분 (1이면 init_z 무시와 같음)
 p.add_argument('--cls_json', default='')                 # sample (11-11): {이름: synset} → 이름마다 그 범주로 하나씩, <out>/<이름>.npy (--n 무시)
 a = p.parse_args()
 dev = 'cuda'; C, R, PS = 8, 16, 2; L = (R // PS) ** 3; CP = C * PS ** 3
@@ -114,6 +116,11 @@ else:
     gcls = {}
     for b in range(0, a.n, 32):
         B = min(32, a.n - b); x = a.temp * torch.randn(B, C, R, R, R, device=dev, generator=g); y = yall[b:b + B]
+        tsb = ts
+        if a.init_z:   # xt = (1 − t) x0 + t e (학습식과 같음), t = t_start에서 출발. 걸음 크기는 그대로 → 걸음 수 round(n_steps · t_start)
+            z0 = torch.stack([torch.from_numpy(np.load(f'{a.init_z}/{names[b + j]}.npy')).float() for j in range(B)]).to(dev)
+            x = (1 - a.t_start) * (z0 - MU) / SD + a.t_start * x
+            tsb = torch.linspace(a.t_start, 0, max(1, round(a.n_steps * a.t_start)) + 1, device=dev)
 
         def vel(x, t):
             if not NC: return net(x, t).float()
@@ -122,10 +129,10 @@ else:
             vu = net(x, t, torch.full_like(y, NC)).float()
             return vu + a.cfg * (vc - vu)
         with torch.no_grad(), torch.autocast(dev, dtype=torch.bfloat16):
-            for t, tp in zip(ts[:-1], ts[1:]): x = x - (t - tp) * vel(x, t.expand(B))
+            for t, tp in zip(tsb[:-1], tsb[1:]): x = x - (t - tp) * vel(x, t.expand(B))
         x = x.float() * SD + MU
         for j in range(B):
             np.save(f'{a.out}/{names[b + j]}.npy', x[j].half().cpu().numpy())
             if NC: gcls[names[b + j]] = CLASSES[int(y[j])]
     if NC: json.dump(gcls, open(f'{a.out}/cls.json', 'w'), indent=1)
-    print(f'생성 {a.n}개 → {a.out} (T {a.temp}, {a.n_steps} steps, 범주 조건 {NC}, cfg {a.cfg})', flush=True); print('PRIOR_SAMPLE_DONE', flush=True)
+    print(f'생성 {a.n}개 → {a.out} (T {a.temp}, {a.n_steps} steps, 범주 조건 {NC}, cfg {a.cfg}, init_z {a.init_z or '없음'} t_start {a.t_start})', flush=True); print('PRIOR_SAMPLE_DONE', flush=True)
