@@ -3,6 +3,7 @@
 #  요약: 지금 = 가장 최근 [hold] 줄, 최저 = 토큰 손실(1 − cos)이 가장 낮았던 스텝. 범주 = 7명 평균 범주 정확도
 # 사용: watch -n 1 bash status_reg.sh        (RUNS="base do …"로 바꿀 수 있음)        UKB 인코더판: UKB=1 watch -n 1 bash status_reg.sh
 W=/home/oem/jhj/MinD-3D++; UKB=${UKB:-0}; O=$W/prism_reg; LP=prism_reg; DEF="base do dowd aug augdo lin"; [ $UKB = 1 ] && { O=$W/prism_reg_ukb; LP=prism_regukb; DEF="do dowd aug augdo lin"; }
+[ "${SET:-}" = branch ] && { O=$W/prism_branch; LP=prism_branch; DEF="a asv ac au"; }   # 11-13 새 구조 비교 (run_branch.sh): SET=branch watch -n 1 bash status_reg.sh
 RUNS=${RUNS:-$DEF}; now=$(date +%s); kst() { date -d "@$(( $1 + 32400 ))" +%H:%M; }
 printf "%-7s %-6s %-13s %-12s %-8s %s\n" 이름 단계 진행 속도 남은시간 "종료(KST)"
 for n in $RUNS; do
@@ -25,5 +26,5 @@ for n in $RUNS; do
     $2=="hold"{ls=$1; lc=$c; la=$a; if(bs==""||$c<bc){bs=$1; bc=$c; ba=$a}} $2=="val"{va=$a}
     END{if(ls!="") printf "%-7s %-22s %-28s %s\n", n, sprintf("%d %.4f %.3f", ls, lc, la), sprintf("%d %.4f %.3f", bs, bc, ba), sprintf("%.3f", va)}' $C
 done
-grep -q REG_DONE $W/logs/$LP.log 2>/dev/null && echo "=== 학습 전부 끝남"
+grep -qE 'REG_DONE|BRANCH_DONE' $W/logs/$LP.log 2>/dev/null && echo "=== 학습 전부 끝남"
 echo "지금 $(kst $now) KST | GPU: $(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader 2>/dev/null | tr '\n' ' ') | 디스크 $(df -h $W | tail -1 | awk '{print $4" 남음"}')"

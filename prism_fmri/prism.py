@@ -16,6 +16,14 @@
 #  11-11 P = 버리는 나머지 (사용자 제안, `.보고 자료/261112_9차보고/PRISM_분리/P나머지_설계.md`): film 0(디코더에 P 안 넣음) + 피험자 간 일치 손실 + remainder(P가 나머지 복원)
 #  11-12 과적합 대책 (`.보고 자료/261112_9차보고/PRISM_개선/성능개선_가설·계획.md`, 사용자 승인): dropout p(Mixed Features · 디코더 입력 · 디코더 안),
 #    lin_path(Semantic 안 원 신호 선형 경로: 프레임 평균 fMRI 65536픽셀 → Linear → 1024, 피험자별, 0 초기화, CLIP Projection 출력의 모든 패치 토큰에 더함)
+#  11-13 새 구조 (사용자 승인, 피드백: patch = 뇌 조각이라 patch마다 CLIP은 의미 없음 · 256 + 6을 한 줄로 붙이면 6개에 쏠림 · 세부를 잡는 경로 없음):
+#    mem 'branch'  Semantic    = S 채널 patch 256개(프레임 평균) → attention pooling(피험자별, 가중치 = out['sem_attn'] [B, 256] → 뇌 지도) → CLIP Projection → 벡터 1개 (L_sem을 이 벡터에 직접)
+#                               (+ lin_path · vit_lin 선형 경로는 이 벡터에 더함) → Linear → Semantic 토큰 1개. Down Stage · ConvNeXt · Res Encoder는 안 씀
+#                  Variational = 기존 head 토큰 T개(모양 정답 손실 그대로) + patch 토큰 T × 256개 (V 채널 → MLP, + 프레임 embedding + patch 위치 embedding)
+#                  디코더      = 갈래별 cross-attention (층마다 Semantic용 · Variational용 따로, 결과를 더함 — IP-Adapter decoupled cross-attention 방식). 두 갈래가 한 softmax에서 경쟁하지 않음
+#        'cat'     이전: [Semantic 256 ; Variational T]를 한 줄로 이어 붙여 cross-attention 하나
+#    sv_enc 0      SV Encoder를 뺌 (Temporal Stem 출력을 바로 채널 분할) — 넣고 / 빼고 비교용
+#    v_center 1    (branch만) patch 토큰을 "patch별 프레임 평균 256개 + 프레임별 변화량 T × 256개"로 나눠 줌 (변화량 = 값 − 프레임 평균, 따로 MLP)
 #  구조도에 없어 정한 것: ConvNeXt 블록 수 2 · 채널 512, head 은닉 256, SV Encoder 뒤 MLP 은닉 1024, Perceptive 입력 방식 FiLM
 import torch
 import torch.nn as nn
@@ -89,6 +97,22 @@ class PoseHead(nn.Module):
         f = self.n(self.mlp(x)); return self.out(f), f
 
 
+class BranchDecoderLayer(nn.Module):
+    """11-13 갈래별 cross-attention 디코더 층 (norm_first): self-attention → [Semantic cross-attention + Variational cross-attention] → FFN.
+    두 cross-attention은 같은 입력에서 따로 계산해 더함 (IP-Adapter decoupled cross-attention 방식)."""
+    def __init__(self, d, nh, ff, dropout=0.0):
+        super().__init__()
+        self.sa = nn.MultiheadAttention(d, nh, dropout=dropout, batch_first=True)
+        self.ca_s = nn.MultiheadAttention(d, nh, dropout=dropout, batch_first=True)
+        self.ca_v = nn.MultiheadAttention(d, nh, dropout=dropout, batch_first=True)
+        self.n1 = nn.LayerNorm(d); self.n2 = nn.LayerNorm(d); self.n3 = nn.LayerNorm(d)
+        self.f1 = nn.Linear(d, ff); self.f2 = nn.Linear(ff, d); self.do = nn.Dropout(dropout)
+    def forward(self, x, ms, mv):                                               # x [B, Q, d], ms [B, 1, d], mv [B, M, d]
+        h = self.n1(x); x = x + self.do(self.sa(h, h, h, need_weights=False)[0])
+        h = self.n2(x); x = x + self.do(self.ca_s(h, ms, ms, need_weights=False)[0]) + self.do(self.ca_v(h, mv, mv, need_weights=False)[0])
+        return x + self.do(self.f2(self.do(F.gelu(self.f1(self.n3(x))))))
+
+
 class TemporalStem(nn.Module):
     """[B, T, N, D] → 같은 크기. 패치 위치(N)·채널(D)마다 따로 프레임 축(T) 1D conv (박사님 EEG TemporalStem의 fMRI판), 잔차."""
     def __init__(self, d, k=3):
@@ -134,8 +158,10 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False):
         super().__init__()
+        assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
+        assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
         self.feat_norm = feat_norm                                          # 11-12: 인코더 출력을 피험자 · 위치 · 차원별 train 평균 · 표준편차로 표준화 (값은 학습 스크립트가 채움, 체크포인트에 저장)
         self.in_norm = in_norm                                              # 11-12: 인코더 입력을 프레임마다 0 아닌 픽셀 기준 z-score (UKB 사전학습 인코더용, 판정용 임시)
         self.drop = nn.Dropout(dropout)                                     # 11-12: 0이면 아무 일도 안 함 (이전 체크포인트와 같음)
@@ -158,9 +184,14 @@ class Prism(nn.Module):
         else:                                                               # 이전 구현
             self.temporal = TemporalStem(d)                                 # Spatio-Temporal의 시간 부분
             self.shared = nn.Sequential(ResMLP(d, 2 * d), ResMLP(d, 2 * d))   # Semantic-Variation Encoder
+        if not sv_enc: self.shared = nn.Identity()                          # 11-13: SV Encoder 빼기 (Temporal Stem 출력을 바로 채널 분할)
         # Semantic (피험자별 K벌)
         assert sem_clip in ('back', 'front'); self.sem_clip = sem_clip
-        if sem_clip == 'front':                                             # CLIP Projection이 경로 안 (Down Stage 앞)
+        if mem == 'branch':                                                 # 11-13: attention pooling → CLIP Projection → 벡터 1개 → 토큰 1개
+            self.sem_pool = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1)) for _ in range(K)])   # patch마다 점수 → softmax = 어느 뇌 조각을 볼지
+            self.sem_clip_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])
+            self.sem_tok = nn.ModuleList([nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, dc)) for _ in range(K)])
+        elif sem_clip == 'front':                                           # CLIP Projection이 경로 안 (Down Stage 앞)
             self.sem_clip_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])
             self.sem_enc = nn.ModuleList([SemanticEncoder(1024, sem_ch, sem_blocks, dc) for _ in range(K)])
         else:
@@ -206,11 +237,19 @@ class Prism(nn.Module):
             self.rem_g = nn.Sequential(nn.Linear(2 * dc, 1024), nn.GELU(), nn.Linear(1024, d))   # [S ; V](기울기 끊음) → 인코더 특징
             self.rem_r = nn.Sequential(nn.Linear(dp, 1024), nn.GELU(), nn.Linear(1024, d))       # P → 나머지
         # 재구성 (TRELLIS 조건 토큰, 공유)
-        self.type_emb = nn.Parameter(torch.zeros(2, dc))                 # Semantic / Variational 토큰 구분
         self.time_emb = nn.Embedding(n_frames, dc)
         self.query = nn.Parameter(torch.randn(1, n_query, dc) * 0.02)
-        layer = nn.TransformerDecoderLayer(dc, 12, 4 * dc, dropout=dropout, batch_first=True, norm_first=True)
-        self.dec = nn.TransformerDecoder(layer, dec_layers)
+        if mem == 'branch':
+            self.type_emb = nn.Parameter(torch.zeros(4, dc))             # Semantic / Variational head 토큰 / patch 토큰 / (v_center) 변화량 토큰
+            vt = lambda: nn.Sequential(nn.LayerNorm(dv), nn.Linear(dv, dc), nn.GELU(), nn.Linear(dc, dc))
+            self.var_tok = nn.ModuleList([vt() for _ in range(K)])         # V 채널 patch 토큰 → dc (피험자별)
+            if self.v_center: self.var_tok_r = nn.ModuleList([vt() for _ in range(K)])   # 프레임별 변화량용
+            self.var_pos = nn.Parameter(torch.randn(256, dc) * 0.02)      # patch(뇌 조각) 위치 embedding, 공유 (피험자 모두 같은 평면 지도)
+            self.dec = nn.ModuleList([BranchDecoderLayer(dc, 12, 4 * dc, dropout) for _ in range(dec_layers)])
+        else:
+            self.type_emb = nn.Parameter(torch.zeros(2, dc))             # Semantic / Variational 토큰 구분
+            layer = nn.TransformerDecoderLayer(dc, 12, 4 * dc, dropout=dropout, batch_first=True, norm_first=True)
+            self.dec = nn.TransformerDecoder(layer, dec_layers)
         self.tok_out = nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024))
 
     def train(self, mode=True):
@@ -269,13 +308,21 @@ class Prism(nn.Module):
         out = {}
         # Semantic (피험자별): 프레임 평균(정적 성분) → (front) CLIP Projection → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
         st = s[:, :, 1:].mean(1)                                                     # [B, 256, ds]
-        if self.sem_clip == 'front':
+        if self.mem == 'branch':                                                     # 11-13: attention pooling → CLIP Projection → 벡터 1개
+            aw = torch.softmax(_route(self.sem_pool, subj, st).squeeze(-1).float(), -1); out['sem_attn'] = aw   # [B, 256] 어느 뇌 조각을 보나
+            sv = _route(self.sem_clip_proj, subj, (aw[..., None].to(st.dtype) * st).sum(1))                     # [B, 1024]
+            if hasattr(self, 'sem_lin'): sv = sv + _route(self.sem_lin, subj, fmri.mean(1).flatten(1).to(sv.dtype))
+            if hasattr(self, 'sem_vlin'): sv = sv + _route(self.sem_vlin, subj, _route(self.sem_vred, subj, tok[:, :, 1:].mean(1)).flatten(1))
+            out['sem_clip'] = F.normalize(sv, dim=-1)
+            if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, sv)
+            sem_feat = _route(self.sem_tok, subj, sv)[:, None]                       # Semantic Features [B, 1, dc]
+        elif self.sem_clip == 'front':
             st = _route(self.sem_clip_proj, subj, st)                                # CLIP 공간 [B, 256, 1024]
             if hasattr(self, 'sem_lin'): st = st + _route(self.sem_lin, subj, fmri.mean(1).flatten(1).to(st.dtype))[:, None]   # 원 신호 선형 경로
             if hasattr(self, 'sem_vlin'): st = st + _route(self.sem_vlin, subj, _route(self.sem_vred, subj, tok[:, :, 1:].mean(1)).flatten(1))[:, None]   # ViT 출력 선형 읽기 (탐침과 같은 입력: 프레임 평균 패치 토큰)
             out['sem_clip'] = F.normalize(st.mean(1), dim=-1)
             if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, st.mean(1))   # [B, 1024] (정규화 전)
-        sem_feat = _route(self.sem_enc, subj, st.transpose(1, 2).reshape(B, -1, 16, 16)).flatten(2).transpose(1, 2)
+        if self.mem != 'branch': sem_feat = _route(self.sem_enc, subj, st.transpose(1, 2).reshape(B, -1, 16, 16)).flatten(2).transpose(1, 2)
         out['sem_vec'] = sem_feat.mean(1)
         if self.sem_clip == 'back':
             out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
@@ -297,6 +344,15 @@ class Prism(nn.Module):
         agg_in = torch.cat(feats if self.var_mode == 'feat' else vals, -1)          # feat: LayerNorm 특징 head 수×256
         var_feat = _route(self.aggregate, subj, agg_in)
         out['var_vec'] = var_feat.mean(1)
+        if self.mem == 'branch':                                                     # 11-13: head 토큰 T개 + patch 토큰 (평균 안 냄) → Variational Features [B, T + T·256 (v_center: + 256), dc]
+            vp = v[:, :, 1:]; te = self.time_emb(frame_idx)                          # [B, T, 256, dv], [B, T, dc]
+            if self.v_center:
+                vm = vp.mean(1)                                                      # patch별 프레임 평균 [B, 256, dv]
+                pt = torch.cat([_route(self.var_tok, subj, vm) + self.var_pos + self.type_emb[2],
+                                (_route(self.var_tok_r, subj, vp - vm[:, None]) + self.var_pos + te[:, :, None] + self.type_emb[3]).flatten(1, 2)], 1)
+            else:
+                pt = (_route(self.var_tok, subj, vp) + self.var_pos + te[:, :, None] + self.type_emb[2]).flatten(1, 2)
+            var_feat = torch.cat([var_feat + self.type_emb[1] + te, pt], 1)
         if hasattr(self, 'v_adv'):
             out['v_adv_logit'] = self.v_adv(GradReverse.apply(out['var_vec'], float(self.grl_lam)))
         # Perceptive (공유): Token Pooling → Subject Projector
@@ -312,8 +368,17 @@ class Prism(nn.Module):
             sem_feat = sem_feat.mean(0, keepdim=True).expand_as(sem_feat) if isinstance(sem_override, str) else sem_override.to(sem_feat.dtype)
         if var_override is not None:
             var_feat = var_feat.mean(0, keepdim=True).expand_as(var_feat) if isinstance(var_override, str) else var_override.to(var_feat.dtype)
+        if self.mem == 'branch':                                                     # 재구성 (공유): 갈래별 cross-attention, FiLM은 두 갈래에 같은 γ, β
+            ms = self.drop(sem_feat + self.type_emb[0]); mv = self.drop(var_feat)
+            if self.use_film:
+                gamma, beta = self.film(h).chunk(2, -1)
+                ms = ms * (1 + gamma[:, None]) + beta[:, None]; mv = mv * (1 + gamma[:, None]) + beta[:, None]
+            x = self.query.expand(B, -1, -1)
+            for l in self.dec: x = l(x, ms, mv)
+            out['cond_tokens'] = self.tok_out(x)                                     # [B, 1374, 1024]
+            return out
         # 재구성 (공유): [Semantic ; Variational] Features (Perceptive FiLM 보정) → 조건 토큰
-        mem = torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
+        mem =torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
         mem = self.drop(mem)
         if self.use_film:
             gamma, beta = self.film(h).chunk(2, -1)
@@ -346,7 +411,8 @@ def build_from_ckpt(ck, repo):
                   vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
-                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0))
+                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
+                  mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)))
     check_load(model, ck['model'])
     return model
 
