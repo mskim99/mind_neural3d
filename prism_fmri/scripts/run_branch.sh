@@ -6,6 +6,7 @@
 #         ac   a + patch 토큰을 프레임 평균 + 프레임별 변화량으로 (--v_center 1)
 #         au   UKB 인코더 4안 설정(고정 · 입력 z-score · 출력 표준화 · ViT 출력 선형 읽기 32) + 새 구조
 #         aup · ausv · auc   au에서 patch 2×2 묶음 · SV Encoder 뺌 · 프레임 평균 + 변화량 (11-13, 5090에서: RUNS="aup ausv auc")
+#         x · xp · xsv · xc   바탕 인코더 설정을 직접 줌: EX="--enc_path … --in_norm 1 …" (필수, 다른 바탕에서 같은 4종을 돌릴 때)
 #  대조(이미 있음): 공개 인코더 이전 구조 = Ours vshape_g0, UKB 이전 구조 = 5090 prism_ukb/frozen_fn_vl
 #  스텝 고르기: [hold] 줄(검증 물체) 토큰 손실 · 범주. 공개 인코더는 인코더가 검증 물체를 이미 봐서 [hold]가 낙관적 → a · asv · ac끼리 비교에만 씀
 #  학습만 함 (추론 · GLB · 평가는 고른 것만 따로) → $W/prism_branch/<이름>, 로그 logs/prism_branch_<이름>.log (BRANCH_DONE)
@@ -19,7 +20,9 @@ EP="--enc_dir $PUB"; EU="--enc_path $U --in_norm 1 --feat_norm 1 --vit_lin 32"
 flags() { case $1 in a) echo "$EP --mem branch";; asv) echo "$EP --mem branch --sv_enc 0";; ac) echo "$EP --mem branch --v_center 1";;
                      ap) echo "$EP --mem branch --v_pool 2";;     # a에서 patch 토큰을 이웃 2×2 평균 (6 × 64 = 384개)
                      au) echo "$EU --mem branch";;
-                     aup) echo "$EU --mem branch --v_pool 2";; ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";; *) echo BAD;; esac; }
+                     aup) echo "$EU --mem branch --v_pool 2";; ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";;
+                     x) echo "$EX --mem branch";; xp) echo "$EX --mem branch --v_pool 2";; xsv) echo "$EX --mem branch --sv_enc 0";; xc) echo "$EX --mem branch --v_center 1";; *) echo BAD;; esac; }
+EX=${EX:-}; for n in $RUNS; do case $n in x|xp|xsv|xc) [ -n "$EX" ] || { echo "x 계열은 EX(바탕 인코더 옵션)가 필요"; exit 1; };; esac; done
 for n in $RUNS; do [ "$(flags $n)" = BAD ] && { echo "모르는 이름 $n"; exit 1; }; done
 for f in $VT $U; do [ -f $f ] || { echo "없음: $f"; exit 1; }; done
 X=""; [ $TEST = 1 ] && { O=$O/test; STEPS=60; SAVE=""; X="--val_every 30 --limit 200"; }
