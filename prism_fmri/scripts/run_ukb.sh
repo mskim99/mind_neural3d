@@ -12,7 +12,7 @@ source $(dirname $0)/common.sh || exit 1
 N=${N:-0}; FN=${FN:-0}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000}; n=frozen; X=""; [ $N -gt 0 ] && { n=ft$N; X="--enc_unfreeze $N --enc_lr ${ENC_LR:-1e-5}"; }
 [ $FN = 1 ] && { n=${n}_fn; X="$X --feat_norm 1"; }   # FN=1: 인코더 출력 표준화 (frozen_fn / ft<n>_fn)
 [ ${VL:-0} -gt 0 ] && { n=${n}_vl; X="$X --vit_lin $VL"; }   # VL=r: Semantic 안 ViT 출력 선형 읽기 (위치 유지, 패치당 r차원)
-[ "${TEST:-0}" = 1 ] && { n=test; STEPS=60; SAVE=""; X="$X --val_every 30 --limit 200"; }
+[ "${TEST:-0}" = 1 ] && { n=test_$n; STEPS=60; SAVE=""; X="$X --val_every 30 --limit 200"; }
 PY=$W/venv/bin/python; UKB=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=$W/prism_ukb
 cd $W/run; mkdir -p $O
 echo "=== 학습 시작 $n $(date +%H:%M:%S)" | tee $W/logs/prism_ukb_start_$n.txt
