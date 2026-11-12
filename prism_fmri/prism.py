@@ -227,9 +227,11 @@ class Prism(nn.Module):
             order = torch.cat(order); inv = torch.empty_like(order); inv[order] = torch.arange(len(order), device=order.device)
             return torch.cat(outs)[inv]
 
-    def forward(self, fmri, frame_idx, subj=None, perceptive_override=None):
+    def forward(self, fmri, frame_idx, subj=None, perceptive_override=None, sem_override=None, var_override=None):
         """fmri [B, T, 256, 256], frame_idx [B, T] (fMRI 프레임 번호, 0~9), subj [B] 피험자 번호 (없으면 0).
-        perceptive_override: 평가 때 Perceptive 벡터를 바꿔 끼우기 ('mean' → 배치 평균 = 사실상 버리기, 텐서 → 그 값)."""
+        perceptive_override: 평가 때 Perceptive 벡터를 바꿔 끼우기 ('mean' → 배치 평균 = 사실상 버리기, 텐서 → 그 값).
+        sem_override · var_override (11-12 판정 2): 디코더에 들어가는 Semantic Features [B, 256, dc] · Variational Features [B, T, dc]를 바꿔 끼우기
+          ('mean' → 배치 평균, 텐서 → 그 값). sem_vec · var_vec 등 다른 출력은 원래 값 그대로. 기본(None)은 이전과 같음."""
         if subj is None:
             subj = torch.zeros(fmri.shape[0], dtype=torch.long, device=fmri.device)
         tok = self.encode_frames(fmri, subj).float()
@@ -281,6 +283,11 @@ class Prism(nn.Module):
         out['subj_logit'] = self.subj_cls(h); out['perc_vec'] = pv
         if hasattr(self, 'rem_g'):
             out['enc_vec'] = enc_vec; out['rem_sv'] = self.rem_g(torch.cat([out['sem_vec'], out['var_vec']], -1).detach()); out['rem_p'] = self.rem_r(pv)
+        out['sem_feat'] = sem_feat; out['var_feat'] = var_feat                    # 바꿔 끼우기용 (판정 2)
+        if sem_override is not None:
+            sem_feat = sem_feat.mean(0, keepdim=True).expand_as(sem_feat) if isinstance(sem_override, str) else sem_override.to(sem_feat.dtype)
+        if var_override is not None:
+            var_feat = var_feat.mean(0, keepdim=True).expand_as(var_feat) if isinstance(var_override, str) else var_override.to(var_feat.dtype)
         # 재구성 (공유): [Semantic ; Variational] Features (Perceptive FiLM 보정) → 조건 토큰
         mem = torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
         mem = self.drop(mem)
