@@ -12,10 +12,11 @@
 #       동작 확인(60스텝, 차례로): TEST=1 GPU=1 bash run_branch.sh        진행: SET=branch watch -n 1 bash status_reg.sh
 SUBS=sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008
 source $(dirname $0)/common.sh || exit 1
-RUNS=${RUNS:-"a asv ac au"}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000,15000}; HOLD=${HOLD:-8}; TEST=${TEST:-0}
+RUNS=${RUNS:-"a asv ac ap au"}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000,15000}; HOLD=${HOLD:-8}; TEST=${TEST:-0}
 PY=$W/venv/bin/python; PUB=$W/weights/MinD-3D-pp/fMRI-Shape; U=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=${OUT:-$W/prism_branch}; LP=prism_branch
 EP="--enc_dir $PUB"; EU="--enc_path $U --in_norm 1 --feat_norm 1 --vit_lin 32"
 flags() { case $1 in a) echo "$EP --mem branch";; asv) echo "$EP --mem branch --sv_enc 0";; ac) echo "$EP --mem branch --v_center 1";;
+                     ap) echo "$EP --mem branch --v_pool 2";;     # a에서 patch 토큰을 이웃 2×2 평균 (6 × 64 = 384개)
                      au) echo "$EU --mem branch";; *) echo BAD;; esac; }
 for n in $RUNS; do [ "$(flags $n)" = BAD ] && { echo "모르는 이름 $n"; exit 1; }; done
 for f in $VT $U; do [ -f $f ] || { echo "없음: $f"; exit 1; }; done
