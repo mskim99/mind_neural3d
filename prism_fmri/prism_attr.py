@@ -14,6 +14,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--pr', required=True); p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True)
 p.add_argument('--ckpt', required=True); p.add_argument('--out', required=True)
 p.add_argument('--subs', default='sub-0001'); p.add_argument('--split', default='test'); p.add_argument('--limit', type=int, default=0)
+p.add_argument('--per_obj', type=int, default=0)   # 1 = 물체별 S · V · P 지도도 저장 (attr_obj_<sub>.npz, 성분 대비 검정용)
 a = p.parse_args()
 sys.path.insert(0, '.'); sys.path.insert(0, a.pr)
 from prism import build_from_ckpt
@@ -50,6 +51,7 @@ for sub in a.subs.split(','):
     si = SUBS.index(sub) if sub in SUBS else 0
     acc = {n: {k: np.zeros((256, 256), np.float64) for k in ('abs', 'sgn', 'grad')} for n in NAMES}
     hit = 0; t0 = time.time()
+    po = {g: np.zeros((len(ids), 256, 256), np.float32) for g in 'SVP'} if a.per_obj else None
     for i, k in enumerate(ids):
         x = torch.from_numpy(np.load(os.path.join(a.data_root, sub, 'npy_data', k + '.npy')).astype(np.float32)[FRAMES])[None].cuda()
         x.requires_grad_(True)
@@ -64,9 +66,14 @@ for sub in a.subs.split(','):
             acc[n]['abs'] += (g * xx).abs().mean(0).cpu().numpy()
             acc[n]['sgn'] += (g * xx).mean(0).cpu().numpy()
             acc[n]['grad'] += g.abs().mean(0).cpu().numpy()
+            if po is not None: po[n[0]][i] += (g * xx).abs().mean(0).cpu().numpy()
         if (i + 1) % 10 == 0 or i + 1 == len(ids):
             print(f'{sub} {i + 1}/{len(ids)} {time.time() - t0:.0f}s 범주 정답 {hit}/{i + 1}', flush=True)
     res = {f'{n}_{kk}': (acc[n][kk] / len(ids)).astype(np.float32) for n in NAMES for kk in acc[n]}
     np.savez(f'{a.out}/attr_{sub}.npz', names=np.array(ids), cls_acc=hit / len(ids), frames=np.array(FRAMES), ckpt=a.ckpt, **res)
+    if po is not None:   # 물체마다 합 1로 맞춘 지도 × 65536 (평균 1) float16 + 원래 합
+        tot = {g: po[g].reshape(len(ids), -1).sum(1) for g in 'SVP'}
+        np.savez_compressed(f'{a.out}/attr_obj_{sub}.npz', names=np.array(ids), **{g: (po[g] / tot[g][:, None, None] * 65536).astype(np.float16) for g in 'SVP'},
+                            **{f'{g}_total': tot[g] for g in 'SVP'})
     print(f'{sub}: {len(ids)}개, 범주 정확도 {hit / len(ids):.3f} → {a.out}/attr_{sub}.npz', flush=True)
 print('ATTR_DONE', flush=True)
