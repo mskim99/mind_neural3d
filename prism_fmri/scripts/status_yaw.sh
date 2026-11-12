@@ -4,7 +4,7 @@
 #  속도 = 지금 단계에서 실제로 끝난 물체 수 / 그 단계 경과 시간. 아직 안 온 단계는 11-11 실측 평균으로 더함 (추정):
 #         12방위 렌더 3.7개/분 · 방향 고르기 4분 · 평가 렌더 2.7개/분 · 지표 계산 12분 (104개 기준, 220개면 비례)
 # 사용: watch -n 1 bash status_yaw.sh            (SETS="이름:full|shape:v2|apac …"로 바꿀 수 있음)
-W=/home/oem/jhj/MinD-3D++; Y=$W/prism_yaw; L=$W/logs/yaw_v2.log
+W=/home/oem/jhj/MinD-3D++; Y=$W/prism_yaw; L=${L:-$W/logs/yaw_v2.log}   # L = run_yaw_v2.sh 로그 (ablation 7명이면 logs/yaw_abl_subs_g<GPU>.log)
 SETS=${SETS:-"vt_s8:full:v2 vt_s2:full:v2 vt_s3:full:v2 vt_s5:full:v2 vt_s6:full:v2 vt_s7:full:v2 ours_AP:shape:v2 ours_APAC220:shape:apac"}
 now=$(date +%s); kst() { date -d "@$(( $1 + 32400 ))" +%H:%M; }
 since() { local t=$(grep -h "^=== $1 $2" $L 2>/dev/null | tail -1 | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}$'); [ -z "$t" ] && { echo 0; return; }
