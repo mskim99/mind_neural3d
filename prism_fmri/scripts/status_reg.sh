@@ -9,9 +9,9 @@ printf "%-7s %-6s %-13s %-12s %-8s %s\n" 이름 단계 진행 속도 남은시�
 for n in $RUNS; do
   L=$W/logs/${LP}_$n.log
   [ -f $L ] || { printf "%-7s %-6s\n" $n 대기; continue; }
-  read st mx <<< "$(grep -oE 'step [0-9]+/[0-9]+' $L | tail -1 | tr '/' ' ' | cut -d' ' -f2,3)"
+  read st mx <<< "$(grep -aoE 'step [0-9]+/[0-9]+' $L | tail -1 | tr '/' ' ' | cut -d' ' -f2,3)"
   [ -f $O/$n/model_final.pt ] && { printf "%-7s %-6s %-13s\n" $n 완료 "$mx/$mx"; continue; }
-  grep -qE 'Traceback|out of memory' $L && { printf "%-7s %-6s %s\n" $n 에러 "$(grep -E 'Error|out of memory' $L | tail -1 | cut -c1-80)"; continue; }
+  grep -aqE 'Traceback|out of memory' $L && { printf "%-7s %-6s %s\n" $n 에러 "$(grep -aE 'Error|out of memory' $L | tail -1 | cut -c1-80)"; continue; }
   [ -z "$st" ] && { printf "%-7s %-6s\n" $n 준비; continue; }
   t=$(grep -h "^=== 학습 시작 $n " $W/logs/$LP.log 2>/dev/null | tail -1 | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}$'); e=1
   [ -n "$t" ] && { e=$(( now - $(date -d "$t" +%s) )); [ $e -lt 0 ] && e=$(( e + 86400 )); }; [ $e -lt 1 ] && e=1
