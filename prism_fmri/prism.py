@@ -209,8 +209,19 @@ class Prism(nn.Module):
         super().train(mode); self.encoders.eval(); return self
 
     def trainable_state_dict(self):
-        """저장용: 고정 ViT(피험자마다 약 1 GB)는 빼고 저장. 불러올 때 ViT는 enc_paths에서 다시 읽음."""
-        return {k: v for k, v in self.state_dict().items() if not k.startswith('encoders.')}
+        """저장용: 고정 ViT(피험자마다 약 1 GB)는 빼고 저장. 불러올 때 ViT는 enc_paths에서 다시 읽음.
+        unfreeze_encoder로 푼 ViT 블록은 같이 저장 (불러올 때 enc_paths 가중치 위에 덮임)."""
+        tuned = {n for n, q in self.named_parameters() if q.requires_grad and n.startswith('encoders.')}
+        return {k: v for k, v in self.state_dict().items() if not k.startswith('encoders.') or k in tuned}
+
+    def unfreeze_encoder(self, n):
+        """11-12: 피험자별 ViT의 마지막 n개 블록 + 마지막 norm을 학습 (앞 블록은 고정 그대로, dropout은 꺼진 채). 반환: 푼 파라미터 목록."""
+        ps = []
+        for e in self.encoders:
+            for m in list(e.blocks)[-n:] + [e.norm]:
+                m.requires_grad_(True); ps += list(m.parameters())
+        self.enc_grad = True
+        return ps
 
     def _vit(self, e, x):
         B, T = x.shape[:2]

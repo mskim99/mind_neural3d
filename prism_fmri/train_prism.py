@@ -65,6 +65,8 @@ p.add_argument('--wd', type=float, default=0.01)        # AdamW weight decay (�
 p.add_argument('--aug_noise', type=float, default=0.0)  # 학습 때 fMRI에 가우시안 잡음 (표본마다 입력 표준편차 × 이 값)
 p.add_argument('--aug_mask', type=float, default=0.0)   # 학습 때 16×16 패치를 이 비율만큼 0으로 (표본마다, 프레임 공통)
 p.add_argument('--lin_path', type=int, default=0, choices=[0, 1])   # Semantic 안 원 신호 선형 경로
+p.add_argument('--enc_unfreeze', type=int, default=0)   # 11-12: > 0이면 피험자별 ViT 마지막 n개 블록 + norm을 같이 학습 (체크포인트에 같이 저장)
+p.add_argument('--enc_lr', type=float, default=1e-5)     # 푼 ViT 블록 학습률
 p.add_argument('--save_steps', default='')              # '5000,10000': 그 스텝에서 model_step<N>.pt (학습 가중치만)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
@@ -160,8 +162,10 @@ d_opt = torch.optim.Adam(disc.parameters(), lr=a.tc_lr, betas=(0.5, 0.9)) if dis
 PARTS = lambda o: [o['sem_vec'], o['var_vec'], o['perc_vec']]
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
+enc_params = model.unfreeze_encoder(a.enc_unfreeze) if a.enc_unfreeze > 0 else []
+if enc_params: print(f'[enc] ViT 마지막 {a.enc_unfreeze}블록 + norm 학습: {sum(q.numel() for q in enc_params) / 1e6:.1f}M, lr {a.enc_lr:g}', flush=True)
 print(f'trainable {sum(q.numel() for q in params) / 1e6:.1f}M, subjects {SUBS}, bs {a.bs}, steps {a.max_step}', flush=True)
-opt = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
+opt = torch.optim.AdamW([{'params': params}] + ([{'params': enc_params, 'lr': a.enc_lr}] if enc_params else []), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / a.warmup) * 0.5 * (1 + math.cos(math.pi * min(1, s / a.max_step))))
 class BalancedBatches(torch.utils.data.Sampler):
     """배치마다 피험자를 같은 수로 (bs / 피험자 수). 한 바퀴 = 가장 적은 피험자 기준."""
@@ -310,7 +314,7 @@ while not done:
             if disc is not None: L['tc'] = tc_enc(disc, pt)
             if a.lam_hsic > 0: L['hsic'] = hsic_loss(pt)
         tot = total_loss(L)
-        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step(); sched.step(); step += 1
+        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); (torch.nn.utils.clip_grad_norm_(enc_params, 1.0) if enc_params else None); opt.step(); sched.step(); step += 1
         if disc is not None: L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt)   # 본 backward 뒤 (판별기를 먼저 바꾸면 그래프가 깨짐)
         if step % a.print_every == 0:
             write('train', L, float(tot))
