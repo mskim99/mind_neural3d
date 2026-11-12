@@ -9,6 +9,8 @@
 #  --lam_vadv λ (11-09): V에서 범주 정보 빼기 — Variational Features → GRL → 범주 분류기. 분류기 손실은 1배, 앞단으로 가는 기울기는 −λ·s(p) (s = DANN 일정 2/(1+e^(−10p))−1)
 #  --fold k/n (11-09, 토큰 prior용 교차 학습): train 목록(annotations 순서)에서 i % n == k인 물체를 학습에서 뺌 → infer_prism.py --split train --fold k/n로 그 물체의 '안 본' 예측을 만듦
 #  --lam_tc λ · --lam_hsic λ (11-10): S · V · P 분리 — 결합-섞기 판별기(총상관) · RBF CKA 합 (sep_losses.py). 판별기는 모델 밖, latest에만 저장
+#  11-12 과적합 대책 (사용자 승인, `.보고 자료/261112_9차보고/PRISM_개선/성능개선_가설·계획.md`): --holdout n (train에서 범주마다 목록 끝 n개를 떼어 [hold]로만 평가 — 설정 · 스텝 수 고르기용,
+#    [val] = test는 기록만 하고 고르는 데 쓰지 않음) · --dropout · --wd · --aug_noise · --aug_mask (fMRI 증강, 학습 때만) · --lin_path (Semantic 안 원 신호 선형 경로) · --save_steps (model_step<N>.pt)
 #  이전 기준선(prism_nop_feat · value)을 다시 학습하려면 --arch res --sem_clip back --var_heads csr
 import os, sys, math, time, argparse, numpy as np, torch
 from torch.utils.data import Dataset, DataLoader
@@ -57,6 +59,13 @@ p.add_argument('--share_warm', type=int, default=2000)   # 일치 손실 세기�
 p.add_argument('--paired', type=int, default=0, choices=[0, 1])   # 1: 짝 배치만 (일치 손실 없이, 배치 구성 대조군). lam_share > 0이면 자동으로 짝 배치
 p.add_argument('--pair_k', type=int, default=2)           # 물체 하나를 배치에 넣는 피험자 수 (bs 14 → 물체 7 × 피험자 2)
 p.add_argument('--lam_rem', type=float, default=0.0)      # 11-11: > 0이면 P = 나머지 복원 (sep_losses.rem_losses), S · V 갈래에는 기울기 안 감
+p.add_argument('--holdout', type=int, default=0)        # 11-12: > 0이면 train 범주마다 목록 끝 n개를 학습에서 빼고 [hold]로 평가
+p.add_argument('--dropout', type=float, default=0.0)    # Mixed Features · 디코더 입력 · 디코더 안
+p.add_argument('--wd', type=float, default=0.01)        # AdamW weight decay (이전 값 0.01)
+p.add_argument('--aug_noise', type=float, default=0.0)  # 학습 때 fMRI에 가우시안 잡음 (표본마다 입력 표준편차 × 이 값)
+p.add_argument('--aug_mask', type=float, default=0.0)   # 학습 때 16×16 패치를 이 비율만큼 0으로 (표본마다, 프레임 공통)
+p.add_argument('--lin_path', type=int, default=0, choices=[0, 1])   # Semantic 안 원 신호 선형 경로
+p.add_argument('--save_steps', default='')              # '5000,10000': 그 스텝에서 model_step<N>.pt (학습 가중치만)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 if a.seed >= 0:
@@ -106,7 +115,13 @@ def load_item(si, k):
 
 class ShapeSet(Dataset):
     def __init__(self, split):
-        ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{split}_list.txt')) if l.strip()]
+        src = 'train' if split == 'hold' else split
+        ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{src}_list.txt')) if l.strip()]
+        if a.holdout > 0 and src == 'train':                                         # 범주마다 목록 끝 n개 = 검증 물체 (학습에서 뺌)
+            by = {}
+            for k in ids: by.setdefault(k.split('/')[0], []).append(k)
+            H = {k for v in by.values() for k in v[-a.holdout:]}
+            ids = [k for k in ids if (k in H) == (split == 'hold')]
         if split == 'train' and a.fold:
             fk, fn = map(int, a.fold.split('/')); ids = [k for i, k in enumerate(ids) if i % fn != fk]   # 목록 순서 기준 (infer_prism.py --fold와 같음)
         ids = [k for k in ids if os.path.exists(f'{a.tgt}/dino/{k.split("/")[1]}.npy')]
@@ -137,7 +152,7 @@ ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
 enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path)).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
@@ -146,7 +161,7 @@ PARTS = lambda o: [o['sem_vec'], o['var_vec'], o['perc_vec']]
 model.prototypes.copy_(build_prototypes())
 params = [q for q in model.parameters() if q.requires_grad]
 print(f'trainable {sum(q.numel() for q in params) / 1e6:.1f}M, subjects {SUBS}, bs {a.bs}, steps {a.max_step}', flush=True)
-opt = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=0.01)
+opt = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / a.warmup) * 0.5 * (1 + math.cos(math.pi * min(1, s / a.max_step))))
 class BalancedBatches(torch.utils.data.Sampler):
     """배치마다 피험자를 같은 수로 (bs / 피험자 수). 한 바퀴 = 가장 적은 피험자 기준."""
@@ -186,6 +201,8 @@ PAIRED = a.paired == 1 or a.lam_share > 0
 train_set = ShapeSet('train')
 tl = DataLoader(train_set, batch_sampler=(PairedBatches(train_set.items, a.bs, a.pair_k) if PAIRED else BalancedBatches(train_set.items, a.bs)), num_workers=a.workers, persistent_workers=True)
 vl = DataLoader(ShapeSet('test'), batch_size=a.bs, shuffle=False, num_workers=a.workers)
+hl = DataLoader(ShapeSet('hold'), batch_size=a.bs, shuffle=False, num_workers=a.workers) if a.holdout > 0 else None
+SAVE_STEPS = {int(x) for x in a.save_steps.split(',') if x.strip()}
 step = 0; latest = f'{a.out_dir}/model_latest.pt'
 if a.resume and os.path.exists(latest):
     ck = torch.load(latest, map_location='cpu'); check_load(model, ck['model'])   # 구조 옵션이 다르면 멈춤
@@ -231,10 +248,10 @@ def write(split, L, tot):
 
 
 @torch.no_grad()
-def validate():
-    model.eval(); acc = {}; per = {}
+def validate(loader=None, tag='val'):
+    loader = loader or vl; model.eval(); acc = {}; per = {}
     G = {k: [] for k in ('sem_vec', 'var_vec', 'obj', 'subj', 'enc_vec', 'rem_sv', 'rem_p')}   # 11-11: val은 배치가 피험자 순이라 짝이 없음 → 다 모아 끝에 한 번
-    for b in vl:
+    for b in loader:
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
@@ -256,12 +273,26 @@ def validate():
         if G['enc_vec']:
             h = torch.cat(G['enc_vec']); h = torch.nn.functional.layer_norm(h, h.shape[-1:]); g = torch.cat(G['rem_sv']); r = torch.cat(G['rem_p']); var = h.var(0).mean()
             L['rem_g'] = float(((g - h) ** 2).mean()); L['rem'] = float(((g + r - h) ** 2).mean()); L['rem_r2_sv'] = float(1 - L['rem_g'] / var); L['rem_r2_svp'] = float(1 - L['rem'] / var)
-    tot = float(total_loss(L)); write('val', L, tot)
-    print(f'[val] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
+    tot = float(total_loss(L)); write(tag, L, tot)
+    print(f'[{tag}] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
           f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} '
           + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '')
           + (f'tc {L.get("tc", 0):.4f} d_acc {L.get("d_acc", 0):.3f} hsic {L.get("hsic", 0):.4f} ' if SEP else '') + (f'검색 S {L.get("share_s_acc", 0):.3f} V {L.get("share_v_acc", 0):.3f} rem R2 {L.get("rem_r2_sv", 0):.2f}>{L.get("rem_r2_svp", 0):.2f} ' if PAIRED or a.lam_rem > 0 else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
+
+
+def validate_all():
+    validate()
+    if hl is not None: validate(hl, 'hold')
+
+
+def augment(x):
+    # 11-12 fMRI 증강 (학습 때만): 표본마다 표준편차 × aug_noise 가우시안 잡음, 16×16 패치를 aug_mask 비율만큼 0으로 (프레임 공통)
+    if a.aug_noise > 0: x = x + torch.randn_like(x) * x.std(dim=(1, 2, 3), keepdim=True) * a.aug_noise
+    if a.aug_mask > 0:
+        keep = (torch.rand(x.shape[0], 1, 16, 16, device=x.device) >= a.aug_mask).to(x.dtype)
+        x = x * keep.repeat_interleave(16, 2).repeat_interleave(16, 3)
+    return x
 
 
 t0 = time.time(); model.train(); done = step >= a.max_step; ep = step // max(1, len(tl))
@@ -270,6 +301,7 @@ while not done:
     for b in tl:
         b = to_dev(b)
         model.grl_lam = a.lam_vadv * (2 / (1 + math.exp(-10 * step / a.max_step)) - 1)
+        if a.aug_noise > 0 or a.aug_mask > 0: b['fmri'] = augment(b['fmri'])
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
         L = prism_losses(out, b); prem_losses(out, b, L, PAIRED)
@@ -286,13 +318,15 @@ while not done:
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
                   f'vt {float(L["vt"]):.4f} v_adv_acc {float(L["v_adv_acc"]):.3f} grl {model.grl_lam:.3f} '
                   f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
-        if step % a.val_every == 0: validate()
+        if step % a.val_every == 0: validate_all()
+        if step in SAVE_STEPS:
+            torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_step{step}.pt'); print(f'saved model_step{step}.pt', flush=True)
         if step % a.save_every == 0 or step >= a.max_step:
             torch.save({'model': STATE(), 'opt': opt.state_dict(), 'sched': sched.state_dict(), 'step': step, 'args': vars(a),
                         'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS,
                         **({'disc': disc.state_dict(), 'd_opt': d_opt.state_dict()} if disc is not None else {})}, latest + '.tmp')
             os.replace(latest + '.tmp', latest); print(f'saved step {step}', flush=True)
         if step >= a.max_step: done = True; break
-validate()
+validate_all()
 torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_final.pt')
 print(f'TRAIN_DONE step {step} {time.time() - t0:.0f}s', flush=True)

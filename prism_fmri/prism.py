@@ -14,6 +14,8 @@
 #  피험자: ViT · Semantic · Variational은 피험자별(자기 데이터로만 학습), Temporal Stem · SV Encoder · Perceptive(FiLM) · 디코더는 공유
 #  읽는 체크포인트: per_subject 1 · temporal 1 · P 없음 (c7ae1f8 이후). P가 있던 이전 체크포인트(prism_shape_ps7 등)는 못 읽음 (지표는 이미 있음)
 #  11-11 P = 버리는 나머지 (사용자 제안, `.보고 자료/261112_9차보고/PRISM_분리/P나머지_설계.md`): film 0(디코더에 P 안 넣음) + 피험자 간 일치 손실 + remainder(P가 나머지 복원)
+#  11-12 과적합 대책 (`.보고 자료/261112_9차보고/PRISM_개선/성능개선_가설·계획.md`, 사용자 승인): dropout p(Mixed Features · 디코더 입력 · 디코더 안),
+#    lin_path(Semantic 안 원 신호 선형 경로: 프레임 평균 fMRI 65536픽셀 → Linear → 1024, 피험자별, 0 초기화, CLIP Projection 출력의 모든 패치 토큰에 더함)
 #  구조도에 없어 정한 것: ConvNeXt 블록 수 2 · 채널 512, head 은닉 256, SV Encoder 뒤 MLP 은닉 1024, Perceptive 입력 방식 FiLM
 import torch
 import torch.nn as nn
@@ -132,8 +134,9 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False):
         super().__init__()
+        self.drop = nn.Dropout(dropout)                                     # 11-12: 0이면 아무 일도 안 함 (이전 체크포인트와 같음)
         self.use_film = film                                                # False: ablation — Perceptive FiLM 보정 끔 (모듈은 남기되 안 씀)
         assert sum(splits) == d
         encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
@@ -159,6 +162,10 @@ class Prism(nn.Module):
         else:
             self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(K)])
             self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
+        if lin_path:                                                        # 11-12: Semantic 안 원 신호 선형 경로 (피험자별, 0 초기화 → 처음엔 기준과 같음)
+            assert sem_clip == 'front', 'lin_path는 sem_clip front에서만'
+            self.sem_lin = nn.ModuleList([nn.Linear(256 * 256, 1024) for _ in range(K)])
+            for m in self.sem_lin: nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
         if img_head:                                                        # 11-10 A안: Semantic 안 이미지 임베딩 head (CLIP Projection 출력 평균 → OpenCLIP ViT-H 이미지 임베딩 1024, unCLIP 입력)
             assert sem_clip == 'front', 'img_head는 sem_clip front에서만'
@@ -194,7 +201,7 @@ class Prism(nn.Module):
         self.type_emb = nn.Parameter(torch.zeros(2, dc))                 # Semantic / Variational 토큰 구분
         self.time_emb = nn.Embedding(n_frames, dc)
         self.query = nn.Parameter(torch.randn(1, n_query, dc) * 0.02)
-        layer = nn.TransformerDecoderLayer(dc, 12, 4 * dc, dropout=0.0, batch_first=True, norm_first=True)
+        layer = nn.TransformerDecoderLayer(dc, 12, 4 * dc, dropout=dropout, batch_first=True, norm_first=True)
         self.dec = nn.TransformerDecoder(layer, dec_layers)
         self.tok_out = nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024))
 
@@ -232,13 +239,14 @@ class Prism(nn.Module):
             x = self.temporal(tok, self.frame_emb(frame_idx))                        # LN → + Frame Emb. → 프레임 축 conv
         else:
             x = self.temporal(tok + self.frame_emb(frame_idx)[:, :, None, :])        # 이전: Frame Emb. 더한 뒤 Stem (잔차)
-        mixed = self.shared(x)                                                       # Mixed Features [B, T, 257, D]
+        mixed = self.drop(self.shared(x))                                                    # Mixed Features [B, T, 257, D]
         s, v, p = mixed.split(self.splits, dim=-1)                                  # 채널 분할 (학습 파라미터 없음)
         out = {}
         # Semantic (피험자별): 프레임 평균(정적 성분) → (front) CLIP Projection → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
         st = s[:, :, 1:].mean(1)                                                     # [B, 256, ds]
         if self.sem_clip == 'front':
             st = _route(self.sem_clip_proj, subj, st)                                # CLIP 공간 [B, 256, 1024]
+            if hasattr(self, 'sem_lin'): st = st + _route(self.sem_lin, subj, fmri.mean(1).flatten(1).to(st.dtype))[:, None]   # 원 신호 선형 경로
             out['sem_clip'] = F.normalize(st.mean(1), dim=-1)
             if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, st.mean(1))   # [B, 1024] (정규화 전)
         sem_feat = _route(self.sem_enc, subj, st.transpose(1, 2).reshape(B, -1, 16, 16)).flatten(2).transpose(1, 2)
@@ -275,6 +283,7 @@ class Prism(nn.Module):
             out['enc_vec'] = enc_vec; out['rem_sv'] = self.rem_g(torch.cat([out['sem_vec'], out['var_vec']], -1).detach()); out['rem_p'] = self.rem_r(pv)
         # 재구성 (공유): [Semantic ; Variational] Features (Perceptive FiLM 보정) → 조건 토큰
         mem = torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
+        mem = self.drop(mem)
         if self.use_film:
             gamma, beta = self.film(h).chunk(2, -1)
             mem = mem * (1 + gamma[:, None]) + beta[:, None]
@@ -304,7 +313,8 @@ def build_from_ckpt(ck, repo):
                   sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'),
                   vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
-                  film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0)
+                  film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
+                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)))
     check_load(model, ck['model'])
     return model
 
