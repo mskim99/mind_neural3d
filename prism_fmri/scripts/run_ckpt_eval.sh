@@ -4,8 +4,9 @@
 #  체크포인트가 아직 없으면 생길 때까지 기다림. STEPS="5000 final 2000 10000 20000" 순서대로
 #  출력: $W/prism_ckpt/infer/<s>/sub-0001_keep, $W/prism_ckpt/text/<s>/glb, $W/prism_yaw/ckpt_<s>, 값 fair_eval/out/yaw_ckpt_<s>/values.txt
 # 사용: GPU=0 nohup bash run_ckpt_eval.sh > $W/logs/ckpt_eval.log 2>&1 < /dev/null & disown
+#  다른 학습 폴더: CK_ROOT(추론 · GLB 둘 곳) CK_DIR(체크포인트 폴더) TAG(출력 이름 prism_yaw/<TAG>_<s>, yaw_<TAG>_<s>) — 예: UKB 인코더 학습
 GPU=${GPU:-0} source $(dirname $0)/common.sh || exit 1
-PY=$W/venv/bin/python; C=$W/prism_ckpt; M=$C/base; TM=microsoft/TRELLIS-text-base; S1=sub-0001
+PY=$W/venv/bin/python; C=${CK_ROOT:-$W/prism_ckpt}; M=${CK_DIR:-$C/base}; TAG=${TAG:-ckpt}; TM=microsoft/TRELLIS-text-base; S1=sub-0001
 F=/home/oem/jhj/fair_eval; V=$F/fair_eval; Y=$W/prism_yaw
 trel() { (cd $MG && source $MG/mg_guard.sh >/dev/null && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 export FE_PY=$F/venv/bin/python FE_BLENDER=$W/tools/blender-4.2.3-linux-x64/blender TORCH_HOME=$F/torch_home
@@ -13,7 +14,7 @@ cd $W/run
 for s in ${STEPS:-5000 final}; do
   ck=$M/model_step$s.pt; [ $s = final ] && ck=$M/model_final.pt
   echo "=== $s 대기 $(date +%H:%M:%S)"; until [ -f $ck ]; do sleep 60; done; sleep 30
-  I=$C/infer/$s; g=$C/text/$s/glb; O=$Y/ckpt_$s; E=yaw_ckpt_$s
+  I=$C/infer/$s; g=$C/text/$s/glb; O=$Y/${TAG}_$s; E=yaw_${TAG}_$s; mkdir -p $C/text/$s
   echo "=== $s 시작 $(date +%H:%M:%S)"
   [ -f $I/${S1}_keep/components.npz ] || $PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $ck --out $I --subs $S1 --perceptive keep | grep -E "범주|DONE|Error"
   $PY $PR/text_prompts.py --comp $I/${S1}_keep/components.npz --out $C/text/$s/prompt.json | tail -1
