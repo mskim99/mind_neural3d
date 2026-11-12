@@ -68,6 +68,7 @@ p.add_argument('--wd', type=float, default=0.01)        # AdamW weight decay (�
 p.add_argument('--aug_noise', type=float, default=0.0)  # 학습 때 fMRI에 가우시안 잡음 (표본마다 입력 표준편차 × 이 값)
 p.add_argument('--aug_mask', type=float, default=0.0)   # 학습 때 16×16 패치를 이 비율만큼 0으로 (표본마다, 프레임 공통)
 p.add_argument('--lin_path', type=int, default=0, choices=[0, 1])   # Semantic 안 원 신호 선형 경로
+p.add_argument('--vit_lin', type=int, default=0)   # Semantic 안 ViT 출력 선형 읽기 (위치 유지), 값 = 패치당 줄인 차원 r (0 = 끔)
 p.add_argument('--enc_unfreeze', type=int, default=0)   # 11-12: > 0이면 피험자별 ViT 마지막 n개 블록 + norm을 같이 학습 (체크포인트에 같이 저장)
 p.add_argument('--enc_lr', type=float, default=1e-5)     # 푼 ViT 블록 학습률
 p.add_argument('--save_steps', default='')              # '5000,10000': 그 스텝에서 model_step<N>.pt (학습 가중치만)
@@ -158,7 +159,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None

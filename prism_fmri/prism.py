@@ -134,7 +134,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0):
         super().__init__()
         self.feat_norm = feat_norm                                          # 11-12: 인코더 출력을 피험자 · 위치 · 차원별 train 평균 · 표준편차로 표준화 (값은 학습 스크립트가 채움, 체크포인트에 저장)
         self.in_norm = in_norm                                              # 11-12: 인코더 입력을 프레임마다 0 아닌 픽셀 기준 z-score (UKB 사전학습 인코더용, 판정용 임시)
@@ -170,6 +170,10 @@ class Prism(nn.Module):
             assert sem_clip == 'front', 'lin_path는 sem_clip front에서만'
             self.sem_lin = nn.ModuleList([nn.Linear(256 * 256, 1024) for _ in range(K)])
             for m in self.sem_lin: nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+        if vit_lin:                                                         # 11-12: Semantic 안 ViT 출력 선형 읽기 (위치 유지, 피험자별): 패치마다 Linear(d → r) → 256 × r 펴서 Linear → 1024, 비선형 없음, 0 초기화
+            assert sem_clip == 'front', 'vit_lin은 sem_clip front에서만'
+            self.sem_vred = nn.ModuleList([nn.Linear(d, vit_lin) for _ in range(K)]); self.sem_vlin = nn.ModuleList([nn.Linear(256 * vit_lin, 1024) for _ in range(K)])
+            for m in self.sem_vlin: nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
         if img_head:                                                        # 11-10 A안: Semantic 안 이미지 임베딩 head (CLIP Projection 출력 평균 → OpenCLIP ViT-H 이미지 임베딩 1024, unCLIP 입력)
             assert sem_clip == 'front', 'img_head는 sem_clip front에서만'
@@ -268,6 +272,7 @@ class Prism(nn.Module):
         if self.sem_clip == 'front':
             st = _route(self.sem_clip_proj, subj, st)                                # CLIP 공간 [B, 256, 1024]
             if hasattr(self, 'sem_lin'): st = st + _route(self.sem_lin, subj, fmri.mean(1).flatten(1).to(st.dtype))[:, None]   # 원 신호 선형 경로
+            if hasattr(self, 'sem_vlin'): st = st + _route(self.sem_vlin, subj, _route(self.sem_vred, subj, tok[:, :, 1:].mean(1)).flatten(1))[:, None]   # ViT 출력 선형 읽기 (탐침과 같은 입력: 프레임 평균 패치 토큰)
             out['sem_clip'] = F.normalize(st.mean(1), dim=-1)
             if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, st.mean(1))   # [B, 1024] (정규화 전)
         sem_feat = _route(self.sem_enc, subj, st.transpose(1, 2).reshape(B, -1, 16, 16)).flatten(2).transpose(1, 2)
@@ -341,7 +346,7 @@ def build_from_ckpt(ck, repo):
                   vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
-                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)))
+                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0))
     check_load(model, ck['model'])
     return model
 
