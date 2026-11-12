@@ -135,4 +135,4 @@ else:
             np.save(f'{a.out}/{names[b + j]}.npy', x[j].half().cpu().numpy())
             if NC: gcls[names[b + j]] = CLASSES[int(y[j])]
     if NC: json.dump(gcls, open(f'{a.out}/cls.json', 'w'), indent=1)
-    print(f'생성 {a.n}개 → {a.out} (T {a.temp}, {a.n_steps} steps, 범주 조건 {NC}, cfg {a.cfg}, init_z {a.init_z or '없음'} t_start {a.t_start})', flush=True); print('PRIOR_SAMPLE_DONE', flush=True)
+    print(f'생성 {a.n}개 → {a.out} (T {a.temp}, {a.n_steps} steps, 범주 조건 {NC}, cfg {a.cfg}, init_z {a.init_z or "없음"} t_start {a.t_start})', flush=True); print('PRIOR_SAMPLE_DONE', flush=True)
