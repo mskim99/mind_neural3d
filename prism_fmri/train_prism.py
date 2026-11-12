@@ -48,7 +48,9 @@ p.add_argument('--arch', default='fig', choices=['fig', 'res'])   # fig: 11-06 �
 p.add_argument('--per_subject', type=int, default=1, choices=[1])   # 피험자별 ViT · S · V만 지원 (11-04 사용자 결정). 기록용으로 args에 남김 (build_from_ckpt가 확인)
 p.add_argument('--temporal', type=int, default=1, choices=[1])     # Temporal Stem 항상 사용. 기록용
 p.add_argument('--fold', default='')       # 'k/n': train에서 i % n == k 물체를 뺌 (교차 학습). 비우면 전부
-p.add_argument('--enc_dir', required=True)               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
+p.add_argument('--enc_path', default='')                # 11-12: 피험자 공통 인코더 파일 하나 (UKB 사전학습 등). 주면 --enc_dir 대신 씀
+p.add_argument('--in_norm', type=int, default=0, choices=[0, 1])   # 인코더 입력 프레임별 z-score
+p.add_argument('--enc_dir', default='')               # <enc_dir>/subNN_encoder.pt (MinD-3D++ 피험자별 공개 가중치의 인코더)
 p.add_argument('--lam_tc', type=float, default=0.0)     # 11-10: > 0이면 결합-섞기 판별기 총상관 손실 가중치 (sep_losses.py A)
 p.add_argument('--lam_hsic', type=float, default=0.0)   # 11-10: > 0이면 갈래 쌍 RBF CKA 합 가중치 (sep_losses.py C, 대조)
 p.add_argument('--tc_lr', type=float, default=1e-4)     # 판별기 학습률 (Adam β 0.5, 0.9)
@@ -150,11 +152,12 @@ def build_prototypes():
 
 
 cfg = OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))
-ENC_PATHS = [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
-enc = [load_encoder(pth, cfg) for pth in ENC_PATHS]
+assert a.enc_path or a.enc_dir, '--enc_dir 또는 --enc_path'
+ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
+enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm)).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None

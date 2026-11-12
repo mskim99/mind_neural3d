@@ -134,12 +134,13 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False):
         super().__init__()
+        self.in_norm = in_norm                                              # 11-12: 인코더 입력을 프레임마다 0 아닌 픽셀 기준 z-score (UKB 사전학습 인코더용, 판정용 임시)
         self.drop = nn.Dropout(dropout)                                     # 11-12: 0이면 아무 일도 안 함 (이전 체크포인트와 같음)
         self.use_film = film                                                # False: ablation — Perceptive FiLM 보정 끔 (모듈은 남기되 안 씀)
         assert sum(splits) == d
-        encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]
+        encs = list(encoder) if isinstance(encoder, (list, tuple, nn.ModuleList)) else [encoder]   # 같은 모듈을 여러 번 넣으면 피험자 공통 인코더 (가중치 하나)
         self.encoders = nn.ModuleList([e.requires_grad_(False).eval() for e in encs])   # MinD-3D++ fMRI ViT (패치 16, 256×256 → 16×16 + CLS), 고정
         self.enc_grad = False                                          # True: 입력까지 기울기 (성분 지도용)
         K = n_subjects
@@ -217,7 +218,7 @@ class Prism(nn.Module):
     def unfreeze_encoder(self, n):
         """11-12: 피험자별 ViT의 마지막 n개 블록 + 마지막 norm을 학습 (앞 블록은 고정 그대로, dropout은 꺼진 채). 반환: 푼 파라미터 목록."""
         ps = []
-        for e in self.encoders:
+        for e in {id(e): e for e in self.encoders}.values():             # 피험자 공통 인코더면 한 번만
             for m in list(e.blocks)[-n:] + [e.norm]:
                 m.requires_grad_(True); ps += list(m.parameters())
         self.enc_grad = True
@@ -229,6 +230,9 @@ class Prism(nn.Module):
 
     def encode_frames(self, fmri, subj):
         """fmri [B, T, 256, 256] → ViT 토큰 [B, T, 257, 1024] (피험자마다 자기 ViT)."""
+        if self.in_norm:
+            m = (fmri != 0).to(fmri.dtype); n = m.sum((2, 3), keepdim=True).clamp_min(1); mu = (fmri * m).sum((2, 3), keepdim=True) / n
+            sd = (((fmri - mu) ** 2 * m).sum((2, 3), keepdim=True) / n).sqrt() + 1e-6; fmri = (fmri - mu) / sd * m
         with torch.set_grad_enabled(self.enc_grad and torch.is_grad_enabled()):
             if len(self.encoders) == 1:
                 return self._vit(self.encoders[0], fmri)
@@ -314,7 +318,8 @@ def load_encoder(path, cfg):
     from src.encoder.autoencoder2 import fMRI_Encoder
     e = fMRI_Encoder(cfg.model.params.fmri_encoder_config); sd = torch.load(path, map_location='cpu'); sd = sd.get('model', sd)
     r = e.load_state_dict({k[len('fmri_encoder.'):]: v for k, v in sd.items() if k.startswith('fmri_encoder.')}, strict=False)
-    assert not r.missing_keys, f'{path}: 인코더 키 {len(r.missing_keys)}개 없음'
+    miss = [k for k in r.missing_keys if k.split('.')[0] not in ('clip_norm', 'aggregation')]   # 사전학습 파일(UKB)에는 이 두 층이 없음 — PRISM은 안 씀
+    assert not miss, f'{path}: 인코더 키 {len(miss)}개 없음'
     return e
 
 
@@ -325,14 +330,14 @@ def build_from_ckpt(ck, repo):
     cfg = OmegaConf.load(os.path.join(repo, 'configs', 'mind3d_pp.yaml'))
     args = ck.get('args') or {}
     assert args.get('per_subject', 0) and args.get('temporal', 1), '피험자별 ViT · Temporal Stem 체크포인트만 읽음 (11-04 이전 구조는 지원 안 함)'
-    encs = [load_encoder(pth, cfg) for pth in ck['enc_paths']]
+    _c = {}; encs = [_c.setdefault(pth, load_encoder(pth, cfg)) if pth not in _c else _c[pth] for pth in ck['enc_paths']]   # 같은 경로는 한 번만 읽음 (피험자 공통 인코더)
     model = Prism(encs, n_classes=len(ck['classes']), n_subjects=len(ck['subs']),
                   var_mode=args.get('var_mode', 'feat'), arch=args.get('arch', 'res'),
                   sem_clip=args.get('sem_clip', 'back'), var_heads=args.get('var_heads', 'csr'),
                   vdim=int(args.get('vdim', 0) or 0), grl_v=float(args.get('lam_vadv', 0) or 0) > 0,
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
-                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)))
+                  dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)))
     check_load(model, ck['model'])
     return model
 
