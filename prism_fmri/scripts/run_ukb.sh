@@ -13,11 +13,11 @@ N=${N:-0}; FN=${FN:-0}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000}; n=froze
 [ $FN = 1 ] && { n=${n}_fn; X="$X --feat_norm 1"; }   # FN=1: 인코더 출력 표준화 (frozen_fn / ft<n>_fn)
 [ ${VL:-0} -gt 0 ] && { n=${n}_vl; X="$X --vit_lin $VL"; }   # VL=r: Semantic 안 ViT 출력 선형 읽기 (위치 유지, 패치당 r차원)
 [ "${TEST:-0}" = 1 ] && { n=test_$n; STEPS=60; SAVE=""; X="$X --val_every 30 --limit 200"; }
-PY=$W/venv/bin/python; UKB=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=$W/prism_ukb
+PY=$W/venv/bin/python; UKB=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=${OUT:-$W/prism_ukb}; LP=${LP:-prism_ukb}   # OUT · LP: 폴더 · 로그 이름을 따로 (예: OUT=$W/prism_ukb40 LP=prism_ukb40 STEPS=40000)
 cd $W/run; mkdir -p $O
-echo "=== 학습 시작 $n $(date +%H:%M:%S)" | tee $W/logs/prism_ukb_start_$n.txt
+echo "=== 학습 시작 $n $(date +%H:%M:%S)" | tee $W/logs/${LP}_start_$n.txt
 $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --bs 14 --max_step $STEPS \
   --per_subject 1 --enc_path $UKB --in_norm 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
-  --seed 1 --holdout 8 ${SAVE:+--save_steps $SAVE} $X --resume --out_dir $O/$n > $W/logs/prism_ukb_$n.log 2>&1
-echo "=== 학습 끝 $n $(date +%H:%M:%S) | $(grep -E '^\[hold\]' $W/logs/prism_ukb_$n.log | tail -1 | cut -c1-200)"
+  --seed 1 --holdout 8 ${SAVE:+--save_steps $SAVE} $X --resume --out_dir $O/$n > $W/logs/${LP}_$n.log 2>&1
+echo "=== 학습 끝 $n $(date +%H:%M:%S) | $(grep -aE '^\[hold\]' $W/logs/${LP}_$n.log | tail -1 | cut -c1-200)"
 echo "=== UKB_DONE $(date +%H:%M:%S)"

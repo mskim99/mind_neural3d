@@ -15,7 +15,7 @@
 SUBS=sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008
 source $(dirname $0)/common.sh || exit 1
 RUNS=${RUNS:-"a asv ac ap au"}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000,15000}; HOLD=${HOLD:-8}; TEST=${TEST:-0}
-PY=$W/venv/bin/python; PUB=$W/weights/MinD-3D-pp/fMRI-Shape; U=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=${OUT:-$W/prism_branch}; LP=prism_branch
+PY=$W/venv/bin/python; PUB=$W/weights/MinD-3D-pp/fMRI-Shape; U=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=${OUT:-$W/prism_branch}; LP=${LP:-prism_branch}   # OUT · LP: 다른 스텝 수로 처음부터 다시 돌릴 때 폴더 · 로그 이름을 따로 (예: OUT=$W/prism_branch40 LP=prism_branch40 STEPS=40000)
 EP="--enc_dir $PUB"; EU="--enc_path $U --in_norm 1 --feat_norm 1 --vit_lin 32"
 flags() { case $1 in a) echo "$EP --mem branch";; asv) echo "$EP --mem branch --sv_enc 0";; ac) echo "$EP --mem branch --v_center 1";;
                      ap) echo "$EP --mem branch --v_pool 2";;     # a에서 patch 토큰을 이웃 2×2 평균 (6 × 64 = 384개)
