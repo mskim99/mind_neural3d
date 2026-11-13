@@ -10,6 +10,7 @@ PY=$W/venv/bin/python; C=${CK_ROOT:-$W/prism_ckpt}; M=${CK_DIR:-$C/base}; TAG=${
 F=/home/oem/jhj/fair_eval; V=$F/fair_eval; Y=$W/prism_yaw
 trel() { (cd $MG && source $MG/mg_guard.sh >/dev/null && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 export FE_PY=$F/venv/bin/python FE_BLENDER=$W/tools/blender-4.2.3-linux-x64/blender TORCH_HOME=$F/torch_home
+freewait() { until [ "$(nvidia-smi -i $CUDA_VISIBLE_DEVICES --query-gpu=memory.free --format=csv,noheader,nounits)" -ge $1 ]; do sleep 30; done; }   # 11-13: 같은 GPU의 다른 평가(외형 지표 약 20 GB)와 겹쳐 터지지 않게
 cd $W/run
 for s in ${STEPS:-5000 final}; do
   ck=$M/model_step$s.pt; [ $s = final ] && ck=$M/model_final.pt
@@ -18,8 +19,9 @@ for s in ${STEPS:-5000 final}; do
   echo "=== $s 시작 $(date +%H:%M:%S)"
   [ -f $I/${S1}_keep/components.npz ] || $PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $ck --out $I --subs $S1 --perceptive keep | grep -E "범주|DONE|Error"
   $PY $PR/text_prompts.py --comp $I/${S1}_keep/components.npz --out $C/text/$s/prompt.json | tail -1
-  [ $(ls $g/*/*.glb 2>/dev/null | wc -l) -ge 104 ] || trel gen --pred $I/${S1}_keep/tokens --slat_text $C/text/$s/prompt.json --text_model $TM --out $g | grep -E "GEN_DONE|Error|없음"
+  [ $(ls $g/*/*.glb 2>/dev/null | wc -l) -ge 104 ] || { freewait 21000; trel gen --pred $I/${S1}_keep/tokens --slat_text $C/text/$s/prompt.json --text_model $TM --out $g | grep -E "GEN_DONE|Error|없음"; }
   echo "T|$s|GLB $(ls $g/*/*.glb 2>/dev/null | wc -l)개|$(date +%H:%M:%S)"
+  [ $(ls $g/*/*.glb 2>/dev/null | wc -l) -ge 104 ] || { echo "!!! $s GLB가 104개가 아님 — 이 스텝은 멈춤 (다시 실행하면 이어서 만듦)"; continue; }
   mkdir -p $O
   if [ ! -f $O/yawsel.json ]; then
     ls $g/*/*.glb > $O/list.txt
