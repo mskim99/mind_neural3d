@@ -41,5 +41,5 @@ one() {
 }
 if [ $TEST = 1 ]; then for n in $RUNS; do one $n; done
 else J=""; for n in $RUNS; do one $n & J="$J $!"; sleep 60; done; wait $J
-  echo "=== 요약 (검증 물체 기준)"; SET=branch RUNS="$RUNS" bash $PR/scripts/status_reg.sh | sed -n '/^요약/,$p'; fi
+  echo "=== 요약 (검증 물체 기준)"; SET=branch OUT=$O LP=$LP RUNS="$RUNS" bash $PR/scripts/status_reg.sh | sed -n '/^요약/,$p'; fi
 echo "=== BRANCH_DONE $(date +%H:%M:%S)"
