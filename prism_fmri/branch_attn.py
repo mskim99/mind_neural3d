@@ -27,7 +27,7 @@ TE = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_tes
 uid = lambda k: k.split('/')[1]; CAT = np.array([SYN.index(k.split('/')[0]) for k in TE])
 G = 16 // model.v_pool; P2 = G * G; GQ, NPRE = 37, 5
 NC = P2 if model.v_center else 0                                   # v_center: patch별 프레임 평균 토큰 G²개가 앞에
-PROTO = F.normalize(model.prototypes.float(), dim=-1); assert PROTO.abs().sum() > 0, '프로토타입이 비어 있음'
+PROTO = F.normalize(model.prototypes.float(), dim=-1).cpu(); assert PROTO.abs().sum() > 0, '프로토타입이 비어 있음'
 REC = {}
 
 
