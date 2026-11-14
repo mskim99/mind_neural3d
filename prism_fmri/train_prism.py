@@ -72,6 +72,9 @@ p.add_argument('--vit_lin', type=int, default=0)   # Semantic 안 ViT 출력 선
 p.add_argument('--mem', default='cat', choices=['cat', 'branch'])   # 11-13: branch = Semantic attention pooling 벡터 1개 + Variational patch 토큰 + 갈래별 cross-attention (prism.py 맨 위)
 p.add_argument('--sv_enc', type=int, default=1, choices=[0, 1])     # 0: SV Encoder 빼기
 p.add_argument('--v_center', type=int, default=0, choices=[0, 1])   # 1: (branch) patch 토큰을 프레임 평균 + 프레임별 변화량으로 나눠 줌
+p.add_argument('--sem_loc', type=int, default=0, choices=[0, 1, 2, 4, 8, 16])   # 11-15 A: (branch) Semantic 위치 토큰 g×g개를 토큰 1개에 더해 줌 (0 = 끔)
+p.add_argument('--lam_nce', type=float, default=0.0)    # 11-15 C: > 0이면 출력 토큰 물체 간 대비 손실 (배치 InfoNCE, 유사도 = 토큰마다 cos 평균, 같은 물체 다른 표본은 음성에서 뺌)
+p.add_argument('--nce_temp', type=float, default=0.02)
 p.add_argument('--v_pool', type=int, default=1, choices=[1, 2, 4, 8])   # (branch) patch 토큰을 이웃 k×k끼리 평균 (2 → 프레임당 64개)
 p.add_argument('--enc_unfreeze', type=int, default=0)   # 11-12: > 0이면 피험자별 ViT 마지막 n개 블록 + norm을 같이 학습 (체크포인트에 같이 저장)
 p.add_argument('--enc_lr', type=float, default=1e-5)     # 푼 ViT 블록 학습률
@@ -163,7 +166,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
@@ -235,6 +238,7 @@ if a.feat_norm and step == 0:                                                   
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
 KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'vt', 'v_adv', 'v_adv_acc', 'subj', 'subj_acc']
 if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']
+if a.lam_nce > 0: KEYS += ['tok_nce', 'tok_nce_acc']
 if PAIRED or a.lam_rem > 0: KEYS += ['share_s', 'share_s_acc', 'share_v', 'share_v_acc', 'rem_g', 'rem', 'rem_r2_sv', 'rem_r2_svp']   # 11-11 P = 나머지
 if SEP: KEYS += ['tc', 'd_loss', 'd_acc', 'hsic']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
@@ -252,7 +256,18 @@ TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambd
          'vadv': lambda L: L['v_adv'], 'img': lambda L: a.lam_img * L['img_cos'] + a.lam_img_nce * L['img_nce'],
          'sep': lambda L: a.lam_tc * L.get('tc', 0.0) + a.lam_hsic * L.get('hsic', 0.0),
          'share': lambda L: a.lam_share * min(1.0, step / max(1, a.share_warm)) * (L.get('share_s', 0.0) + (L.get('share_v', 0.0) if a.share_on == 'sv' else 0.0)),
-         'rem': lambda L: a.lam_rem * (L.get('rem_g', 0.0) + L.get('rem', 0.0))}
+         'rem': lambda L: a.lam_rem * (L.get('rem_g', 0.0) + L.get('rem', 0.0)),
+         'nce': lambda L: a.lam_nce * L.get('tok_nce', 0.0)}
+
+
+def tok_nce(out, b):
+    """11-15 C: 예측 i와 정답 j의 유사도 = 토큰마다 cos 평균 → 온도 τ로 CE (정답 = 자기 물체). 같은 물체의 다른 표본(다른 피험자)은 음성에서 뺌.
+    평균(범주 템플릿)에 가까운 출력은 같은 범주 다른 물체와 구분이 안 돼 손실이 큼 → 물체마다 다른 출력을 내게 함"""
+    p = torch.nn.functional.normalize(out['cond_tokens'].float(), dim=-1).flatten(1); g = torch.nn.functional.normalize(b['cond_tokens'].float(), dim=-1).flatten(1)
+    S = p @ g.t() / out['cond_tokens'].shape[1]; o = b['obj']; o = o if torch.is_tensor(o) else torch.tensor([hash(x) for x in o], device=S.device)
+    eye = torch.eye(len(S), dtype=torch.bool, device=S.device); S = S.masked_fill((o[:, None] == o[None]).to(S.device) & ~eye, -1e4)
+    lg = S / a.nce_temp; y = torch.arange(len(S), device=S.device)
+    return torch.nn.functional.cross_entropy(lg, y), (lg.argmax(-1) == y).float().mean()
 
 
 def prem_losses(out, b, L, paired):
@@ -280,6 +295,7 @@ def validate(loader=None, tag='val'):
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
         L = prism_losses(out, b)
+        if a.lam_nce > 0 and len(b['cls']) > 1: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if PAIRED or a.lam_rem > 0:
             for k in G: G[k].append((out[k] if k in out else b[k]).float().cpu()) if (k in out or k in b) else None
         if SEP and len(b['cls']) > 2:
@@ -329,6 +345,7 @@ while not done:
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'])
         L = prism_losses(out, b); prem_losses(out, b, L, PAIRED)
+        if a.lam_nce > 0: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if SEP:
             pt = PARTS(out)
             if disc is not None: L['tc'] = tc_enc(disc, pt)

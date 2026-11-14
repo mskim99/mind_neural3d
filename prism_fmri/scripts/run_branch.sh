@@ -22,6 +22,9 @@ flags() { case $1 in a) echo "$EP --mem branch";; asv) echo "$EP --mem branch --
                      ap) echo "$EP --mem branch --v_pool 2";;     # a에서 patch 토큰을 이웃 2×2 평균 (6 × 64 = 384개)
                      au) echo "$EU --mem branch";;
                      aup) echo "$EU --mem branch --v_pool 2";; ausvp) echo "$EU --mem branch --v_pool 2 --sv_enc 0";;   # 11-13: patch 2×2 묶음 + SV Encoder 뺌 (aup · ausv를 합친 것, SV Encoder × 묶음 2×2 비교용)
+                     ausvpl) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --sem_loc ${SL:-4}";;   # 11-15 A: ausvp + Semantic 위치 토큰 g×g (SL, 기본 4 → 16개)
+                     ausvpn) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --lam_nce ${LN:-0.1} --nce_temp ${NT:-0.02}";;   # 11-15 C: ausvp + 출력 토큰 대비 손실
+                     ausvpln) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --sem_loc ${SL:-4} --lam_nce ${LN:-0.1} --nce_temp ${NT:-0.02}";;   # 11-15 A + C
                      ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";;
                      x) echo "$EX --mem branch";; xp) echo "$EX --mem branch --v_pool 2";; xsv) echo "$EX --mem branch --sv_enc 0";; xc) echo "$EX --mem branch --v_center 1";; *) echo BAD;; esac; }
 EX=${EX:-}; for n in $RUNS; do case $n in x|xp|xsv|xc) [ -n "$EX" ] || { echo "x 계열은 EX(바탕 인코더 옵션)가 필요"; exit 1; };; esac; done

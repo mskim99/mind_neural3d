@@ -159,7 +159,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -245,6 +245,10 @@ class Prism(nn.Module):
             vt = lambda: nn.Sequential(nn.LayerNorm(dv), nn.Linear(dv, dc), nn.GELU(), nn.Linear(dc, dc))
             self.var_tok = nn.ModuleList([vt() for _ in range(K)])         # V 채널 patch 토큰 → dc (피험자별)
             if self.v_center: self.var_tok_r = nn.ModuleList([vt() for _ in range(K)])   # 프레임별 변화량용
+            assert sem_loc in (0, 1, 2, 4, 8, 16); self.sem_loc = sem_loc      # 11-15 A: Semantic 위치 토큰 g×g개 (0 = 끔, 토큰 1개만)
+            if sem_loc:                                                     # 고정 ViT patch 토큰(프레임 평균) → LN · Linear(d → dc) (피험자별) → 이웃 평균으로 g×g → + 위치 embedding
+                self.sem_loc_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(d), nn.Linear(d, dc)) for _ in range(K)])
+                self.sem_loc_pos = nn.Parameter(torch.randn(sem_loc * sem_loc, dc) * 0.02)
             assert v_pool in (1, 2, 4, 8); self.v_pool = v_pool           # 11-13: patch 토큰을 이웃 k×k끼리 평균 (2 → 프레임당 64개), 토큰 수 줄이기
             self.var_pos = nn.Parameter(torch.randn(256 // v_pool ** 2, dc) * 0.02)      # patch(뇌 조각) 위치 embedding, 공유 (피험자 모두 같은 평면 지도)
             self.dec = nn.ModuleList([BranchDecoderLayer(dc, 12, 4 * dc, dropout) for _ in range(dec_layers)])
@@ -318,6 +322,11 @@ class Prism(nn.Module):
             out['sem_clip'] = F.normalize(sv, dim=-1)
             if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, sv)
             sem_feat = _route(self.sem_tok, subj, sv)[:, None]                       # Semantic Features [B, 1, dc]
+            out['sem_vec'] = sem_feat[:, 0]
+            if self.sem_loc:                                                         # 11-15 A: + 위치 토큰 g×g개 → [B, 1 + g², dc] (디코더 Semantic cross-attention이 위치마다 다른 곳을 볼 수 있게)
+                g = self.sem_loc; k = 16 // g; lt = _route(self.sem_loc_proj, subj, tok[:, :, 1:].mean(1))   # [B, 256, dc]
+                lt = lt.reshape(B, g, k, g, k, -1).mean((2, 4)).flatten(1, 2) + self.sem_loc_pos
+                sem_feat = torch.cat([sem_feat, lt], 1)
         elif self.sem_clip == 'front':
             st = _route(self.sem_clip_proj, subj, st)                                # CLIP 공간 [B, 256, 1024]
             if hasattr(self, 'sem_lin'): st = st + _route(self.sem_lin, subj, fmri.mean(1).flatten(1).to(st.dtype))[:, None]   # 원 신호 선형 경로
@@ -325,7 +334,7 @@ class Prism(nn.Module):
             out['sem_clip'] = F.normalize(st.mean(1), dim=-1)
             if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, st.mean(1))   # [B, 1024] (정규화 전)
         if self.mem != 'branch': sem_feat = _route(self.sem_enc, subj, st.transpose(1, 2).reshape(B, -1, 16, 16)).flatten(2).transpose(1, 2)
-        out['sem_vec'] = sem_feat.mean(1)
+        if 'sem_vec' not in out: out['sem_vec'] = sem_feat.mean(1)
         if self.sem_clip == 'back':
             out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
         # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Scale · Ratio (csr: Center · Scale · Rotate) → Aggregate → Variational Features [B, T, dc]
@@ -416,7 +425,7 @@ def build_from_ckpt(ck, repo):
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
-                  mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1))
+                  mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0))
     check_load(model, ck['model'])
     return model
 
