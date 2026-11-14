@@ -13,12 +13,13 @@
 #  학습만 함 (추론 · GLB · 평가는 고른 것만 따로) → $W/prism_branch/<이름>, 로그 logs/prism_branch_<이름>.log (BRANCH_DONE)
 # 사용: GPU=1 nohup bash run_branch.sh > $W/logs/prism_branch.log 2>&1 < /dev/null & disown
 #       동작 확인(60스텝, 차례로): TEST=1 GPU=1 bash run_branch.sh        진행: SET=branch watch -n 1 bash status_reg.sh
-SUBS=sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008
+SUBS=${SUBS:-sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008}   # 11-15: 2명 학습은 SUBS=sub-0001,sub-0006
 source $(dirname $0)/common.sh || exit 1
 RUNS=${RUNS:-"a asv ac ap au"}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000,15000}; HOLD=${HOLD:-8}; TEST=${TEST:-0}
 PY=$W/venv/bin/python; PUB=$W/weights/MinD-3D-pp/fMRI-Shape; U=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=${OUT:-$W/prism_branch}; LP=${LP:-prism_branch}   # OUT · LP: 다른 스텝 수로 처음부터 다시 돌릴 때 폴더 · 로그 이름을 따로 (예: OUT=$W/prism_branch40 LP=prism_branch40 STEPS=40000)
 EP="--enc_dir $PUB"; EU="--enc_path $U --in_norm 1 --feat_norm 1 --vit_lin 32"
-flags() { case $1 in a) echo "$EP --mem branch";; asv) echo "$EP --mem branch --sv_enc 0";; ac) echo "$EP --mem branch --v_center 1";;
+flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인코더 + 이전 구조 cat), 2명 학습 대조용
+                     a) echo "$EP --mem branch";; asv) echo "$EP --mem branch --sv_enc 0";; ac) echo "$EP --mem branch --v_center 1";;
                      ap) echo "$EP --mem branch --v_pool 2";;     # a에서 patch 토큰을 이웃 2×2 평균 (6 × 64 = 384개)
                      au) echo "$EU --mem branch";;
                      aup) echo "$EU --mem branch --v_pool 2";; ausvp) echo "$EU --mem branch --v_pool 2 --sv_enc 0";;   # 11-13: patch 2×2 묶음 + SV Encoder 뺌 (aup · ausv를 합친 것, SV Encoder × 묶음 2×2 비교용)
