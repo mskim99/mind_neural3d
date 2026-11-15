@@ -15,9 +15,9 @@ for t in 1 2 3; do
 done
 k=$(ls $g/*/*.glb 2>/dev/null | wc -l); echo "T|$N s$s|GLB $k/104 (수리)|$(date +%H:%M:%S)"; [ $k -ge 104 ] || { echo "GLB 부족 → 멈춤"; exit 1; }
 mkdir -p $Yd
-for t in 1 2 3; do
+for t in 1 2 3 4 5; do                                    # 11-16: Blender도 GPU 메모리를 3.5 GB씩 씀 → 꽉 찬 GPU에서는 바로 죽음, 렌더 전 여유 대기
   [ -f $Yd/yawsel.json ] && break
-  ls $g/*/*.glb > $Yd/list.txt
+  ls $g/*/*.glb > $Yd/list.txt; freewait 8000
   $FE_BLENDER -b -t 4 -P $V/scripts/render.py -- --list $Yd/list.txt --out_root $Yd/render --res 512 --light 8000 --camera_dist 1.5 --fov 56 \
     --views $(seq -s, 0 30 330 | sed 's/\([0-9]*\)/\1:30/g') --metallic0 2>&1 | grep -E "FAIL" | head -3
   k=$(find $Yd/render -name '*.png' | wc -l); [ $k -ge 1248 ] || { echo "R!|$N s$s 방향 렌더 $k/1248 → 다시 ($t)"; continue; }
@@ -26,7 +26,7 @@ done
 [ $(ls $Yd/glb/*/*.glb 2>/dev/null | wc -l) -ge 104 ] || $PY $PR/yaw_apply.py --glb $g --sel $Yd/yawsel.json --out $Yd/glb | grep YAWAPPLY
 for t in 1 2 3; do
   grep -q "R2|LPIPS" $V/out/$E/values.txt 2>/dev/null && break
-  [ $t -gt 1 ] && freewait 22000
+  freewait $([ $t -gt 1 ] && echo 22000 || echo 8000)
   bash $V/run_eval.sh $E $Yd/glb glb $GPU > $F/logs/eval_$E.log 2>&1
   grep -q "R2|LPIPS" $V/out/$E/values.txt 2>/dev/null || echo "E!|$N s$s 외형 지표 없음 → 다시 ($t)"
 done
