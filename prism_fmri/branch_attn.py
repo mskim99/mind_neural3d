@@ -11,7 +11,8 @@
 #    Variational cross-attention 가중치: head 토큰(T개) 몫 / patch 토큰 몫 (균등 대비 배수), 엔트로피 ÷ log M, 평균 지도와 cos, 물체끼리 cos,
 #             값 크기까지 본 head 토큰 몫, patch 위치 상위 5개 몫(프레임 합), 프레임별 patch 몫, query 위치(37×37)와 보는 patch 위치(G×G)의 상관
 #  [ABL] 갈래 바꿔 끼우기 (test 104 평균으로): S · V 전체 · V head 토큰 · V patch 토큰 → d_out(1 − cos 원본) · d_gt(정답 cos 변화)
-#  출력 <out>/<sub>.json, <out>/<sub>_maps.npz (Semantic pooling 평균 지도 [256] · 범주별 [C, 256], Variational patch 몫 지도 [L, G²])
+#  출력 <out>/<sub>.json, <out>/<sub>_maps.npz (Semantic pooling 평균 지도 [256] · 범주별 [C, 256], Variational patch 몫 지도 [L, G²],
+#        11-16 물체별 sem_obj [n, 256] · vpos_obj [n, L, G²] — 뇌 지도 대비 검정용)
 import os, sys, json, argparse, numpy as np, torch
 import torch.nn.functional as F
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -93,6 +94,7 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
             Z['wsum'] = wm.sum(0).double() if Z['wsum'] is None else Z['wsum'] + wm.sum(0).double(); Z['maps'].append(wm.half().cpu())
             pf = wm[..., T + NC:].reshape(B, -1, T, P2).sum(1)                         # [B, T, G²] (query 합)
             Z['frame'] = pf.sum(0).double().cpu() if Z['frame'] is None else Z['frame'] + pf.sum(0).double().cpu()
+            Z.setdefault('pobj', []).append(pf.sum(1).float().cpu())                   # 11-16 물체별 patch 위치 몫 [B, G²] (프레임 합, 뇌 지도 대비 검정용)
     AW = torch.cat(aw_all); y = CAT; n = len(TE); R = {}
     # ---- Semantic pooling
     ent = float((-(AW.clamp_min(1e-12).log() * AW).sum(-1) / np.log(AW.shape[1])).mean()); eff = float((1 / (AW ** 2).sum(-1)).mean())
@@ -141,7 +143,8 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
     R['abl'] = abl; R['base_gt'] = float(base.mean()); R['dep_out'] = float((1 - (O_mean ** 2).sum(-1) / (OO ** 2).sum(-1).mean(0)).mean())
     R['mean_gt'] = float(cg(O_mean.expand_as(OO)).mean())                   # 모든 물체에 평균 출력을 줬을 때 정답 cos (출력이 물체를 얼마나 구분하나의 바닥)
     np.savez_compressed(f'{a.out}/{sub}_maps.npz', sem=mu.numpy(), sem_cat=np.stack([AW[torch.from_numpy(y == c)].mean(0).numpy() for c in range(len(SYN))]),
-                        vpos=np.stack([R[f'layer{li}'].pop('_pos') for li in range(L)]), G=G, classes=np.array(SYN))
+                        vpos=np.stack([R[f'layer{li}'].pop('_pos') for li in range(L)]), G=G, classes=np.array(SYN),
+                        sem_obj=AW.numpy(), vpos_obj=np.stack([torch.cat(st[li]['pobj']).numpy() for li in range(L)], 1), names=np.array(TE))   # 물체별 [n, 256] · [n, L, G²]
     OUT[sub] = R; s = R['sem']
     print(f"SEM| {sub} | ent {s['ent']:.3f} eff {s['eff']:.1f}/256 top10 {s['top10']:.3f} | 평균 지도 cos {s['fixed']:.3f} | 범주 안 {s['cat_in']:.3f} 밖 {s['cat_out']:.3f} | "
           f"‖pool‖ {s['n_pool']:.2f} ‖lin‖ {s['n_lin']:.2f} cos {s['cos_pl']:.2f} | acc 합 {s['acc_sum']:.3f} pool {s['acc_pool']:.3f} lin {s['acc_lin']:.3f} 균등pool+lin {s['acc_unif']:.3f} 균등pool {s['acc_unif_pool']:.3f}", flush=True)
