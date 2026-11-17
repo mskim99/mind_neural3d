@@ -109,7 +109,7 @@ while step < a.steps:
         opt.zero_grad(set_to_none=True); tot.backward(); opt.step(); step += 1; th.step()
         if step % a.print_every == 0:
             el = time.time() - t0; print(f'step {step}/{a.steps} loss {float(loss):.4f} acc {float(acc):.3f} |g| {float(cal.g.abs().mean()):.3f} |b| {float(cal.b.abs().mean()):.3f} '
-                                         f'{step / el:.2f}스텝/초 남은 {(a.steps - step) / (step / el) / 60:.0f}분 종료 {time.strftime("%H:%M", time.localtime(time.time() + (a.steps - step) / (step / el)))} {th.tag()}', flush=True)
+                                         f'{step / el:.2f}스텝/초 남은 {(a.steps - step) / (step / el) / 60:.0f}분 종료 {time.strftime("%H:%M", time.gmtime(time.time() + 9 * 3600 + (a.steps - step) / (step / el)))} {th.tag()}', flush=True)
         if step % a.eval_every == 0 and step < a.steps: hist.append(eval_all(step))
 hist.append(eval_all(step))
 b0, b1 = hist[0]['hold'], hist[-1]['hold']

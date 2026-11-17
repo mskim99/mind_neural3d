@@ -4,7 +4,7 @@
 #  우리 = 명령줄에 /home/oem/jhj 또는 prism · calib · blender · trellis가 있는 프로세스
 # 사용: watch -n 1 bash /home/oem/jhj/MinD-3D++/mind_neural3d/prism_fmri/scripts/polite_watch.sh
 ours() { tr '\0' ' ' 2>/dev/null < /proc/$1/cmdline | grep -qE '/home/oem/jhj|prism|calib|blender|trellis|run_branch|run_yaw'; }
-echo "지금 $(date +%H:%M:%S) KST | CPU 부하(1·5·15분) $(cut -d' ' -f1-3 /proc/loadavg) / $(nproc)코어 | 우리 CPU 합 $(ps -u oem -o pid=,pcpu= | while read p c; do ours $p && echo $c; done | awk '{s+=$1} END{printf "%.0f%%", s}')"
+echo "지금 $(TZ=Asia/Seoul date +%H:%M:%S) KST | CPU 부하(1·5·15분) $(cut -d' ' -f1-3 /proc/loadavg) / $(nproc)코어 | 우리 CPU 합 $(ps -u oem -o pid=,pcpu= | while read p c; do ours $p && echo $c; done | awk '{s+=$1} END{printf "%.0f%%", s}')"
 echo; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader | awk -F', ' '{printf "GPU %s 전체 %s · %s / %s\n", $1, $2, $3, $4}'
 echo; printf "%-4s %-8s %-5s %-6s %-9s %s\n" GPU PID 누구 SM% 메모리 명령
 declare -A MEM; while IFS=', ' read pid m; do MEM[$pid]=$m; done < <(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits)
