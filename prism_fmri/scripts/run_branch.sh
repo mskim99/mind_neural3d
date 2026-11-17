@@ -47,12 +47,16 @@ one() {
   [ -f $M/model_final.pt ] && { echo "이미 있음 $n"; return; }
   echo "=== 학습 시작 $n ($(flags $n)) $(date +%H:%M:%S)"
   $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --bs 14 --max_step $STEPS \
-    --per_subject 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
+    --workers ${WK:-4} --per_subject 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
     --seed 1 --holdout $HOLD ${SAVE:+--save_steps $SAVE} $(flags $n) $X --resume --out_dir $M > $L 2>&1
   echo "=== 학습 끝 $n $(date +%H:%M:%S) | $(grep -E '^\[hold\]' $L | tail -1 | cut -c1-200)"
   [ $TEST = 1 ] && { grep -E 'Traceback|Error|out of memory' $L | tail -3; grep -oE 'step [0-9]+/[0-9]+.*' $L | tail -1 | cut -c1-160; nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' '; echo; }
 }
 if [ $TEST = 1 ]; then for n in $RUNS; do one $n; done
-else J=""; for n in $RUNS; do one $n & J="$J $!"; sleep 60; done; wait $J
+else J=""   # 11-17: 공용 GPU 배려 — 동시에 MAXJ개까지, GPU 남은 메모리 MINFREE MiB 이상 · CPU 1분 부하 LOADMAX 미만일 때만 새로 띄움
+  MAXJ=${MAXJ:-2}; MINFREE=${MINFREE:-20000}; LOADMAX=${LOADMAX:-40}
+  gate() { while :; do nrun=$(jobs -rp | wc -l); free=$(nvidia-smi -i $CUDA_VISIBLE_DEVICES --query-gpu=memory.free --format=csv,noheader,nounits); load=$(cut -d' ' -f1 /proc/loadavg)
+    [ $nrun -lt $MAXJ ] && [ $free -ge $MINFREE ] && awk "BEGIN{exit !($load < $LOADMAX)}" && return; sleep 30; done; }
+  for n in $RUNS; do gate; echo "=== 띄움 $n $(date +%H:%M:%S) | 도는 것 $nrun/$MAXJ · GPU 남은 ${free} MiB · 부하 $load"; one $n & J="$J $!"; sleep 120; done; wait $J
   echo "=== 요약 (검증 물체 기준)"; SET=branch OUT=$O LP=$LP RUNS="$RUNS" bash $PR/scripts/status_reg.sh | sed -n '/^요약/,$p'; fi
 echo "=== BRANCH_DONE $(date +%H:%M:%S)"
