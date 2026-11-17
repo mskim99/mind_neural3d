@@ -57,6 +57,7 @@ def within(pred):                                                               
     return float(np.mean(hit)), float(np.mean([1 / int((cy == c).sum()) for c in cy]))
 for spec in a.pred:
     name, d = spec.split('=', 1); ks = [k for k in te if os.path.exists(f'{d}/{k.split("/")[1]}.npy')]
+    if not ks: print(f'[{name}] 토큰 없음 — 건너뜀 ({d})'); continue
     if len(ks) < len(te): print(f'[{name}] 토큰 {len(ks)}/{len(te)}개만 있음 — 있는 것만');
     idx = [te.index(k) for k in ks]; P = torch.stack([torch.from_numpy(np.load(f'{d}/{k.split("/")[1]}.npy')).float().to(dev) for k in ks])
     Yk = Y[idx]; res[f'L_tok 모델 [{name}]'] = float(ltok(P, Yk).mean())
