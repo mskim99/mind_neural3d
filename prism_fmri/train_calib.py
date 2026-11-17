@@ -23,6 +23,8 @@ p.add_argument('--holdout', type=int, default=8); p.add_argument('--out_dir', re
 p.add_argument('--m', type=int, default=12); p.add_argument('--k', type=int, default=2)          # 배치 = 물체 m × 피험자 k
 p.add_argument('--steps', type=int, default=3000); p.add_argument('--lr', type=float, default=1e-2); p.add_argument('--temp', type=float, default=0.05)
 p.add_argument('--reg', type=float, default=1e-3)                                                  # 보정값 L2 (항등에서 너무 멀어지지 않게)
+p.add_argument('--bound', type=float, default=0.0); p.add_argument('--renorm', type=int, default=0, choices=[0, 1])   # 11-18 크기 묶기 (prism.RegionCalib)
+p.add_argument('--keep', type=float, default=0.0)   # 11-18 보존 항: λ · mean(1 − cos(보정 켠 특징, 보정 끈 특징)) — 피험자 간 정렬이 고정 ViT 특징을 바꿔 정보를 잃지 않게
 p.add_argument('--eval_every', type=int, default=500); p.add_argument('--print_every', type=int, default=50)
 p.add_argument('--polite', type=float, default=0)   # > 0: 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
 p.add_argument('--fit_subs', default=''); p.add_argument('--limit', type=int, default=0); p.add_argument('--fake_enc', type=int, default=0)   # fake_enc: 로컬 동작 확인용
@@ -49,19 +51,20 @@ else:
     from omegaconf import OmegaConf
     enc = load_encoder(a.enc_path, OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml')))
 enc = enc.to(dev).eval().requires_grad_(False)
-cal = RegionCalib(K).to(dev)
+cal = RegionCalib(K, bound=a.bound, renorm=bool(a.renorm)).to(dev)
 fit = [SUBS.index(s) for s in a.fit_subs.split(',')] if a.fit_subs else list(range(K))
 mask = torch.zeros(K, 1, device=dev); mask[fit] = 1
 for q in (cal.g, cal.b): q.register_hook(lambda g_: g_ * mask)                     # 고를 피험자 행만 학습
 opt = torch.optim.Adam(cal.parameters(), lr=a.lr); th = Throttle(a.polite)
 
 
-def feats(x, subj):
-    """x [B, T, 256, 256] → [B, 64·1024] 정규화 특징"""
+def feats(x, subj, on=True):
+    """x [B, T, 256, 256] → [B, 64·1024] 정규화 특징 (on=False: 보정 끔)"""
     if a.in_norm:
         m = (x != 0).to(x.dtype); n = m.sum((2, 3), keepdim=True).clamp_min(1); mu = (x * m).sum((2, 3), keepdim=True) / n
         sd = (((x - mu) ** 2 * m).sum((2, 3), keepdim=True) / n).sqrt() + 1e-6; x = (x - mu) / sd * m
-    x = cal(x, subj); B, T = x.shape[:2]
+    if on: x = cal(x, subj)
+    B, T = x.shape[:2]
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=dev == 'cuda'):
         t = enc.forward_encoder_wo_pred(x.reshape(B * T, 1, 256, 256)).view(B, T, 257, -1)[:, :, 1:].float().mean(1)   # [B, 256, 1024]
     return F.layer_norm(t, t.shape[-1:]).view(B, 8, 2, 8, 2, -1).mean((2, 4)).flatten(1)   # [B, 64·1024] (정규화 전)
@@ -89,7 +92,8 @@ def evaluate(split):
 
 
 def eval_all(step):
-    r = {s: evaluate(s) for s in ('hold', 'test')}; r['step'] = step; r['|g|'] = round(float(cal.g.detach().abs().mean()), 4); r['|b|'] = round(float(cal.b.detach().abs().mean()), 4)
+    r = {s: evaluate(s) for s in ('hold', 'test')}; r['step'] = step; _g, _b = (a.bound * torch.tanh(cal.g / a.bound), a.bound * torch.tanh(cal.b / a.bound)) if a.bound > 0 else (cal.g, cal.b)
+    r['|g|'] = round(float(_g.detach().abs().mean()), 4); r['|b|'] = round(float(_b.detach().abs().mean()), 4)
     print(f'[eval] step {step} | hold top1 {r["hold"]["top1"]:.3f} gap {r["hold"]["gap"]:.4f} | test top1 {r["test"]["top1"]:.3f} gap {r["test"]["gap"]:.4f} '
           f'(우연 {r["hold"]["chance"]:.3f}) | |g| {r["|g|"]:.3f} |b| {r["|b|"]:.3f}', flush=True)
     return r
@@ -104,11 +108,14 @@ while step < a.steps:
         for j in oi[:a.m]:
             for si in rng.choice(K, a.k, replace=False): xs.append(load(si, keys[j])); ss.append(int(si)); os_.append(int(j))
         x = torch.from_numpy(np.stack(xs)).to(dev); subj = torch.tensor(ss, device=dev); obj = torch.tensor(os_, device=dev)
-        z = center(feats(x, subj), subj); loss, acc = share_loss(z, obj, a.temp)
+        zr = feats(x, subj); z = center(zr, subj); loss, acc = share_loss(z, obj, a.temp)
         tot = loss + a.reg * (cal.g.pow(2).mean() + cal.b.pow(2).mean())
+        if a.keep > 0:
+            with torch.no_grad(): z0 = feats(x, subj, on=False)
+            kp = (1 - F.cosine_similarity(zr.float(), z0.float(), dim=-1)).mean(); tot = tot + a.keep * kp
         opt.zero_grad(set_to_none=True); tot.backward(); opt.step(); step += 1; th.step()
         if step % a.print_every == 0:
-            el = time.time() - t0; print(f'step {step}/{a.steps} loss {float(loss):.4f} acc {float(acc):.3f} |g| {float(cal.g.abs().mean()):.3f} |b| {float(cal.b.abs().mean()):.3f} '
+            el = time.time() - t0; print(f'step {step}/{a.steps} loss {float(loss):.4f} acc {float(acc):.3f} ' + (f'keep {float(kp):.4f} ' if a.keep > 0 else '') + f'|g| {float(cal.g.abs().mean()):.3f} |b| {float(cal.b.abs().mean()):.3f} '
                                          f'{step / el:.2f}스텝/초 남은 {(a.steps - step) / (step / el) / 60:.0f}분 종료 {time.strftime("%H:%M", time.gmtime(time.time() + 9 * 3600 + (a.steps - step) / (step / el)))} {th.tag()}', flush=True)
         if step % a.eval_every == 0 and step < a.steps: hist.append(eval_all(step))
 hist.append(eval_all(step))
@@ -116,6 +123,6 @@ b0, b1 = hist[0]['hold'], hist[-1]['hold']
 ok = b1['top1'] > b0['top1'] and b1['gap'] > b0['gap'] + max(0.002, 0.1 * abs(b0['gap'])) and b1['top1'] >= 2 * b1['chance']   # 11-17: 0 근처 값끼리 작은 변화는 정렬로 안 침
 note = '' if b0['top1'] >= 2 * b0['chance'] else ' | 보정 전 피험자 간 같은 물체 신호가 우연 수준'
 summary = f"hold top1 {b0['top1']:.3f}→{b1['top1']:.3f} (우연 {b1['chance']:.3f}) gap {b0['gap']:.4f}→{b1['gap']:.4f} ({'정렬됨' if ok else '개선 없음'}){note}"
-torch.save({'g': cal.g.detach().cpu(), 'b': cal.b.detach().cpu(), 'lab': cal.lab.cpu(), 'subs': SUBS, 'args': vars(a), 'hist': hist, 'summary': summary}, f'{a.out_dir}/calib.pt')
+torch.save({'g': cal.g.detach().cpu(), 'b': cal.b.detach().cpu(), 'bound': a.bound, 'renorm': a.renorm, 'lab': cal.lab.cpu(), 'subs': SUBS, 'args': vars(a), 'hist': hist, 'summary': summary}, f'{a.out_dir}/calib.pt')
 json.dump(hist, open(f'{a.out_dir}/calib_hist.json', 'w'), ensure_ascii=False, indent=1)
 print('CALIB_DONE', summary, flush=True)

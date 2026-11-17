@@ -158,9 +158,11 @@ def _route(mods, idx, x):
 class RegionCalib(nn.Module):
     """11-17 추가 논문 Perceptive 개선안: 피험자 · 뇌 영역별 입력 보정. 같은 정보라도 피험자마다 반응하는 영역 · 세기가 다르므로,
     fMRI 평면 지도(256²)의 영역 r(HCP-MMP, assets/mmp_256_regions.npy, 0 = 영역 없음)마다 피험자 s의 gain · offset: x' = (x · (1 + g[s, r]) + b[s, r]) · (x ≠ 0).
-    0 초기화 → 처음엔 보정 없음. 1단계(train_calib.py)에서 같은 물체 · 다른 피험자의 ViT 특징이 가까워지게 이것만 학습, 2단계에서는 고정."""
-    def __init__(self, n_subjects, lab=None):
-        super().__init__()
+    0 초기화 → 처음엔 보정 없음. 1단계(train_calib.py)에서 같은 물체 · 다른 피험자의 ViT 특징이 가까워지게 이것만 학습, 2단계에서는 고정.
+    11-18 크기 묶기 (진단: 묶지 않으면 입력이 2배 넘게 바뀌어 고정 ViT 특징의 범주 정보가 절반 이하로 줆):
+      bound > 0 → gain · offset = bound · tanh(값 / bound) (|·| < bound), renorm → 보정 뒤 프레임마다 0 아닌 픽셀 기준 z-score를 다시 함 (in_norm과 같은 식)"""
+    def __init__(self, n_subjects, lab=None, bound=0.0, renorm=False):
+        super().__init__(); self.bound = float(bound); self.renorm = bool(renorm)
         if lab is None:
             import os, numpy as np
             lab = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'mmp_256_regions.npy'))
@@ -168,15 +170,20 @@ class RegionCalib(nn.Module):
         self.g = nn.Parameter(torch.zeros(n_subjects, R)); self.b = nn.Parameter(torch.zeros(n_subjects, R))
 
     def forward(self, x, subj):                                                  # x [B, T, 256, 256], subj [B]
-        m = (x != 0).to(x.dtype); G = self.g[subj][:, self.lab]; Bo = self.b[subj][:, self.lab]   # [B, 256, 256]
-        return (x * (1 + G[:, None].to(x.dtype)) + Bo[:, None].to(x.dtype)) * m
+        g, b = (self.bound * torch.tanh(self.g / self.bound), self.bound * torch.tanh(self.b / self.bound)) if self.bound > 0 else (self.g, self.b)
+        m = (x != 0).to(x.dtype); G = g[subj][:, self.lab]; Bo = b[subj][:, self.lab]   # [B, 256, 256]
+        x = (x * (1 + G[:, None].to(x.dtype)) + Bo[:, None].to(x.dtype)) * m
+        if self.renorm:
+            n = m.sum((2, 3), keepdim=True).clamp_min(1); mu = (x * m).sum((2, 3), keepdim=True) / n
+            sd = (((x - mu) ** 2 * m).sum((2, 3), keepdim=True) / n).sqrt() + 1e-6; x = (x - mu) / sd * m
+        return x
 
 
 class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -191,7 +198,7 @@ class Prism(nn.Module):
         K = n_subjects
         Ks = 1 if shared_sv else K                                          # 11-17 Perceptive 개선안 2단계: Semantic · Variational을 피험자 공통 한 벌로 (보정은 RegionCalib가 맡음)
         self.shared_sv = bool(shared_sv)
-        if calib: self.calib = RegionCalib(K)
+        if calib: self.calib = RegionCalib(K, bound=calib_bound, renorm=calib_renorm)
         assert len(encs) == K, f'피험자 {K}명인데 ViT {len(encs)}개'
         self.splits = splits
         if feat_norm:
@@ -466,7 +473,8 @@ def build_from_ckpt(ck, repo):
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
                   mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
-                  calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)))
+                  calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
+                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)))
     check_load(model, ck['model'])
     return model
 

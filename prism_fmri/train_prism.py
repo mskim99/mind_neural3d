@@ -87,6 +87,9 @@ p.add_argument('--shared_sv', type=int, default=0, choices=[0, 1])   # 11-17: Se
 p.add_argument('--polite', type=float, default=0)   # 11-17: > 0이면 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
+a.calib_bound, a.calib_renorm = 0.0, 0                                   # 11-18: 1단계 보정 파일의 크기 묶기 설정을 그대로 씀 (체크포인트 args에 남아 추론에서도 같게)
+if a.calib_init:
+    _c0 = torch.load(a.calib_init, map_location='cpu'); a.calib_bound, a.calib_renorm = float(_c0.get('bound', 0) or 0), int(_c0.get('renorm', 0) or 0)
 if a.seed >= 0:
     import random; random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed); torch.cuda.manual_seed_all(a.seed)
 os.makedirs(a.out_dir, exist_ok=True)
@@ -176,7 +179,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm)).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
@@ -192,7 +195,7 @@ if a.calib_init:
     _c = torch.load(a.calib_init, map_location='cpu'); assert list(_c['subs']) == SUBS, f"보정 파일 피험자 {_c['subs']} ≠ {SUBS}"
     assert torch.equal(_c['lab'].long(), model.calib.lab.cpu()), '보정 파일의 영역 지도가 다름'
     model.calib.g.data.copy_(_c['g']); model.calib.b.data.copy_(_c['b']); model.calib.requires_grad_(False)
-    print(f"[calib] 1단계 보정 불러와 고정: {a.calib_init} | |g| {float(_c['g'].abs().mean()):.3f} |b| {float(_c['b'].abs().mean()):.3f} | 1단계 검증 {_c.get('summary', '')}", flush=True)
+    print(f"[calib] 1단계 보정 불러와 고정: {a.calib_init} | bound {a.calib_bound:g} renorm {a.calib_renorm} | |g| {float(_c['g'].abs().mean()):.3f} |b| {float(_c['b'].abs().mean()):.3f} | 1단계 검증 {_c.get('summary', '')}", flush=True)
 params = [q for q in model.parameters() if q.requires_grad]
 enc_params = model.unfreeze_encoder(a.enc_unfreeze) if a.enc_unfreeze > 0 else []
 if enc_params: print(f'[enc] ViT 마지막 {a.enc_unfreeze}블록 + norm 학습: {sum(q.numel() for q in enc_params) / 1e6:.1f}M, lr {a.enc_lr:g}', flush=True)

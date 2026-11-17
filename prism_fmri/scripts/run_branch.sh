@@ -32,6 +32,7 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      base_vres) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz}";;   # + Variational 잔차 (범주 평균 토큰 + PCA 32, = aupvr)
                      base_sharedsv) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0";;   # + S · V 피험자 공통 (이전 Perceptive FiLM · 피험자 분류 끔), 보정 없음 — 대조
                      base_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # + 1단계 영역별 보정(고정) = Perceptive 개선안
+                     base_sharedsv_calib_bound_keep) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:?CAL 필요 (크기 묶기 + 보존 항 1단계 calib.pt)}";;   # 11-18 보정 다시: 크기 묶기(bound · renorm) + 보존 항(keep), 설정은 calib.pt에 들어 있음
                      base_vres_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz} --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # V 잔차 + Perceptive 개선안 둘 다
                      ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";;
                      x) echo "$EX --mem branch";; xp) echo "$EX --mem branch --v_pool 2";; xsv) echo "$EX --mem branch --sv_enc 0";; xc) echo "$EX --mem branch --v_center 1";; *) echo BAD;; esac; }

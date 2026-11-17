@@ -32,9 +32,9 @@ load = lambda si, k_: np.load(os.path.join(a.data_root, SUBS[si], 'npy_data', k_
 
 from omegaconf import OmegaConf
 enc = load_encoder(a.enc_path, OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))).to(dev).eval().requires_grad_(False)
-cal = RegionCalib(K).to(dev); c = torch.load(a.calib, map_location='cpu'); assert list(c['subs']) == SUBS
+c = torch.load(a.calib, map_location='cpu'); assert list(c['subs']) == SUBS; cal = RegionCalib(K, bound=float(c.get('bound', 0) or 0), renorm=bool(int(c.get('renorm', 0) or 0))).to(dev)
 cal.g.data.copy_(c['g']); cal.b.data.copy_(c['b']); cal.requires_grad_(False)
-print(f'보정 {a.calib} | |g| {float(c["g"].abs().mean()):.3f} |b| {float(c["b"].abs().mean()):.3f} | {c.get("summary", "")}', flush=True)
+print(f'보정 {a.calib} | bound {cal.bound:g} renorm {int(cal.renorm)} | 원값 |g| {float(c["g"].abs().mean()):.3f} |b| {float(c["b"].abs().mean()):.3f} | {c.get("summary", "")}', flush=True)
 
 
 def norm_in(x):
