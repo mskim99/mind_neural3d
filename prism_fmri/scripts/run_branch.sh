@@ -47,7 +47,7 @@ one() {
   [ -f $M/model_final.pt ] && { echo "이미 있음 $n"; return; }
   echo "=== 학습 시작 $n ($(flags $n)) $(date +%H:%M:%S)"
   $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --bs 14 --max_step $STEPS \
-    --workers ${WK:-4} --per_subject 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
+    --workers ${WK:-4} --polite ${POLITE:-65} --per_subject 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
     --seed 1 --holdout $HOLD ${SAVE:+--save_steps $SAVE} $(flags $n) $X --resume --out_dir $M > $L 2>&1
   echo "=== 학습 끝 $n $(date +%H:%M:%S) | $(grep -E '^\[hold\]' $L | tail -1 | cut -c1-200)"
   [ $TEST = 1 ] && { grep -E 'Traceback|Error|out of memory' $L | tail -3; grep -oE 'step [0-9]+/[0-9]+.*' $L | tail -1 | cut -c1-160; nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr '\n' ' '; echo; }

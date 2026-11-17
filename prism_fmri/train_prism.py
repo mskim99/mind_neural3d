@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from omegaconf import OmegaConf
 from prism import Prism, prism_losses, load_encoder, check_load
+from polite import Throttle
 from sep_losses import TCDisc, tc_enc, tc_disc_update, hsic_loss, share_loss, rem_losses
 
 CLASSES = {'02691156': 'airplane', '02828884': 'bench', '02933112': 'cabinet', '02958343': 'car', '03001627': 'chair', '03211117': 'display',
@@ -83,6 +84,7 @@ p.add_argument('--v_res_basis', default='')   # 11-17: prep_vres_basis.py npz �
 p.add_argument('--calib', type=int, default=0, choices=[0, 1])   # 11-17 Perceptive 개선안: 피험자 · 영역별 입력 보정 (prism.RegionCalib)
 p.add_argument('--calib_init', default='')   # 1단계(train_calib.py) 결과 calib.pt — 주면 보정값을 불러와 고정 (2단계). 안 주면 보정도 같이 학습
 p.add_argument('--shared_sv', type=int, default=0, choices=[0, 1])   # 11-17: Semantic · Variational을 피험자 공통 한 벌로 (2단계)
+p.add_argument('--polite', type=float, default=0)   # 11-17: > 0이면 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 if a.seed >= 0:
@@ -353,7 +355,7 @@ def augment(x):
     return x
 
 
-t0 = time.time(); model.train(); done = step >= a.max_step; ep = step // max(1, len(tl))
+th = Throttle(a.polite); t0 = time.time(); model.train(); done = step >= a.max_step; ep = step // max(1, len(tl))
 while not done:
     ep += 1
     for b in tl:
@@ -369,14 +371,14 @@ while not done:
             if disc is not None: L['tc'] = tc_enc(disc, pt)
             if a.lam_hsic > 0: L['hsic'] = hsic_loss(pt)
         tot = total_loss(L)
-        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); (torch.nn.utils.clip_grad_norm_(enc_params, 1.0) if enc_params else None); opt.step(); sched.step(); step += 1
+        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); (torch.nn.utils.clip_grad_norm_(enc_params, 1.0) if enc_params else None); opt.step(); sched.step(); step += 1; th.step()
         if disc is not None: L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt)   # 본 backward 뒤 (판별기를 먼저 바꾸면 그래프가 깨짐)
         if step % a.print_every == 0:
             write('train', L, float(tot))
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
                   f'vt {float(L["vt"]):.4f} v_adv_acc {float(L["v_adv_acc"]):.3f} grl {model.grl_lam:.3f} '
-                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s', flush=True)
+                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s {th.tag()}', flush=True)
         if step % a.val_every == 0: validate_all()
         if step in SAVE_STEPS:
             torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_step{step}.pt'); print(f'saved model_step{step}.pt', flush=True)

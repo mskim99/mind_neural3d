@@ -14,6 +14,7 @@ sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__fi
 
 from prism import RegionCalib, load_encoder
 from sep_losses import share_loss
+from polite import Throttle
 
 p = argparse.ArgumentParser()
 p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--tgt', required=True)
@@ -23,6 +24,7 @@ p.add_argument('--m', type=int, default=12); p.add_argument('--k', type=int, def
 p.add_argument('--steps', type=int, default=3000); p.add_argument('--lr', type=float, default=1e-2); p.add_argument('--temp', type=float, default=0.05)
 p.add_argument('--reg', type=float, default=1e-3)                                                  # 보정값 L2 (항등에서 너무 멀어지지 않게)
 p.add_argument('--eval_every', type=int, default=500); p.add_argument('--print_every', type=int, default=50)
+p.add_argument('--polite', type=float, default=0)   # > 0: 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
 p.add_argument('--fit_subs', default=''); p.add_argument('--limit', type=int, default=0); p.add_argument('--fake_enc', type=int, default=0)   # fake_enc: 로컬 동작 확인용
 a = p.parse_args(); os.makedirs(a.out_dir, exist_ok=True)
 dev = 'cuda' if torch.cuda.is_available() else 'cpu'; FRAMES = list(range(2, 8)); SUBS = a.subs.split(','); K = len(SUBS)
@@ -51,7 +53,7 @@ cal = RegionCalib(K).to(dev)
 fit = [SUBS.index(s) for s in a.fit_subs.split(',')] if a.fit_subs else list(range(K))
 mask = torch.zeros(K, 1, device=dev); mask[fit] = 1
 for q in (cal.g, cal.b): q.register_hook(lambda g_: g_ * mask)                     # 고를 피험자 행만 학습
-opt = torch.optim.Adam(cal.parameters(), lr=a.lr)
+opt = torch.optim.Adam(cal.parameters(), lr=a.lr); th = Throttle(a.polite)
 
 
 def feats(x, subj):
@@ -104,10 +106,10 @@ while step < a.steps:
         x = torch.from_numpy(np.stack(xs)).to(dev); subj = torch.tensor(ss, device=dev); obj = torch.tensor(os_, device=dev)
         z = center(feats(x, subj), subj); loss, acc = share_loss(z, obj, a.temp)
         tot = loss + a.reg * (cal.g.pow(2).mean() + cal.b.pow(2).mean())
-        opt.zero_grad(set_to_none=True); tot.backward(); opt.step(); step += 1
+        opt.zero_grad(set_to_none=True); tot.backward(); opt.step(); step += 1; th.step()
         if step % a.print_every == 0:
             el = time.time() - t0; print(f'step {step}/{a.steps} loss {float(loss):.4f} acc {float(acc):.3f} |g| {float(cal.g.abs().mean()):.3f} |b| {float(cal.b.abs().mean()):.3f} '
-                                         f'{step / el:.2f}스텝/초 남은 {(a.steps - step) / (step / el) / 60:.0f}분 종료 {time.strftime("%H:%M", time.localtime(time.time() + (a.steps - step) / (step / el)))}', flush=True)
+                                         f'{step / el:.2f}스텝/초 남은 {(a.steps - step) / (step / el) / 60:.0f}분 종료 {time.strftime("%H:%M", time.localtime(time.time() + (a.steps - step) / (step / el)))} {th.tag()}', flush=True)
         if step % a.eval_every == 0 and step < a.steps: hist.append(eval_all(step))
 hist.append(eval_all(step))
 b0, b1 = hist[0]['hold'], hist[-1]['hold']

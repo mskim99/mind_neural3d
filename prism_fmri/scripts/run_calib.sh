@@ -12,5 +12,5 @@ X=""; [ $TEST = 1 ] && { OUT=$OUT/test; X="--steps 40 --eval_every 20 --print_ev
 mkdir -p $OUT; cd $W/run
 echo "=== 1단계 시작 $(date +%H:%M:%S) | 피험자 $SUBS | GPU $CUDA_VISIBLE_DEVICES | 디스크: $(df -h $W | tail -1 | awk '{print $4" 남음"}')"
 $PY $PR/train_calib.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --enc_path $U --in_norm 1 --holdout ${HOLD:-8} \
-  --steps $STEPS --out_dir $OUT $X ${EXTRA:-}
+  --steps $STEPS --polite ${POLITE:-65} --out_dir $OUT $X ${EXTRA:-}
 echo "=== 1단계 끝 $(date +%H:%M:%S)"
