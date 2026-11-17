@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 11-17 추가 논문 Perceptive 개선안 1단계: 피험자 · 영역별 입력 보정(prism.RegionCalib)만 학습해 피험자들의 뇌를 맞춤
 #  고정 ViT(--enc_path, 피험자 공통) 앞에 보정을 두고, 같은 물체를 본 다른 피험자의 ViT 특징이 가까워지게 대조 손실(sep_losses.share_loss)
-#  특징 = patch 토큰 프레임 평균 → 토큰마다 LayerNorm(학습 파라미터 없음) → 이웃 2×2 평균(64개) → 펴서 정규화
+#  특징 = patch 토큰 프레임 평균 → 토큰마다 LayerNorm(학습 파라미터 없음) → 이웃 2×2 평균(64개) → 펴서 피험자별 평균 빼기(배치 · 평가 세트 안) → 정규화
 #  배치 = 물체 m개 × 피험자 k명 (train에서 --holdout 뗀 물체 중 전 피험자에 있는 것)
 #  검증 (보정 전 = 0스텝, 이후 --eval_every마다, 끝): [hold] · [test]에서 "다른 피험자 표본 중 같은 물체 고르기" top-1 (우연 = 1/물체 수)과
 #    같은 물체 · 다른 피험자 cos 평균 − 다른 물체 cos 평균 (gap). 판정: [hold]가 보정 전보다 올라야 정렬이 된 것 (train만 오르면 외운 것)
@@ -19,7 +19,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--tgt', required=True)
 p.add_argument('--subs', required=True); p.add_argument('--enc_path', required=True); p.add_argument('--in_norm', type=int, default=1, choices=[0, 1])
 p.add_argument('--holdout', type=int, default=8); p.add_argument('--out_dir', required=True)
-p.add_argument('--m', type=int, default=8); p.add_argument('--k', type=int, default=2)          # 배치 = 물체 m × 피험자 k
+p.add_argument('--m', type=int, default=12); p.add_argument('--k', type=int, default=2)          # 배치 = 물체 m × 피험자 k
 p.add_argument('--steps', type=int, default=3000); p.add_argument('--lr', type=float, default=1e-2); p.add_argument('--temp', type=float, default=0.05)
 p.add_argument('--reg', type=float, default=1e-3)                                                  # 보정값 L2 (항등에서 너무 멀어지지 않게)
 p.add_argument('--eval_every', type=int, default=500); p.add_argument('--print_every', type=int, default=50)
@@ -62,8 +62,14 @@ def feats(x, subj):
     x = cal(x, subj); B, T = x.shape[:2]
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=dev == 'cuda'):
         t = enc.forward_encoder_wo_pred(x.reshape(B * T, 1, 256, 256)).view(B, T, 257, -1)[:, :, 1:].float().mean(1)   # [B, 256, 1024]
-    t = F.layer_norm(t, t.shape[-1:]).view(B, 8, 2, 8, 2, -1).mean((2, 4)).flatten(1)
-    return F.normalize(t, dim=-1)
+    return F.layer_norm(t, t.shape[-1:]).view(B, 8, 2, 8, 2, -1).mean((2, 4)).flatten(1)   # [B, 64·1024] (정규화 전)
+
+
+def center(z, subj):
+    """피험자마다 자기 표본 평균을 빼고 정규화 — 피험자 고유 성분(물체와 무관)을 없애야 피험자 간 같은 물체 신호가 보임 (본 모델 feat_norm과 같은 이유)"""
+    z = z.float().clone()
+    for s_ in subj.unique(): mk = subj == s_; z[mk] = z[mk] - z[mk].mean(0, keepdim=True)
+    return F.normalize(z, dim=-1)
 
 
 @torch.no_grad()
@@ -73,7 +79,7 @@ def evaluate(split):
         for i in range(0, len(ks), 16):
             x = torch.from_numpy(np.stack([load(si, k_) for k_ in ks[i:i + 16]])).to(dev)
             Z.append(feats(x, torch.full((len(x),), si, dtype=torch.long, device=dev)).half()); O += list(range(i, i + len(x))); S += [si] * len(x)
-    Z = torch.cat(Z).float(); O = torch.tensor(O, device=dev); S = torch.tensor(S, device=dev)
+    O = torch.tensor(O, device=dev); S = torch.tensor(S, device=dev); Z = center(torch.cat(Z), S)
     sim = Z @ Z.t(); other = S[:, None] != S[None]; same = (O[:, None] == O[None]) & other
     top1 = float((O[sim.masked_fill(~other, -2).argmax(-1)] == O).float().mean())
     gap = float(sim[same].mean() - sim[other & ~same].mean())
@@ -96,7 +102,7 @@ while step < a.steps:
         for j in oi[:a.m]:
             for si in rng.choice(K, a.k, replace=False): xs.append(load(si, keys[j])); ss.append(int(si)); os_.append(int(j))
         x = torch.from_numpy(np.stack(xs)).to(dev); subj = torch.tensor(ss, device=dev); obj = torch.tensor(os_, device=dev)
-        z = feats(x, subj); loss, acc = share_loss(z, obj, a.temp)
+        z = center(feats(x, subj), subj); loss, acc = share_loss(z, obj, a.temp)
         tot = loss + a.reg * (cal.g.pow(2).mean() + cal.b.pow(2).mean())
         opt.zero_grad(set_to_none=True); tot.backward(); opt.step(); step += 1
         if step % a.print_every == 0:
@@ -105,7 +111,9 @@ while step < a.steps:
         if step % a.eval_every == 0 and step < a.steps: hist.append(eval_all(step))
 hist.append(eval_all(step))
 b0, b1 = hist[0]['hold'], hist[-1]['hold']
-summary = f"hold top1 {b0['top1']:.3f}→{b1['top1']:.3f} gap {b0['gap']:.4f}→{b1['gap']:.4f} ({'정렬됨' if b1['gap'] > b0['gap'] and b1['top1'] >= b0['top1'] else '개선 없음'})"
+ok = b1['top1'] > b0['top1'] and b1['gap'] > b0['gap'] + max(0.002, 0.1 * abs(b0['gap'])) and b1['top1'] >= 2 * b1['chance']   # 11-17: 0 근처 값끼리 작은 변화는 정렬로 안 침
+note = '' if b0['top1'] >= 2 * b0['chance'] else ' | 보정 전 피험자 간 같은 물체 신호가 우연 수준'
+summary = f"hold top1 {b0['top1']:.3f}→{b1['top1']:.3f} (우연 {b1['chance']:.3f}) gap {b0['gap']:.4f}→{b1['gap']:.4f} ({'정렬됨' if ok else '개선 없음'}){note}"
 torch.save({'g': cal.g.detach().cpu(), 'b': cal.b.detach().cpu(), 'lab': cal.lab.cpu(), 'subs': SUBS, 'args': vars(a), 'hist': hist, 'summary': summary}, f'{a.out_dir}/calib.pt')
 json.dump(hist, open(f'{a.out_dir}/calib_hist.json', 'w'), ensure_ascii=False, indent=1)
 print('CALIB_DONE', summary, flush=True)
