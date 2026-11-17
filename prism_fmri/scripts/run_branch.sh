@@ -27,6 +27,9 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      ausvpn) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --lam_nce ${LN:-0.1} --nce_temp ${NT:-0.02}";;   # 11-15 C: ausvp + 출력 토큰 대비 손실
                      ausvpln) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --sem_loc ${SL:-4} --lam_nce ${LN:-0.1} --nce_temp ${NT:-0.02}";;   # 11-15 A + C
                      aupvr) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz}";;   # 11-17 추가 논문 Variational 임시 실험: aup(SV Encoder 유지) + 범주 평균 토큰 + Variational 잔차(PCA 32)를 출력에 더함 — 먼저 prep_vres_basis.py
+                     aupS) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0";;   # 11-17 Perceptive 개선안 대조: S · V 피험자 공통 한 벌 + 이전 Perceptive(FiLM · 피험자 분류) 끔, 보정 없음
+                     aupP) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # 11-17 Perceptive 개선안 2단계: aupS + 1단계 영역별 보정(고정) — 먼저 run_calib.sh
+                     aupvrP) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz} --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # 11-17 V 잔차 + P 개선 둘 다
                      ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";;
                      x) echo "$EX --mem branch";; xp) echo "$EX --mem branch --v_pool 2";; xsv) echo "$EX --mem branch --sv_enc 0";; xc) echo "$EX --mem branch --v_center 1";; *) echo BAD;; esac; }
 EX=${EX:-}; for n in $RUNS; do case $n in x|xp|xsv|xc) [ -n "$EX" ] || { echo "x 계열은 EX(바탕 인코더 옵션)가 필요"; exit 1; };; esac; done

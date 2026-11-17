@@ -155,11 +155,28 @@ def _route(mods, idx, x):
     return torch.cat(outs)[inv]
 
 
+class RegionCalib(nn.Module):
+    """11-17 추가 논문 Perceptive 개선안: 피험자 · 뇌 영역별 입력 보정. 같은 정보라도 피험자마다 반응하는 영역 · 세기가 다르므로,
+    fMRI 평면 지도(256²)의 영역 r(HCP-MMP, assets/mmp_256_regions.npy, 0 = 영역 없음)마다 피험자 s의 gain · offset: x' = (x · (1 + g[s, r]) + b[s, r]) · (x ≠ 0).
+    0 초기화 → 처음엔 보정 없음. 1단계(train_calib.py)에서 같은 물체 · 다른 피험자의 ViT 특징이 가까워지게 이것만 학습, 2단계에서는 고정."""
+    def __init__(self, n_subjects, lab=None):
+        super().__init__()
+        if lab is None:
+            import os, numpy as np
+            lab = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'mmp_256_regions.npy'))
+        lab = torch.as_tensor(lab).long(); self.register_buffer('lab', lab); R = int(lab.max()) + 1
+        self.g = nn.Parameter(torch.zeros(n_subjects, R)); self.b = nn.Parameter(torch.zeros(n_subjects, R))
+
+    def forward(self, x, subj):                                                  # x [B, T, 256, 256], subj [B]
+        m = (x != 0).to(x.dtype); G = self.g[subj][:, self.lab]; Bo = self.b[subj][:, self.lab]   # [B, 256, 256]
+        return (x * (1 + G[:, None].to(x.dtype)) + Bo[:, None].to(x.dtype)) * m
+
+
 class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -172,6 +189,9 @@ class Prism(nn.Module):
         self.encoders = nn.ModuleList([e.requires_grad_(False).eval() for e in encs])   # MinD-3D++ fMRI ViT (패치 16, 256×256 → 16×16 + CLS), 고정
         self.enc_grad = False                                          # True: 입력까지 기울기 (성분 지도용)
         K = n_subjects
+        Ks = 1 if shared_sv else K                                          # 11-17 Perceptive 개선안 2단계: Semantic · Variational을 피험자 공통 한 벌로 (보정은 RegionCalib가 맡음)
+        self.shared_sv = bool(shared_sv)
+        if calib: self.calib = RegionCalib(K)
         assert len(encs) == K, f'피험자 {K}명인데 ViT {len(encs)}개'
         self.splits = splits
         if feat_norm:
@@ -189,44 +209,44 @@ class Prism(nn.Module):
         # Semantic (피험자별 K벌)
         assert sem_clip in ('back', 'front'); self.sem_clip = sem_clip
         if mem == 'branch':                                                 # 11-13: attention pooling → CLIP Projection → 벡터 1개 → 토큰 1개
-            self.sem_pool = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1)) for _ in range(K)])   # patch마다 점수 → softmax = 어느 뇌 조각을 볼지
-            self.sem_clip_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])
-            self.sem_tok = nn.ModuleList([nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, dc)) for _ in range(K)])
+            self.sem_pool = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1)) for _ in range(Ks)])   # patch마다 점수 → softmax = 어느 뇌 조각을 볼지
+            self.sem_clip_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(Ks)])
+            self.sem_tok = nn.ModuleList([nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, dc)) for _ in range(Ks)])
         elif sem_clip == 'front':                                           # CLIP Projection이 경로 안 (Down Stage 앞)
-            self.sem_clip_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])
-            self.sem_enc = nn.ModuleList([SemanticEncoder(1024, sem_ch, sem_blocks, dc) for _ in range(K)])
+            self.sem_clip_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(ds), nn.Linear(ds, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(Ks)])
+            self.sem_enc = nn.ModuleList([SemanticEncoder(1024, sem_ch, sem_blocks, dc) for _ in range(Ks)])
         else:
-            self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(K)])
-            self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])   # 학습 감독용
+            self.sem_enc = nn.ModuleList([SemanticEncoder(ds, sem_ch, sem_blocks, dc) for _ in range(Ks)])
+            self.sem_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(Ks)])   # 학습 감독용
         if lin_path:                                                        # 11-12: Semantic 안 원 신호 선형 경로 (피험자별, 0 초기화 → 처음엔 기준과 같음)
             assert sem_clip == 'front', 'lin_path는 sem_clip front에서만'
-            self.sem_lin = nn.ModuleList([nn.Linear(256 * 256, 1024) for _ in range(K)])
+            self.sem_lin = nn.ModuleList([nn.Linear(256 * 256, 1024) for _ in range(Ks)])
             for m in self.sem_lin: nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
         if vit_lin:                                                         # 11-12: Semantic 안 ViT 출력 선형 읽기 (위치 유지, 피험자별): 패치마다 Linear(d → r) → 256 × r 펴서 Linear → 1024, 비선형 없음, 0 초기화
             assert sem_clip == 'front', 'vit_lin은 sem_clip front에서만'
-            self.sem_vred = nn.ModuleList([nn.Linear(d, vit_lin) for _ in range(K)]); self.sem_vlin = nn.ModuleList([nn.Linear(256 * vit_lin, 1024) for _ in range(K)])
+            self.sem_vred = nn.ModuleList([nn.Linear(d, vit_lin) for _ in range(Ks)]); self.sem_vlin = nn.ModuleList([nn.Linear(256 * vit_lin, 1024) for _ in range(Ks)])
             for m in self.sem_vlin: nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
         self.register_buffer('prototypes', torch.zeros(n_classes, 1024))
         if img_head:                                                        # 11-10 A안: Semantic 안 이미지 임베딩 head (CLIP Projection 출력 평균 → OpenCLIP ViT-H 이미지 임베딩 1024, unCLIP 입력)
             assert sem_clip == 'front', 'img_head는 sem_clip front에서만'
-            self.sem_img = nn.ModuleList([nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(K)])
+            self.sem_img = nn.ModuleList([nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(Ks)])
         # Variational (피험자별 K벌)
         assert var_heads in ('csr', 'sr', 'sil', 'view', 'shape'); self.var_heads = var_heads
         if var_heads in ('sil', 'view', 'shape'):           # shape (11-09): 범주 안 개체 형상 차이 (물체마다 고정, 프레임마다 같은 정답)                                    # 11-09: V = 변하는 정보 (물체 평균 · 프레임 평균을 뺀 실루엣 / 시점 특징), head 하나
             assert vdim > 0, 'sil · view · shape는 vdim 필요'
-            self.vhead = nn.ModuleList([PoseHead(2 * dv, vdim, head_dim) for _ in range(K)])
+            self.vhead = nn.ModuleList([PoseHead(2 * dv, vdim, head_dim) for _ in range(Ks)])
         else:
-            self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(K)])
+            self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(Ks)])
         if var_heads == 'csr':
-            self.center = nn.ModuleList([PoseHead(2 * dv, 2, head_dim) for _ in range(K)])
-            self.rotate = nn.ModuleList([PoseHead(2 * dv, 6, head_dim) for _ in range(K)])
+            self.center = nn.ModuleList([PoseHead(2 * dv, 2, head_dim) for _ in range(Ks)])
+            self.rotate = nn.ModuleList([PoseHead(2 * dv, 6, head_dim) for _ in range(Ks)])
         elif var_heads == 'sr':
-            self.ratio = nn.ModuleList([PoseHead(2 * dv, 3, head_dim) for _ in range(K)])
+            self.ratio = nn.ModuleList([PoseHead(2 * dv, 3, head_dim) for _ in range(Ks)])
         assert var_mode in ('feat', 'value'); self.var_mode = var_mode
         nh, nv = {'csr': (3, 12), 'sr': (2, 4)}.get(var_heads, (1, vdim))
         agg_in = nh * head_dim if var_mode == 'feat' else nv
         self.aggregate = nn.ModuleList([nn.Sequential(nn.Linear(agg_in, dc), nn.GELU(), nn.LayerNorm(dc)) if var_mode == 'feat' else
-                                        nn.Sequential(nn.Linear(agg_in, head_dim), nn.GELU(), nn.Linear(head_dim, dc), nn.GELU(), nn.LayerNorm(dc)) for _ in range(K)])
+                                        nn.Sequential(nn.Linear(agg_in, head_dim), nn.GELU(), nn.Linear(head_dim, dc), nn.GELU(), nn.LayerNorm(dc)) for _ in range(Ks)])
         # Perceptive (공유)
         self.grl_lam = 0.0                                                  # GRL 세기 (학습 스크립트가 스텝마다 정함)
         if grl_v:                                                           # 11-09: V에서 범주 정보 빼기 — Variational Features로 범주를 맞히는 분류기를 GRL 뒤에 붙임 (공유)
@@ -243,11 +263,11 @@ class Prism(nn.Module):
         if mem == 'branch':
             self.type_emb = nn.Parameter(torch.zeros(4, dc))             # Semantic / Variational head 토큰 / patch 토큰 / (v_center) 변화량 토큰
             vt = lambda: nn.Sequential(nn.LayerNorm(dv), nn.Linear(dv, dc), nn.GELU(), nn.Linear(dc, dc))
-            self.var_tok = nn.ModuleList([vt() for _ in range(K)])         # V 채널 patch 토큰 → dc (피험자별)
-            if self.v_center: self.var_tok_r = nn.ModuleList([vt() for _ in range(K)])   # 프레임별 변화량용
+            self.var_tok = nn.ModuleList([vt() for _ in range(Ks)])         # V 채널 patch 토큰 → dc (피험자별)
+            if self.v_center: self.var_tok_r = nn.ModuleList([vt() for _ in range(Ks)])   # 프레임별 변화량용
             assert sem_loc in (0, 1, 2, 4, 8, 16); self.sem_loc = sem_loc      # 11-15 A: Semantic 위치 토큰 g×g개 (0 = 끔, 토큰 1개만)
             if sem_loc:                                                     # 고정 ViT patch 토큰(프레임 평균) → LN · Linear(d → dc) (피험자별) → 이웃 평균으로 g×g → + 위치 embedding
-                self.sem_loc_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(d), nn.Linear(d, dc)) for _ in range(K)])
+                self.sem_loc_proj = nn.ModuleList([nn.Sequential(nn.LayerNorm(d), nn.Linear(d, dc)) for _ in range(Ks)])
                 self.sem_loc_pos = nn.Parameter(torch.randn(sem_loc * sem_loc, dc) * 0.02)
             assert v_pool in (1, 2, 4, 8); self.v_pool = v_pool           # 11-13: patch 토큰을 이웃 k×k끼리 평균 (2 → 프레임당 64개), 토큰 수 줄이기
             self.var_pos = nn.Parameter(torch.randn(256 // v_pool ** 2, dc) * 0.02)      # patch(뇌 조각) 위치 embedding, 공유 (피험자 모두 같은 평면 지도)
@@ -301,7 +321,9 @@ class Prism(nn.Module):
         if self.in_norm:
             m = (fmri != 0).to(fmri.dtype); n = m.sum((2, 3), keepdim=True).clamp_min(1); mu = (fmri * m).sum((2, 3), keepdim=True) / n
             sd = (((fmri - mu) ** 2 * m).sum((2, 3), keepdim=True) / n).sqrt() + 1e-6; fmri = (fmri - mu) / sd * m
-        with torch.set_grad_enabled(self.enc_grad and torch.is_grad_enabled()):
+        cg = hasattr(self, 'calib') and self.calib.g.requires_grad
+        if hasattr(self, 'calib'): fmri = self.calib(fmri, subj)                   # 11-17: 피험자 · 영역별 입력 보정 (in_norm 뒤)
+        with torch.set_grad_enabled((self.enc_grad or cg) and torch.is_grad_enabled()):   # 보정을 학습할 때는 고정 ViT를 거쳐 입력까지 기울기
             if len(self.encoders) == 1:
                 return self._vit(self.encoders[0], fmri)
             outs, order = [], []
@@ -443,7 +465,8 @@ def build_from_ckpt(ck, repo):
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
-                  mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0))
+                  mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
+                  calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)))
     check_load(model, ck['model'])
     return model
 

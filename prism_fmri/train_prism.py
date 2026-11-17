@@ -80,6 +80,9 @@ p.add_argument('--enc_unfreeze', type=int, default=0)   # 11-12: > 0이면 피�
 p.add_argument('--enc_lr', type=float, default=1e-5)     # 푼 ViT 블록 학습률
 p.add_argument('--save_steps', default='')              # '5000,10000': 그 스텝에서 model_step<N>.pt (학습 가중치만)
 p.add_argument('--v_res_basis', default='')   # 11-17: prep_vres_basis.py npz — 범주 평균 토큰 + Variational 잔차(PCA)를 출력에 더함. 주면 --view_tgt도 이 파일로, --var_heads shape 필요
+p.add_argument('--calib', type=int, default=0, choices=[0, 1])   # 11-17 Perceptive 개선안: 피험자 · 영역별 입력 보정 (prism.RegionCalib)
+p.add_argument('--calib_init', default='')   # 1단계(train_calib.py) 결과 calib.pt — 주면 보정값을 불러와 고정 (2단계). 안 주면 보정도 같이 학습
+p.add_argument('--shared_sv', type=int, default=0, choices=[0, 1])   # 11-17: Semantic · Variational을 피험자 공통 한 벌로 (2단계)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 if a.seed >= 0:
@@ -171,7 +174,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv)).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
@@ -182,6 +185,12 @@ if a.v_res:
     _b = np.load(a.v_res_basis); assert list(_b['classes']) == list(SYN), '기저 npz의 범주 순서가 SYN과 다름'
     model.res_mean.copy_(torch.from_numpy(_b['res_mean'])); model.res_U.copy_(torch.from_numpy(_b['res_U'])); model.res_sd.copy_(torch.from_numpy(_b['res_sd']))
     print(f'[v_res] 범주 평균 토큰 + Variational 잔차 PCA {a.v_res}개를 출력에 더함 ({a.v_res_basis})', flush=True)
+if a.calib_init:
+    assert a.calib, '--calib_init은 --calib 1과 같이'
+    _c = torch.load(a.calib_init, map_location='cpu'); assert list(_c['subs']) == SUBS, f"보정 파일 피험자 {_c['subs']} ≠ {SUBS}"
+    assert torch.equal(_c['lab'].long(), model.calib.lab.cpu()), '보정 파일의 영역 지도가 다름'
+    model.calib.g.data.copy_(_c['g']); model.calib.b.data.copy_(_c['b']); model.calib.requires_grad_(False)
+    print(f"[calib] 1단계 보정 불러와 고정: {a.calib_init} | |g| {float(_c['g'].abs().mean()):.3f} |b| {float(_c['b'].abs().mean()):.3f} | 1단계 검증 {_c.get('summary', '')}", flush=True)
 params = [q for q in model.parameters() if q.requires_grad]
 enc_params = model.unfreeze_encoder(a.enc_unfreeze) if a.enc_unfreeze > 0 else []
 if enc_params: print(f'[enc] ViT 마지막 {a.enc_unfreeze}블록 + norm 학습: {sum(q.numel() for q in enc_params) / 1e6:.1f}M, lr {a.enc_lr:g}', flush=True)
