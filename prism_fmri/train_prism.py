@@ -79,12 +79,17 @@ p.add_argument('--v_pool', type=int, default=1, choices=[1, 2, 4, 8])   # (branc
 p.add_argument('--enc_unfreeze', type=int, default=0)   # 11-12: > 0이면 피험자별 ViT 마지막 n개 블록 + norm을 같이 학습 (체크포인트에 같이 저장)
 p.add_argument('--enc_lr', type=float, default=1e-5)     # 푼 ViT 블록 학습률
 p.add_argument('--save_steps', default='')              # '5000,10000': 그 스텝에서 model_step<N>.pt (학습 가중치만)
+p.add_argument('--v_res_basis', default='')   # 11-17: prep_vres_basis.py npz — 범주 평균 토큰 + Variational 잔차(PCA)를 출력에 더함. 주면 --view_tgt도 이 파일로, --var_heads shape 필요
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 if a.seed >= 0:
     import random; random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed); torch.cuda.manual_seed_all(a.seed)
 os.makedirs(a.out_dir, exist_ok=True)
 VT, a.vdim = {}, 0
+a.v_res = 0
+if a.v_res_basis:
+    assert a.var_heads == 'shape', '--v_res_basis는 --var_heads shape와 같이'
+    a.view_tgt = a.v_res_basis; a.v_res = int(np.load(a.v_res_basis)['res_sd'].shape[0])
 if a.var_heads in ('sil', 'view', 'shape'):                                          # uid → ([6, vdim], ok)
     _z = np.load(a.view_tgt); _y = _z[a.var_heads].astype(np.float32); _ok = _z[a.var_heads + '_ok']
     VT = {str(k).split('/')[-1]: (_y[i], bool(_ok[i])) for i, k in enumerate(_z['keys'])}; a.vdim = int(_y.shape[-1])
@@ -166,13 +171,17 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
 d_opt = torch.optim.Adam(disc.parameters(), lr=a.tc_lr, betas=(0.5, 0.9)) if disc is not None else None
 PARTS = lambda o: [o['sem_vec'], o['var_vec'], o['perc_vec']]
 model.prototypes.copy_(build_prototypes())
+if a.v_res:
+    _b = np.load(a.v_res_basis); assert list(_b['classes']) == list(SYN), '기저 npz의 범주 순서가 SYN과 다름'
+    model.res_mean.copy_(torch.from_numpy(_b['res_mean'])); model.res_U.copy_(torch.from_numpy(_b['res_U'])); model.res_sd.copy_(torch.from_numpy(_b['res_sd']))
+    print(f'[v_res] 범주 평균 토큰 + Variational 잔차 PCA {a.v_res}개를 출력에 더함 ({a.v_res_basis})', flush=True)
 params = [q for q in model.parameters() if q.requires_grad]
 enc_params = model.unfreeze_encoder(a.enc_unfreeze) if a.enc_unfreeze > 0 else []
 if enc_params: print(f'[enc] ViT 마지막 {a.enc_unfreeze}블록 + norm 학습: {sum(q.numel() for q in enc_params) / 1e6:.1f}M, lr {a.enc_lr:g}', flush=True)

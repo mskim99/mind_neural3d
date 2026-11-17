@@ -159,7 +159,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -257,9 +257,25 @@ class Prism(nn.Module):
             layer = nn.TransformerDecoderLayer(dc, 12, 4 * dc, dropout=dropout, batch_first=True, norm_first=True)
             self.dec = nn.TransformerDecoder(layer, dec_layers)
         self.tok_out = nn.Sequential(nn.LayerNorm(dc), nn.Linear(dc, 1024))
+        # 11-17 추가 논문 개선안 (Variational 임시 실험): 조건 토큰 = 디코더 출력 + 범주 평균 토큰(Semantic 범주 확률로 섞음) + Variational 잔차(PCA 기저 v_res개)
+        #  Variational 정답 = (GT 토큰 − 범주 평균)의 PCA 계수 (표준화). 기저 · 범주 평균은 prep_vres_basis.py가 만들고 train_prism.py --v_res_basis로 채움 (체크포인트에 같이 저장)
+        self.v_res = v_res
+        if v_res:
+            assert var_heads == 'shape' and vdim == v_res, 'v_res는 --var_heads shape · 정답 차원(vdim) = 기저 개수일 때만'
+            self.register_buffer('res_mean', torch.zeros(n_classes, 1374, 1024, dtype=torch.float16))
+            self.register_buffer('res_U', torch.zeros(v_res, 1374, 1024, dtype=torch.float16)); self.register_buffer('res_sd', torch.ones(v_res))
 
     def train(self, mode=True):
         super().train(mode); self.encoders.eval(); return self
+
+    def _res_tokens(self, out):
+        """범주 평균 토큰(Semantic 범주 확률로 섞음, 기울기 안 보냄) + Variational 잔차 → [B, 1374, 1024]. out['res_base'] · out['res_var']도 남김."""
+        pr = torch.softmax(out['sem_clip'].float() @ self.prototypes.t().float() / 0.07, -1).detach()
+        base = (pr @ self.res_mean.flatten(1).float()).view(-1, 1374, 1024)
+        z = out['vt'].float().mean(1) * self.res_sd                                  # 프레임 평균 → 원래 계수 크기
+        rv = (z @ self.res_U.flatten(1).float()).view(-1, 1374, 1024)
+        out['res_base'] = base; out['res_var'] = rv
+        return base + rv
 
     def trainable_state_dict(self):
         """저장용: 고정 ViT(피험자마다 약 1 GB)는 빼고 저장. 불러올 때 ViT는 enc_paths에서 다시 읽음.
@@ -389,6 +405,7 @@ class Prism(nn.Module):
             x = self.query.expand(B, -1, -1)
             for l in self.dec: x = l(x, ms, mv)
             out['cond_tokens'] = self.tok_out(x)                                     # [B, 1374, 1024]
+            if self.v_res: out['cond_tokens'] = out['cond_tokens'] + self._res_tokens(out)
             return out
         # 재구성 (공유): [Semantic ; Variational] Features (Perceptive FiLM 보정) → 조건 토큰
         mem =torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
@@ -397,6 +414,7 @@ class Prism(nn.Module):
             gamma, beta = self.film(h).chunk(2, -1)
             mem = mem * (1 + gamma[:, None]) + beta[:, None]
         out['cond_tokens'] = self.tok_out(self.dec(self.query.expand(B, -1, -1), mem))   # [B, 1374, 1024]
+        if self.v_res: out['cond_tokens'] = out['cond_tokens'] + self._res_tokens(out)
         return out
 
 
@@ -425,7 +443,7 @@ def build_from_ckpt(ck, repo):
                   img_head=float(args.get('lam_img', 0) or 0) > 0 or float(args.get('lam_img_nce', 0) or 0) > 0,
                   film=bool(int(args.get('film', 1))), remainder=float(args.get('lam_rem', 0) or 0) > 0,
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
-                  mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0))
+                  mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0))
     check_load(model, ck['model'])
     return model
 
