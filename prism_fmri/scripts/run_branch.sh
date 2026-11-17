@@ -26,10 +26,13 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      ausvpl) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --sem_loc ${SL:-4}";;   # 11-15 A: ausvp + Semantic 위치 토큰 g×g (SL, 기본 4 → 16개)
                      ausvpn) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --lam_nce ${LN:-0.1} --nce_temp ${NT:-0.02}";;   # 11-15 C: ausvp + 출력 토큰 대비 손실
                      ausvpln) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --sem_loc ${SL:-4} --lam_nce ${LN:-0.1} --nce_temp ${NT:-0.02}";;   # 11-15 A + C
-                     aupvr) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz}";;   # 11-17 추가 논문 Variational 임시 실험: aup(SV Encoder 유지) + 범주 평균 토큰 + Variational 잔차(PCA 32)를 출력에 더함 — 먼저 prep_vres_basis.py
-                     aupS) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0";;   # 11-17 Perceptive 개선안 대조: S · V 피험자 공통 한 벌 + 이전 Perceptive(FiLM · 피험자 분류) 끔, 보정 없음
-                     aupP) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # 11-17 Perceptive 개선안 2단계: aupS + 1단계 영역별 보정(고정) — 먼저 run_calib.sh
-                     aupvrP) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz} --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # 11-17 V 잔차 + P 개선 둘 다
+                     aupvr) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz}";;   # 11-17 추가 논문 Variational 임시 실험 (= base_vres, 이미 이 이름으로 학습 중이라 남김) — 먼저 prep_vres_basis.py
+                     # 11-17 추가 논문 이름 규칙 (사용자): 지금 기준 = base (= aup: UKB 인코더 + 새 구조 + patch 2×2 묶음, SV Encoder 있음), 더한 것은 이름에 다 붙임
+                     base) echo "$EU --mem branch --v_pool 2";;
+                     base_vres) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz}";;   # + Variational 잔차 (범주 평균 토큰 + PCA 32, = aupvr)
+                     base_sharedsv) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0";;   # + S · V 피험자 공통 (이전 Perceptive FiLM · 피험자 분류 끔), 보정 없음 — 대조
+                     base_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # + 1단계 영역별 보정(고정) = Perceptive 개선안
+                     base_vres_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz} --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # V 잔차 + Perceptive 개선안 둘 다
                      ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";;
                      x) echo "$EX --mem branch";; xp) echo "$EX --mem branch --v_pool 2";; xsv) echo "$EX --mem branch --sv_enc 0";; xc) echo "$EX --mem branch --v_center 1";; *) echo BAD;; esac; }
 EX=${EX:-}; for n in $RUNS; do case $n in x|xp|xsv|xc) [ -n "$EX" ] || { echo "x 계열은 EX(바탕 인코더 옵션)가 필요"; exit 1; };; esac; done
