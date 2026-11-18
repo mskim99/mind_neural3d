@@ -106,7 +106,10 @@ if a.var_heads in ('sil', 'view', 'shape'):                                     
 OSIL = {}
 if a.oracle_sil:
     assert a.mem == 'branch', '--oracle_sil은 --mem branch에서만'
-    _z = np.load(a.oracle_sil); OSIL = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
+    _z = np.load(a.oracle_sil)                                                       # sil [N,10,32,32] uint8 (영상 프레임) · map [N,32,32] (공통) · map_<피험자> [N,32,32] (피험자별, 11-19 V-0 대조)
+    for _kk in _z.files:
+        if _kk == 'sil': OSIL.update({('*', str(u)): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])})
+        elif _kk == 'map' or _kk.startswith('map_'): OSIL.update({('*' if _kk == 'map' else _kk[4:], str(u)): _z[_kk][i].astype(np.float32) for i, u in enumerate(_z['uids'])})
     print(f'[oracle_sil] 정답 실루엣 지도 {len(OSIL)}개 (V-0 상한 진단)', flush=True)
 IMG = a.lam_img > 0 or a.lam_img_nce > 0; IMG_TGT = a.img_tgt or f'{a.tgt}/clipimg'
 dev = 'cuda'
@@ -143,7 +146,7 @@ def load_item(si, k):
             **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False)),
             **(lambda v: {'vt': torch.from_numpy(v[0]), 'vt_ok': v[1]})(VT.get(uid, (np.zeros((len(FRAMES), max(a.vdim, 1)), np.float32), False))),
             **({'img_emb': torch.from_numpy(np.load(f'{IMG_TGT}/{uid}.npy').astype(np.float32))} if IMG else {}),
-            **({'osil': torch.from_numpy(OSIL[uid])} if OSIL else {})}
+            **({'osil': torch.from_numpy(OSIL.get((SUBS[si], uid), OSIL.get(('*', uid))))} if OSIL else {})}
 
 
 class ShapeSet(Dataset):
