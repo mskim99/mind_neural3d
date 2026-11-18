@@ -22,6 +22,9 @@ a = p.parse_args()
 ck = torch.load(a.ckpt, map_location='cpu')
 SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8))
 model = build_from_ckpt(ck, a.repo).cuda().eval()   # 피험자별 체크포인트는 enc_paths에서 ViT, 옛 체크포인트(11-02 첫 학습)는 Temporal Stem 없음
+OSIL = {}
+if (ck.get('args') or {}).get('oracle_sil'):                 # 11-18 V-0: 정답 실루엣 지도 (진단 전용 상한, 학습 때 경로)
+    _z = np.load(ck['args']['oracle_sil']); OSIL = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
 print('load ok | per_subject', bool((ck.get('args') or {}).get('per_subject', 0)), '| subs', SUBS, flush=True)
 ids = [l.strip() for l in open(a.list or os.path.join(a.data_root, 'annotations', f'core_{a.split}_list.txt')) if l.strip()]
 assert not a.fmri_sub or (a.subs and ',' not in a.subs), '--fmri_sub는 --subs에 갈래 피험자 하나'
@@ -36,7 +39,8 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
         x = torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, dsub, 'npy_data', k + '.npy')).astype(np.float32)[FRAMES] for k in ks])).cuda()
         fi = torch.tensor(FRAMES).expand(len(ks), -1).cuda()
         with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(x, fi, torch.full((len(ks),), si, dtype=torch.long, device='cuda'), perceptive_override=None if a.perceptive == 'keep' else 'mean')
+            out = model(x, fi, torch.full((len(ks),), si, dtype=torch.long, device='cuda'), perceptive_override=None if a.perceptive == 'keep' else 'mean',
+                        sil=torch.from_numpy(np.stack([OSIL[k.split('/')[1]] for k in ks])).cuda() if OSIL else None)
         if a.tok_pool: comp['tok_pool'].append(pool(out['cond_tokens'].float()).half().cpu())
         for j, k in enumerate(ks if a.save_tokens else []):
             np.save(f'{od}/tokens/{k.split("/")[1]}.npy', out['cond_tokens'][j].float().half().cpu().numpy())

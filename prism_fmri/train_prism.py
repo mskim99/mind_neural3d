@@ -83,6 +83,7 @@ p.add_argument('--save_steps', default='')              # '5000,10000': 그 스�
 p.add_argument('--v_res_basis', default='')   # 11-17: prep_vres_basis.py npz — 범주 평균 토큰 + Variational 잔차(PCA)를 출력에 더함. 주면 --view_tgt도 이 파일로, --var_heads shape 필요
 p.add_argument('--calib', type=int, default=0, choices=[0, 1])   # 11-17 Perceptive 개선안: 피험자 · 영역별 입력 보정 (prism.RegionCalib)
 p.add_argument('--calib_init', default='')   # 1단계(train_calib.py) 결과 calib.pt — 주면 보정값을 불러와 고정 (2단계). 안 주면 보정도 같이 학습
+p.add_argument('--oracle_sil', default='')   # 11-18 V-0 (진단 전용 상한): silhouettes32.npz 경로 — 정답 실루엣 지도(영상 10프레임 평균)를 V 메모리에 넣음 (평가도 정답 사용)
 p.add_argument('--shared_sv', type=int, default=0, choices=[0, 1])   # 11-17: Semantic · Variational을 피험자 공통 한 벌로 (2단계)
 p.add_argument('--polite', type=float, default=0)   # 11-17: > 0이면 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
@@ -102,6 +103,11 @@ if a.var_heads in ('sil', 'view', 'shape'):                                     
     _z = np.load(a.view_tgt); _y = _z[a.var_heads].astype(np.float32); _ok = _z[a.var_heads + '_ok']
     VT = {str(k).split('/')[-1]: (_y[i], bool(_ok[i])) for i, k in enumerate(_z['keys'])}; a.vdim = int(_y.shape[-1])
     print(f'[view] {a.var_heads} 정답 {len(VT)}개 (정상 {int(_ok.sum())}), vdim {a.vdim}', flush=True)
+OSIL = {}
+if a.oracle_sil:
+    assert a.mem == 'branch', '--oracle_sil은 --mem branch에서만'
+    _z = np.load(a.oracle_sil); OSIL = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
+    print(f'[oracle_sil] 정답 실루엣 지도 {len(OSIL)}개 (V-0 상한 진단)', flush=True)
 IMG = a.lam_img > 0 or a.lam_img_nce > 0; IMG_TGT = a.img_tgt or f'{a.tgt}/clipimg'
 dev = 'cuda'
 SUBS = a.subs.split(',')
@@ -136,7 +142,8 @@ def load_item(si, k):
             'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k,
             **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False)),
             **(lambda v: {'vt': torch.from_numpy(v[0]), 'vt_ok': v[1]})(VT.get(uid, (np.zeros((len(FRAMES), max(a.vdim, 1)), np.float32), False))),
-            **({'img_emb': torch.from_numpy(np.load(f'{IMG_TGT}/{uid}.npy').astype(np.float32))} if IMG else {})}
+            **({'img_emb': torch.from_numpy(np.load(f'{IMG_TGT}/{uid}.npy').astype(np.float32))} if IMG else {}),
+            **({'osil': torch.from_numpy(OSIL[uid])} if OSIL else {})}
 
 
 class ShapeSet(Dataset):
@@ -179,7 +186,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil)).to(dev)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None
@@ -316,7 +323,7 @@ def validate(loader=None, tag='val'):
     for b in loader:
         b = to_dev(b)
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(b['fmri'], b['frame_idx'], b['subj'])
+            out = model(b['fmri'], b['frame_idx'], b['subj'], sil=b.get('osil'))
         L = prism_losses(out, b)
         if a.lam_nce > 0 and len(b['cls']) > 1: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if PAIRED or a.lam_rem > 0:
@@ -366,7 +373,7 @@ while not done:
         model.grl_lam = a.lam_vadv * (2 / (1 + math.exp(-10 * step / a.max_step)) - 1)
         if a.aug_noise > 0 or a.aug_mask > 0: b['fmri'] = augment(b['fmri'])
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(b['fmri'], b['frame_idx'], b['subj'])
+            out = model(b['fmri'], b['frame_idx'], b['subj'], sil=b.get('osil'))
         L = prism_losses(out, b); prem_losses(out, b, L, PAIRED)
         if a.lam_nce > 0: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if SEP:
