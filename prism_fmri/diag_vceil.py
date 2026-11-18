@@ -28,13 +28,15 @@ for k_ in tr_all: by.setdefault(k_.split('/')[0], []).append(k_)
 H = {k_ for v in by.values() for k_ in v[-a.holdout:]}
 VR = np.load(f'{a.tgt}/vres_basis_k32.npz'); RES = {str(k).split('/')[-1]: VR['shape'][i, 0] for i, k in enumerate(VR['keys'])}
 VS = np.load(f'{a.tgt}/view_targets_shape.npz'); SIL = {str(k).split('/')[-1]: (VS['shape'][i, 0], bool(VS['shape_ok'][i])) for i, k in enumerate(VS['keys'])}
+SM = np.load(f'{a.tgt}/silhouettes32.npz'); MAP = {str(u): SM['sil'][i].astype(np.float32).mean(0) / max(1.0, float(SM['sil'].max())) for i, u in enumerate(SM['uids'])}   # 영상 10프레임 평균 실루엣 32×32
 uid = lambda k_: k_.split('/')[1]
-has = lambda k_: uid(k_) in RES and uid(k_) in SIL and all(os.path.exists(os.path.join(a.data_root, s, 'npy_data', k_ + '.npy')) for s in SUBS)
+has = lambda k_: uid(k_) in RES and uid(k_) in MAP and uid(k_) in SIL and all(os.path.exists(os.path.join(a.data_root, s, 'npy_data', k_ + '.npy')) for s in SUBS)
 SPL = {'train': [k_ for k_ in tr_all if k_ not in H and has(k_)], 'hold': [k_ for k_ in tr_all if k_ in H and has(k_)], 'test': [k_ for k_ in lst('test') if has(k_)]}
 if a.limit: SPL = {s: v[:a.limit] for s, v in SPL.items()}
 CL = sorted(by); Y = {s: torch.tensor([CL.index(k_.split('/')[0]) for k_ in v], device=dev) for s, v in SPL.items()}
 TR = {s: torch.tensor(np.stack([RES[uid(k_)] for k_ in v]), device=dev).float() for s, v in SPL.items()}
 TS = {s: torch.tensor(np.stack([SIL[uid(k_)][0] for k_ in v]), device=dev).float() for s, v in SPL.items()}
+TM = {s: torch.tensor(np.stack([MAP[uid(k_)].ravel() for k_ in v]), device=dev).float() for s, v in SPL.items()}
 OK = {s: torch.tensor([SIL[uid(k_)][1] for k_ in v], device=dev) for s, v in SPL.items()}
 print('물체 ' + ' · '.join(f'{s} {len(v)}' for s, v in SPL.items()) + f' | 범주 {len(CL)}', flush=True)
 
@@ -93,7 +95,10 @@ def r2(P, T_, ok=None):
 
 LAMS = (0.01, 0.03, 0.1, 0.3, 1, 3, 10)
 R = {'chance_within': round(float(np.mean([1 / int((Y['test'] == c).sum()) for c in Y['test']])), 4)}
-TRc = cat_center(TR, 'res'); TSc = cat_center(TS, 'sil')
+TRc = cat_center(TR, 'res'); TSc = cat_center(TS, 'sil'); TMc = cat_center(TM, 'map')
+MU_M = TM['test'] - TMc['test']                                       # 정답 범주 평균 실루엣 (test)
+def pcorr(A, B): A = A - A.mean(1, keepdim=True); B = B - B.mean(1, keepdim=True); return float((F.normalize(A, dim=-1) * F.normalize(B, dim=-1)).sum(-1).mean())
+R['map 범주 평균만: 화소 상관'] = round(pcorr(MU_M, TM['test']), 4)
 for s in SUBS:
     raw, vit = {}, {}
     for sp in SPL: raw[sp], vit[sp] = collect(sp, s)
@@ -111,5 +116,9 @@ for s in SUBS:
         r = {'res_within_top1': round(within_top1(P, TRc['test'], Y['test']), 4), 'res_r2_mean': round(float(r2(P, TRc['test']).mean()), 4),
              'res_r2_top4': [round(float(v), 3) for v in r2(P, TRc['test'])[:4]], 'lam_res': lr,
              'sil_r2[cy,w,h,area]': [round(float(v), 3) for v in r2(Ps, TSc['test'], o)], 'sil_corr': [round(c, 3) for c in corr], 'lam_sil': ls}
+        lm = max((within_top1(krr(Xc['train'], TMc['train'], Xc['hold'], l), TMc['hold'], Y['hold']), l) for l in LAMS)[1]
+        Pm = krr(Xc['train'], TMc['train'], Xc['test'], lm)
+        r.update({'map_within_top1': round(within_top1(Pm, TMc['test'], Y['test']), 4), 'map_resid_corr': round(pcorr(Pm, TMc['test']), 4),
+                  'map_full_corr(범주평균+예측)': round(pcorr(MU_M + Pm, TM['test']), 4), 'lam_map': lm})
         R[f'{s} {fn}'] = r; print(f'[{s} {fn}]', json.dumps(r, ensure_ascii=False), flush=True)
 json.dump(R, open(a.out, 'w'), ensure_ascii=False, indent=1); print('VCEIL_DONE', a.out, f'{time.time() - t0:.0f}s', flush=True)
