@@ -1,0 +1,115 @@
+# -*- coding: utf-8 -*-
+# 11-18 진단: fMRI에 "같은 범주 안 형상 차이"(Variational이 맡을 정보)가 선형으로 얼마나 읽히나 — 학습 없음, 커널 릿지만
+#  V 개선안(V 잔차 · 공통 S·V)이 모두 실패한 뒤, 구조를 더 바꿀 가치가 있는지 상한을 잼
+#  입력 (피험자마다, 프레임 2~7 평균, in_norm 같은 식):
+#    raw:<영역묶음>  원 fMRI 평면 지도에서 그 영역 픽셀만 (HCP-MMP, assets/mmp_256_regions.*)
+#    vit             고정 UKB ViT 특징 (diag_calib.py와 같음: LayerNorm → 2×2 묶음 64개 → 폄)
+#  정답:
+#    res   GT 토큰(자극 프레임 0 DINOv2)의 범주 평균 뺀 잔차 PCA 32 계수 (vres_basis_k32.npz, 표준화)
+#    sil   현재 V head 정답 = 물체 평균 실루엣 [cy, w, h, area] − 범주 평균 (view_targets_shape.npz)
+#  범주 안 정보만 보려고 특징 · 정답 모두 정답 범주의 train 평균을 뺌 (범주는 맞혔다고 치는 상한)
+#  지표 (test): res → 같은 범주 test 물체 중 정답 고르기 top-1 (우연 ≈ 1/8), 계수 R²(평균) / sil → 성분별 R² · 상관
+#  λ는 hold로 고름 (res: 고르기 top-1, sil: R²)
+# 사용 (실행 위치 $W/run): python diag_vceil.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs sub-0001,sub-0006 --enc_path $U --out $W/prism_calib/vceil.json
+import os, sys, json, time, argparse, numpy as np, torch
+import torch.nn.functional as F
+sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from prism import load_encoder
+
+p = argparse.ArgumentParser()
+p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--tgt', required=True)
+p.add_argument('--subs', required=True); p.add_argument('--enc_path', required=True); p.add_argument('--holdout', type=int, default=8)
+p.add_argument('--out', required=True); p.add_argument('--limit', type=int, default=0)
+a = p.parse_args()
+dev = 'cuda'; FRAMES = list(range(2, 8)); SUBS = a.subs.split(','); t0 = time.time()
+lst = lambda s: [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{s}_list.txt')) if l.strip()]
+tr_all = lst('train'); by = {}
+for k_ in tr_all: by.setdefault(k_.split('/')[0], []).append(k_)
+H = {k_ for v in by.values() for k_ in v[-a.holdout:]}
+VR = np.load(f'{a.tgt}/vres_basis_k32.npz'); RES = {str(k).split('/')[-1]: VR['shape'][i, 0] for i, k in enumerate(VR['keys'])}
+VS = np.load(f'{a.tgt}/view_targets_shape.npz'); SIL = {str(k).split('/')[-1]: (VS['shape'][i, 0], bool(VS['shape_ok'][i])) for i, k in enumerate(VS['keys'])}
+uid = lambda k_: k_.split('/')[1]
+has = lambda k_: uid(k_) in RES and uid(k_) in SIL and all(os.path.exists(os.path.join(a.data_root, s, 'npy_data', k_ + '.npy')) for s in SUBS)
+SPL = {'train': [k_ for k_ in tr_all if k_ not in H and has(k_)], 'hold': [k_ for k_ in tr_all if k_ in H and has(k_)], 'test': [k_ for k_ in lst('test') if has(k_)]}
+if a.limit: SPL = {s: v[:a.limit] for s, v in SPL.items()}
+CL = sorted(by); Y = {s: torch.tensor([CL.index(k_.split('/')[0]) for k_ in v], device=dev) for s, v in SPL.items()}
+TR = {s: torch.tensor(np.stack([RES[uid(k_)] for k_ in v]), device=dev).float() for s, v in SPL.items()}
+TS = {s: torch.tensor(np.stack([SIL[uid(k_)][0] for k_ in v]), device=dev).float() for s, v in SPL.items()}
+OK = {s: torch.tensor([SIL[uid(k_)][1] for k_ in v], device=dev) for s, v in SPL.items()}
+print('물체 ' + ' · '.join(f'{s} {len(v)}' for s, v in SPL.items()) + f' | 범주 {len(CL)}', flush=True)
+
+lab = torch.as_tensor(np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'mmp_256_regions.npy'))).long().to(dev)
+NAME = {int(k): v for k, v in json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'mmp_256_regions.json'), encoding='utf-8')).items()}
+GROUP = {'초기시각 V1-V4': {'V1', 'V2', 'V3', 'V4'},
+         '등쪽 V3A·V3B·V6·V7·IPS1·MT·MST': {'V3A', 'V3B', 'V6', 'V6A', 'V7', 'IPS1', 'MT', 'MST', 'LO3'},
+         '배쪽·LO LO1·LO2·PIT·FFC·V8·VVC·PH': {'LO1', 'LO2', 'PIT', 'FFC', 'V8', 'VVC', 'PH', 'VMV1', 'VMV2', 'VMV3', 'TE2p', 'TF'}}
+gmask = {g: torch.isin(lab, torch.tensor([r for r, n in NAME.items() if n.split('_', 1)[-1] in names], device=dev)) for g, names in GROUP.items()}
+gmask['전체'] = lab > 0
+for g, m in gmask.items(): print(f'  영역 {g}: 픽셀 {int(m.sum())}', flush=True)
+
+from omegaconf import OmegaConf
+enc = load_encoder(a.enc_path, OmegaConf.load(os.path.join(a.repo, 'configs', 'mind3d_pp.yaml'))).to(dev).eval().requires_grad_(False)
+
+
+def norm_in(x):
+    m = (x != 0).to(x.dtype); n = m.sum((2, 3), keepdim=True).clamp_min(1); mu = (x * m).sum((2, 3), keepdim=True) / n
+    sd = (((x - mu) ** 2 * m).sum((2, 3), keepdim=True) / n).sqrt() + 1e-6; return (x - mu) / sd * m
+
+
+@torch.no_grad()
+def collect(split, s):
+    raw, vt = [], []
+    for i in range(0, len(SPL[split]), 16):
+        x = norm_in(torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, s, 'npy_data', k_ + '.npy')).astype(np.float32)[FRAMES] for k_ in SPL[split][i:i + 16]])).to(dev))
+        raw.append(x.mean(1).half())
+        B, T = x.shape[:2]
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            t = enc.forward_encoder_wo_pred(x.reshape(B * T, 1, 256, 256)).view(B, T, 257, -1)[:, :, 1:].float()
+        vt.append(F.layer_norm(t, t.shape[-1:]).view(B, T, 8, 2, 8, 2, -1).mean((3, 5)).flatten(2).mean(1).half())
+    return torch.cat(raw), torch.cat(vt)
+
+
+def cat_center(Xs, key):                     # 정답 범주의 train 평균 빼기 (특징 · 정답 같이)
+    mu = torch.stack([Xs['train'][Y['train'] == c].float().mean(0) if (Y['train'] == c).any() else torch.zeros_like(Xs['train'][0]).float() for c in range(len(CL))])
+    return {s: Xs[s].float() - mu[Y[s]] for s in Xs}
+
+
+def krr(Xtr, Ttr, Xev, lam):
+    Kt = Xtr @ Xtr.t(); A = torch.linalg.solve(Kt + lam * Kt.diagonal().mean() * torch.eye(len(Kt), device=dev), Ttr)
+    return Xev @ Xtr.t() @ A
+
+
+def within_top1(P, T_, y):
+    P_, T2 = F.normalize(P, dim=-1), F.normalize(T_, dim=-1); S = P_ @ T2.t(); hit = []
+    for i in range(len(P)):
+        m = (y == y[i]).nonzero().squeeze(1); hit.append(float(m[S[i, m].argmax()] == i))
+    return float(np.mean(hit))
+
+
+def r2(P, T_, ok=None):
+    if ok is not None: P, T_ = P[ok], T_[ok]
+    return (1 - ((P - T_) ** 2).sum(0) / ((T_ - T_.mean(0)) ** 2).sum(0)).cpu().numpy()
+
+
+LAMS = (0.01, 0.03, 0.1, 0.3, 1, 3, 10)
+R = {'chance_within': round(float(np.mean([1 / int((Y['test'] == c).sum()) for c in Y['test']])), 4)}
+TRc = cat_center(TR, 'res'); TSc = cat_center(TS, 'sil')
+for s in SUBS:
+    raw, vit = {}, {}
+    for sp in SPL: raw[sp], vit[sp] = collect(sp, s)
+    print(f'  {s} 특징 끝 {time.time() - t0:.0f}s', flush=True)
+    feats = {f'raw:{g}': {sp: raw[sp].flatten(1)[:, m.flatten()] for sp in SPL} for g, m in gmask.items()}
+    feats['vit'] = vit
+    for fn, Xs in feats.items():
+        Xc = cat_center(Xs, fn); Xc = {sp: F.normalize(v, dim=-1) for sp, v in Xc.items()}
+        lr = max((within_top1(krr(Xc['train'], TRc['train'], Xc['hold'], l), TRc['hold'], Y['hold']), l) for l in LAMS)[1]
+        P = krr(Xc['train'], TRc['train'], Xc['test'], lr)
+        ok_tr, ok_h = OK['train'], OK['hold']
+        ls = max((float(r2(krr(Xc['train'][ok_tr], TSc['train'][ok_tr], Xc['hold'], l), TSc['hold'], ok_h).mean()), l) for l in LAMS)[1]
+        Ps = krr(Xc['train'][ok_tr], TSc['train'][ok_tr], Xc['test'], ls)
+        o = OK['test']; corr = [float(np.corrcoef(Ps[o][:, j].cpu(), TSc['test'][o][:, j].cpu())[0, 1]) for j in range(Ps.shape[1])]
+        r = {'res_within_top1': round(within_top1(P, TRc['test'], Y['test']), 4), 'res_r2_mean': round(float(r2(P, TRc['test']).mean()), 4),
+             'res_r2_top4': [round(float(v), 3) for v in r2(P, TRc['test'])[:4]], 'lam_res': lr,
+             'sil_r2[cy,w,h,area]': [round(float(v), 3) for v in r2(Ps, TSc['test'], o)], 'sil_corr': [round(c, 3) for c in corr], 'lam_sil': ls}
+        R[f'{s} {fn}'] = r; print(f'[{s} {fn}]', json.dumps(r, ensure_ascii=False), flush=True)
+json.dump(R, open(a.out, 'w'), ensure_ascii=False, indent=1); print('VCEIL_DONE', a.out, f'{time.time() - t0:.0f}s', flush=True)
