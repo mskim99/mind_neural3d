@@ -70,7 +70,7 @@ for n, m in RM.items():
     cw = float(np.mean([float(((tez[i] @ cenz[i].t()).argmax(1) == yt).float().mean()) for i in range(len(SUBS))]))
     ntr = [F.normalize(t, dim=-1) for t in tr]; nte = [F.normalize(t, dim=-1) for t in te]; oh = F.one_hot(ytr, len(CL)).float(); rw = []; rc = []
     for i in range(len(SUBS)):
-        Kt = ntr[i] @ ntr[i].t(); A = torch.linalg.solve(Kt + 0.1 * Kt.diagonal().mean() * torch.eye(len(Kt), device=dev), oh)
+        Kt = ntr[i] @ ntr[i].t(); A = torch.linalg.solve(Kt.double() + (0.1 * Kt.diagonal().mean().double() + 1e-6) * torch.eye(len(Kt), device=dev, dtype=torch.float64), oh.double()).float()
         for j in range(len(SUBS)):
             acc_ = float(((nte[j] @ ntr[i].t() @ A).argmax(1) == yt).float().mean()); (rw if i == j else rc).append(acc_)
     r = {'px': int(m.sum()), 'rr_within': round(float(np.mean(rw)), 4), 'rr_cross': round(float(np.mean(rc)), 4),
