@@ -55,6 +55,7 @@ echo "디스크: $(df -h $W | tail -1 | awk '{print $4" 남음 ("$5")"}')"
 
 one() {
   local n=$1 M=$O/$1 L=$W/logs/${LP}_$1.log; [ $TEST = 1 ] && L=$W/logs/${LP}_test_$1.log
+  [ -f $W/SKIP_$n ] && { echo "SKIP_$n 있음 — 건너뜀 (다른 서버 몫)"; return; }   # 11-19: run 하나만 kill 없이 건너뛰기
   [ -f $M/model_final.pt ] && { echo "이미 있음 $n"; return; }
   echo "=== 학습 시작 $n ($(flags $n)) $(date +%H:%M:%S)"
   $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --bs 14 --max_step $STEPS \
