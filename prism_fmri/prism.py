@@ -183,11 +183,12 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
         self.feat_norm = feat_norm                                          # 11-12: 인코더 출력을 피험자 · 위치 · 차원별 train 평균 · 표준편차로 표준화 (값은 학습 스크립트가 채움, 체크포인트에 저장)
+        self.lin_norm = bool(lin_norm)                                      # 11-19 C-1: lin_path 입력을 in_norm과 같은 식으로 정규화 (diag_cls.py 선형 천장과 같은 입력)
         self.in_norm = in_norm                                              # 11-12: 인코더 입력을 프레임마다 0 아닌 픽셀 기준 z-score (UKB 사전학습 인코더용, 판정용 임시)
         self.drop = nn.Dropout(dropout)                                     # 11-12: 0이면 아무 일도 안 함 (이전 체크포인트와 같음)
         self.use_film = film                                                # False: ablation — Perceptive FiLM 보정 끔 (모듈은 남기되 안 씀)
@@ -368,7 +369,12 @@ class Prism(nn.Module):
         if self.mem == 'branch':                                                     # 11-13: attention pooling → CLIP Projection → 벡터 1개
             aw = torch.softmax(_route(self.sem_pool, subj, st).squeeze(-1).float(), -1); out['sem_attn'] = aw   # [B, 256] 어느 뇌 조각을 보나
             sv = _route(self.sem_clip_proj, subj, (aw[..., None].to(st.dtype) * st).sum(1))                     # [B, 1024]
-            if hasattr(self, 'sem_lin'): sv = sv + _route(self.sem_lin, subj, fmri.mean(1).flatten(1).to(sv.dtype))
+            if hasattr(self, 'sem_lin'):
+                xl = fmri
+                if self.lin_norm:
+                    m_ = (xl != 0).to(xl.dtype); n_ = m_.sum((2, 3), keepdim=True).clamp_min(1); mu_ = (xl * m_).sum((2, 3), keepdim=True) / n_
+                    xl = (xl - mu_) / ((((xl - mu_) ** 2 * m_).sum((2, 3), keepdim=True) / n_).sqrt() + 1e-6) * m_
+                sv = sv + _route(self.sem_lin, subj, xl.mean(1).flatten(1).to(sv.dtype))
             if hasattr(self, 'sem_vlin'): sv = sv + _route(self.sem_vlin, subj, _route(self.sem_vred, subj, tok[:, :, 1:].mean(1)).flatten(1))
             out['sem_clip'] = F.normalize(sv, dim=-1)
             if hasattr(self, 'sem_img'): out['sem_img'] = _route(self.sem_img, subj, sv)
@@ -487,7 +493,7 @@ def build_from_ckpt(ck, repo):
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
                   mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
                   calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
-                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''))
+                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)))
     check_load(model, ck['model'])
     return model
 
