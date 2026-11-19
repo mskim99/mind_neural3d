@@ -65,5 +65,25 @@ for g, m in sub_m.items():
             v = float(np.mean(accs))
             if best is None or v > best[0]: best = (v, lam)
         r['aligned'][str(min(n, ntr))] = {'acc': round(best[0], 4), 'lam': best[1]}
+    # (추가) ① 자기 데이터 N개로만 분류기를 학습했을 때 (정렬 N개와 같은 물체, 라벨 사용) — 정렬이 few-shot보다 나은지의 기준
+    r['own_nshot'] = {}
+    for n in NSH:
+        idx = g_perm[:min(n, ntr)]; accs = []
+        for i in range(NS):
+            c_ = solve(tr[i][idx] @ tr[i][idx].t(), oh[idx], 0.1); accs.append(float(((te[i] @ tr[i][idx].t() @ c_).argmax(1) == yte).float().mean()))
+        r['own_nshot'][str(min(n, ntr))] = round(float(np.mean(accs)), 4)
+    # ② 다른 6명의 train 데이터를 A 공간으로 옮겨(5겹 밖 예측) A의 train과 합쳐 분류기 학습 → A의 test (데이터를 함께 쓰는 이득)
+    if g in ('전체', '초기시각 V1-V4'):
+        fold = torch.arange(ntr, device=dev) % 5; accs = []
+        for i in range(NS):
+            Zs = [tr[i]]
+            for j in range(NS):
+                if j == i: continue
+                Zj = torch.zeros_like(tr[i])
+                for f_ in range(5):
+                    a_, b_ = fold != f_, fold == f_; Wd = solve(tr[j][a_] @ tr[j][a_].t(), tr[i][a_], 0.03); Zj[b_] = tr[j][b_] @ tr[j][a_].t() @ Wd
+                Zs.append(F.normalize(Zj, dim=-1))
+            Zall = torch.cat(Zs); c_ = solve(Zall @ Zall.t(), oh.repeat(NS, 1), 0.1); accs.append(float(((te[i] @ Zall.t() @ c_).argmax(1) == yte).float().mean()))
+        r['pooled_aligned_7'] = round(float(np.mean(accs)), 4); r['pooled_aligned_7_by_sub'] = [round(x, 3) for x in accs]
     R['groups'][g] = r; print(f'[{g}]', json.dumps(r, ensure_ascii=False), flush=True)
 json.dump(R, open(a.out, 'w'), ensure_ascii=False, indent=1); print('ALIGN_DONE', a.out, f'{time.time() - t0:.0f}s', flush=True)
