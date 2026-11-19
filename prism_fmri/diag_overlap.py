@@ -85,7 +85,18 @@ for n, ids in REG.items():
         return float(torch.stack([(2 * (B[i][..., m] & B[j][..., m]).float().sum(-1) / (B[i][..., m].float().sum(-1) + B[j][..., m].float().sum(-1)).clamp_min(1)) for i, j in PAIRS]).mean())
     reg[n] = {'px': int(m.sum()), 'on_all': float(B_all[:, 0][:, m].float().mean()), 'dice_all': rd(B_all), 'dice_cat': rd(B_cat),
               'corr_cat': float(corr(cat_m[..., m]).mean())}
-np.savez_compressed(a.out, mask=M.view(256, 256).cpu().numpy(), lab=lab.view(256, 256).cpu().numpy(), cnt_all=full(B_all[:, 0].float().sum(0)), cnt_cat=full(B_cat.float().sum(0)),
+# 픽셀별 피험자 간 상관 (ISC 지도): 픽셀마다 "물체 축 반응"이 피험자 사이에 얼마나 같이 움직이나 (쌍 평균). 위 20 % 겹침은 부호가 뒤집히는 공통 공간 성분 때문에 부풀려져 그림에는 이것을 씀
+def zc(A): A = A.float() - A.float().mean(1, keepdim=True); return A / A.norm(dim=1, keepdim=True).clamp_min(1e-8)      # [S, n, P] → n축 정규화
+def isc_map(A): Z = zc(A); return torch.stack([(Z[i] * Z[j]).sum(0) for i, j in PAIRS]).mean(0)                        # [P]
+XS = torch.stack([x.float() for x in X])                                   # [S, N, P] z
+isc_obj = isc_map(XS); isc_cat = isc_map(cat_m); isc_wc = isc_map(XS - cat_m[:, Y])
+isc_sub = torch.stack([torch.stack([(zc(XS)[i] * zc(XS)[j]).sum(0) for j in range(NS) if j != i]).mean(0) for i in range(NS)])   # [S, P] 피험자별 (나머지 6명과)
+for n, ids in REG.items():
+    if n in reg:
+        m = torch.isin(labm, torch.tensor(ids, device=dev)); reg[n].update({'isc_obj': float(isc_obj[m].mean()), 'isc_cat': float(isc_cat[m].mean()), 'isc_wc': float(isc_wc[m].mean()),
+                                                                             'isc_obj_by_sub': [float(v[m].mean()) for v in isc_sub]})
+print('ISC 평균 (전체 픽셀): 물체', round(float(isc_obj.mean()), 4), '범주', round(float(isc_cat.mean()), 4), '범주 내', round(float(isc_wc.mean()), 4), '| 물체 ISC 위 5 % 픽셀 값', round(float(isc_obj.kthvalue(int(P * 0.95)).values), 4), flush=True)
+np.savez_compressed(a.out, isc_obj=full(isc_obj), isc_cat=full(isc_cat), isc_wc=full(isc_wc), isc_sub=full(isc_sub), mask=M.view(256, 256).cpu().numpy(), lab=lab.view(256, 256).cpu().numpy(), cnt_all=full(B_all[:, 0].float().sum(0)), cnt_cat=full(B_cat.float().sum(0)),
                     cnt_obj=full(on(O).float().sum(0)), obj_names=np.array([KEYS[i] for i in ex]), classes=np.array(CL), subs=np.array(SUBS),
                     mean_sub=full(mean_all), reg=json.dumps(reg, ensure_ascii=False), **{k_: np.asarray(v) for k_, v in R.items()})
 print(json.dumps({k_: (round(float(np.mean(v)), 4) if not isinstance(v, float) else round(v, 4)) for k_, v in R.items()}, ensure_ascii=False))
