@@ -15,6 +15,7 @@
 #       동작 확인(60스텝, 차례로): TEST=1 GPU=1 bash run_branch.sh        진행: SET=branch watch -n 1 bash status_reg.sh
 SUBS=${SUBS:-sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008}   # 11-15: 2명 학습은 SUBS=sub-0001,sub-0006
 source $(dirname $0)/common.sh || exit 1
+[ -f "$W/STOP_GPU${GPU:-x}" ] && { echo "STOP_GPU${GPU} 있음 — 이 GPU에서는 띄우지 않음 ($(date +%H:%M:%S))"; exit 0; }   # 11-19: 예약된 run을 kill 없이 건너뛰게 (GPU 할당이 바뀔 때 $W/STOP_GPU<번호> 파일을 만듦)
 RUNS=${RUNS:-"a asv ac ap au"}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000,15000}; HOLD=${HOLD:-8}; TEST=${TEST:-0}
 PY=$W/venv/bin/python; PUB=$W/weights/MinD-3D-pp/fMRI-Shape; U=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=${OUT:-$W/prism_branch}; LP=${LP:-prism_branch}   # OUT · LP: 다른 스텝 수로 처음부터 다시 돌릴 때 폴더 · 로그 이름을 따로 (예: OUT=$W/prism_branch40 LP=prism_branch40 STEPS=40000)
 EP="--enc_dir $PUB"; EU="--enc_path $U --in_norm 1 --feat_norm 1 --vit_lin 32"
