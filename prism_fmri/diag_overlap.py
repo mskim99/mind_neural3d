@@ -2,7 +2,7 @@
 # 11-19 분석: 피험자 7명의 활성 지도가 평면 지도(256×256) 위에서 얼마나 겹치나 — 그림용 (학습 없음)
 #  활성 지도: 피험자마다 fMRI 프레임 2~7 평균 (in_norm). 세 수준으로 봄
 #    전체   모든 물체 평균 반응 (그 피험자의 평균 활성)
-#    범주별 범주 평균 반응 − 그 피험자의 전체 평균 (그 범주에서만 더 켜지는 곳)
+#    범주별 범주 평균 반응 − 그 피험자의 전체 평균 (그 범주에서만 더 켜지는 곳) — 범주별 · 물체별은 픽셀마다 물체 축 z-score 뒤
 #    물체별 물체 반응 − 그 피험자의 전체 평균 (그 물체에서만 더 켜지는 곳)
 #  겹침: 지도마다 값이 큰 위 20 % 픽셀을 "켜짐"으로 → 픽셀마다 켜진 피험자 수(0~7) / 피험자 쌍마다 켜진 영역의 Dice (우연 = 0.20)
 #  + 픽셀 단위 피험자 간 상관 (지도 전체 픽셀 값의 상관, 쌍 평균)
@@ -49,20 +49,22 @@ def corr(A):                                                               # A [
     Z = A.float() - A.float().mean(-1, keepdim=True); Z = Z / Z.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     return torch.stack([(Z[i] * Z[j]).sum(-1) for i, j in PAIRS]).mean(0)
 mean_all = torch.stack([x.float().mean(0) for x in X])                     # [S, P]
-cat_m = torch.stack([torch.stack([x[Y == c].float().mean(0) for c in range(len(CL))]) for x in X]) - mean_all[:, None]   # [S, 13, P]
+X = [((x.float() - x.float().mean(0)) / x.float().std(0).clamp_min(1e-6)).half() for x in X]   # 픽셀마다 물체 축 z-score (픽셀별 분산 차이가 겹침을 부풀리지 않게) — 범주별 · 물체별은 이 값으로
+ZERO = torch.zeros_like(mean_all)
+cat_m = torch.stack([torch.stack([x[Y == c].float().mean(0) for c in range(len(CL))]) for x in X])   # [S, 13, P] (z 단위, 이미 전체 평균 0)
 B_all = on(mean_all)[:, None]; B_cat = on(cat_m)
 R = {'top': a.top, 'chance_dice': a.top, 'dice_all': float(dice(B_all)[0]), 'corr_all': float(corr(mean_all[:, None])[0]),
      'dice_cat': dice(B_cat).cpu().numpy(), 'corr_cat': corr(cat_m).cpu().numpy()}
 ti = torch.tensor([i for i, k_ in enumerate(KEYS) if k_ in TEST], device=dev)
 d_obj, c_obj = [], []
 for i0 in range(0, len(ti), 26):
-    idx = ti[i0:i0 + 26]; O = torch.stack([x[idx].float() for x in X]) - mean_all[:, None]       # [S, n, P]
+    idx = ti[i0:i0 + 26]; O = torch.stack([x[idx].float() for x in X])       # [S, n, P]
     d_obj.append(dice(on(O))); c_obj.append(corr(O))
 R['dice_obj'] = torch.cat(d_obj).cpu().numpy(); R['corr_obj'] = torch.cat(c_obj).cpu().numpy()
 # 물체 − 범주 평균 (같은 범주 안 차이)
 d_w, c_w = [], []
 for i0 in range(0, len(ti), 26):
-    idx = ti[i0:i0 + 26]; O = torch.stack([x[idx].float() for x in X]) - mean_all[:, None] - cat_m[:, Y[idx]]
+    idx = ti[i0:i0 + 26]; O = torch.stack([x[idx].float() for x in X]) - cat_m[:, Y[idx]]
     d_w.append(dice(on(O))); c_w.append(corr(O))
 R['dice_objwc'] = torch.cat(d_w).cpu().numpy(); R['corr_objwc'] = torch.cat(c_w).cpu().numpy()
 def full(v):                                                               # [.., P] → [.., 256, 256]
@@ -71,7 +73,7 @@ ex = []; seen = set()
 for i in ti.tolist():                                                      # 범주마다 첫 test 물체 → 앞 n_ex개
     c = int(Y[i])
     if c not in seen: seen.add(c); ex.append(i)
-ex = ex[:a.n_ex]; O = torch.stack([x[ex].float() for x in X]) - mean_all[:, None]
+ex = ex[:a.n_ex]; O = torch.stack([x[ex].float() for x in X])
 # 영역별 Dice (영역 안 픽셀에서 켜진 것끼리, 전체 · 범주 평균)
 REG = {}
 for r, n in NAME.items(): REG.setdefault(n.split('_', 1)[-1], []).append(r)
