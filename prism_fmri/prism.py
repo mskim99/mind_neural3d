@@ -183,7 +183,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -240,18 +240,22 @@ class Prism(nn.Module):
             self.sem_img = nn.ModuleList([nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, 1024), nn.GELU(), nn.Linear(1024, 1024)) for _ in range(Ks)])
         # Variational (피험자별 K벌)
         assert var_heads in ('csr', 'sr', 'sil', 'view', 'shape'); self.var_heads = var_heads
+        self.csr_drop = set(csr_drop) if var_heads == 'csr' else set()      # 11-19 성분 소거 (csr만): 'c' · 's' · 'r' 중 뺄 head — head · 손실 · Aggregate 입력에서 모두 빠짐
+        assert self.csr_drop <= set('csr') and len(self.csr_drop) < 3, 'csr_drop은 c · s · r 중 최대 2개'
+        self.no_frame_emb = bool(no_frame_emb)                              # 11-19: Frame Embedding · time embedding을 0으로 (프레임 번호를 모델에 알려 주지 않음)
         if var_heads in ('sil', 'view', 'shape'):           # shape (11-09): 범주 안 개체 형상 차이 (물체마다 고정, 프레임마다 같은 정답)                                    # 11-09: V = 변하는 정보 (물체 평균 · 프레임 평균을 뺀 실루엣 / 시점 특징), head 하나
             assert vdim > 0, 'sil · view · shape는 vdim 필요'
             self.vhead = nn.ModuleList([PoseHead(2 * dv, vdim, head_dim) for _ in range(Ks)])
-        else:
+        elif 's' not in self.csr_drop:
             self.scale = nn.ModuleList([PoseHead(2 * dv, 1, head_dim) for _ in range(Ks)])
         if var_heads == 'csr':
-            self.center = nn.ModuleList([PoseHead(2 * dv, 2, head_dim) for _ in range(Ks)])
-            self.rotate = nn.ModuleList([PoseHead(2 * dv, 6, head_dim) for _ in range(Ks)])
+            if 'c' not in self.csr_drop: self.center = nn.ModuleList([PoseHead(2 * dv, 2, head_dim) for _ in range(Ks)])
+            if 'r' not in self.csr_drop: self.rotate = nn.ModuleList([PoseHead(2 * dv, 6, head_dim) for _ in range(Ks)])
         elif var_heads == 'sr':
             self.ratio = nn.ModuleList([PoseHead(2 * dv, 3, head_dim) for _ in range(Ks)])
         assert var_mode in ('feat', 'value'); self.var_mode = var_mode
         nh, nv = {'csr': (3, 12), 'sr': (2, 4)}.get(var_heads, (1, vdim))
+        if self.csr_drop: nh, nv = 3 - len(self.csr_drop), sum(n_ for k_, n_ in (('c', 2), ('s', 1), ('r', 9)) if k_ not in self.csr_drop)
         agg_in = nh * head_dim if var_mode == 'feat' else nv
         self.aggregate = nn.ModuleList([nn.Sequential(nn.Linear(agg_in, dc), nn.GELU(), nn.LayerNorm(dc)) if var_mode == 'feat' else
                                         nn.Sequential(nn.Linear(agg_in, head_dim), nn.GELU(), nn.Linear(head_dim, dc), nn.GELU(), nn.LayerNorm(dc)) for _ in range(Ks)])
@@ -358,9 +362,9 @@ class Prism(nn.Module):
         B, T, N, D = tok.shape
         enc_vec = tok.mean((1, 2)).detach()                                          # 고정 ViT 특징 (프레임 · 패치 평균), 나머지 복원 정답
         if self.arch == 'fig':
-            x = self.temporal(tok, self.frame_emb(frame_idx))                        # LN → + Frame Emb. → 프레임 축 conv
+            x = self.temporal(tok, self.frame_emb(frame_idx) * (0.0 if self.no_frame_emb else 1.0))   # LN → + Frame Emb. → 프레임 축 conv
         else:
-            x = self.temporal(tok + self.frame_emb(frame_idx)[:, :, None, :])        # 이전: Frame Emb. 더한 뒤 Stem (잔차)
+            x = self.temporal(tok + (self.frame_emb(frame_idx) * (0.0 if self.no_frame_emb else 1.0))[:, :, None, :])        # 이전: Frame Emb. 더한 뒤 Stem (잔차)
         mixed = self.drop(self.shared(x))                                                    # Mixed Features [B, T, 257, D]
         s, v, p = mixed.split(self.splits, dim=-1)                                  # 채널 분할 (학습 파라미터 없음)
         out = {}
@@ -399,13 +403,13 @@ class Prism(nn.Module):
         if self.var_heads in ('sil', 'view', 'shape'):
             q, fq = _route(self.vhead, subj, vin); out['vt'] = q                    # [B, T, vdim] 표준화된 변화량
             feats = [fq]; vals = [q]
-        else:
+        elif hasattr(self, 'scale'):
             sc, fs = _route(self.scale, subj, vin); out['scale'] = F.softplus(sc).squeeze(-1)
-        if self.var_heads == 'csr':
-            c, fc = _route(self.center, subj, vin); r, fr = _route(self.rotate, subj, vin)
-            out['center'] = torch.tanh(c); out['rot6d'] = r
-            feats = [fc, fs, fr]
-            vals = [out['center'], out['scale'][..., None], rot6d_to_matrix(r).flatten(-2)]          # 실제 값 2+1+9
+        if self.var_heads == 'csr':                                                  # 뺀 성분(csr_drop)은 head · 값 · 특징 모두 없음
+            feats, vals = [], []
+            if hasattr(self, 'center'): c, fc = _route(self.center, subj, vin); out['center'] = torch.tanh(c); feats.append(fc); vals.append(out['center'])
+            if hasattr(self, 'scale'): feats.append(fs); vals.append(out['scale'][..., None])
+            if hasattr(self, 'rotate'): r, fr = _route(self.rotate, subj, vin); out['rot6d'] = r; feats.append(fr); vals.append(rot6d_to_matrix(r).flatten(-2))
         elif self.var_heads == 'sr':
             q, fq = _route(self.ratio, subj, vin); out['ratio'] = torch.sigmoid(q)  # [B, T, 3] 크기 비율 (가장 긴 변 = 1)
             feats = [fs, fq]; vals = [out['scale'][..., None], out['ratio']]                         # 실제 값 1+3
@@ -413,7 +417,7 @@ class Prism(nn.Module):
         var_feat = _route(self.aggregate, subj, agg_in)
         out['var_vec'] = var_feat.mean(1)
         if self.mem == 'branch':                                                     # 11-13: head 토큰 T개 + patch 토큰 (평균 안 냄) → Variational Features [B, T + T·256 (v_center: + 256), dc]
-            vp = v[:, :, 1:]; te = self.time_emb(frame_idx)                          # [B, T, 256, dv], [B, T, dc]
+            vp = v[:, :, 1:]; te = self.time_emb(frame_idx) * (0.0 if self.no_frame_emb else 1.0)   # [B, T, 256, dv], [B, T, dc]
             if self.v_pool > 1:                                                      # 이웃 patch k×k 평균 (16×16 → (16/k)²)
                 k = self.v_pool; vp = vp.reshape(B, T, 16 // k, k, 16 // k, k, -1).mean((3, 5)).flatten(2, 3)
             if self.v_center:
@@ -456,7 +460,7 @@ class Prism(nn.Module):
             if self.v_res: out['cond_tokens'] = out['cond_tokens'] + self._res_tokens(out)
             return out
         # 재구성 (공유): [Semantic ; Variational] Features (Perceptive FiLM 보정) → 조건 토큰
-        mem =torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx)], 1)   # [B, 256 + T, dc]
+        mem =torch.cat([sem_feat + self.type_emb[0], var_feat + self.type_emb[1] + self.time_emb(frame_idx) * (0.0 if self.no_frame_emb else 1.0)], 1)   # [B, 256 + T, dc]
         mem = self.drop(mem)
         if self.use_film:
             gamma, beta = self.film(h).chunk(2, -1)
@@ -493,7 +497,7 @@ def build_from_ckpt(ck, repo):
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
                   mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
                   calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
-                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)))
+                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)), csr_drop=args.get('csr_drop', '') or '', no_frame_emb=bool(int(args.get('no_frame_emb', 0) or 0)))
     check_load(model, ck['model'])
     return model
 
