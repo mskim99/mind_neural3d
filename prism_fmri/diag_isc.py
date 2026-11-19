@@ -8,6 +8,8 @@
 #    cat_cross     피험자 A의 범주 중심(train 물체 평균 패턴)으로 피험자 B의 test 물체 범주 맞히기 (우연 1/13)
 #    cat_within    자기 범주 중심으로 자기 test 물체 범주 맞히기 (피험자 평균) — 그 영역에 범주 정보가 있나
 #    share         cat_cross − 우연 / cat_within − 우연 (공통 정도, cat_within이 우연보다 0.03 이상 높을 때만)
+#    rr_within · rr_cross (11-19 추가)  커널 릿지(one-hot, λ 0.1) 범주 분류기: 자기 test / 다른 피험자 test — 패턴 상관보다 민감한 측정
+#    rr_share    (rr_cross − 우연) / (rr_within − 우연), rr_within이 우연 + 0.03 이상일 때만 · rr_by_sub = 피험자별 rr_within
 #  피험자별 차이: 영역 · 피험자마다 "다른 6명과의 평균 obj_gap" → 특정 피험자만 다른 영역이 있는지
 # 사용 (실행 위치 $W/run): python diag_isc.py --data_root $DR --subs sub-0001,...,sub-0008 --out $W/prism_calib/isc.json
 import os, sys, json, time, argparse, itertools, numpy as np, torch
@@ -66,7 +68,13 @@ for n, m in RM.items():
         Sw = (tew[i] @ tew[j].t()).masked_fill(~same_cat, -9); wc.append(float((Sw.argmax(1) == torch.arange(len(yt), device=dev)).float().mean()))
         cc.append(float(((tez[j] @ cenz[i].t()).argmax(1) == yt).float().mean()))
     cw = float(np.mean([float(((tez[i] @ cenz[i].t()).argmax(1) == yt).float().mean()) for i in range(len(SUBS))]))
-    r = {'px': int(m.sum()), 'obj_top1': round(float(np.mean(top1)), 4), 'obj_top1_wc': round(float(np.mean(wc)), 4), 'obj_gap': round(float(np.mean(gap)), 4),
+    ntr = [F.normalize(t, dim=-1) for t in tr]; nte = [F.normalize(t, dim=-1) for t in te]; oh = F.one_hot(ytr, len(CL)).float(); rw = []; rc = []
+    for i in range(len(SUBS)):
+        Kt = ntr[i] @ ntr[i].t(); A = torch.linalg.solve(Kt + 0.1 * Kt.diagonal().mean() * torch.eye(len(Kt), device=dev), oh)
+        for j in range(len(SUBS)):
+            acc_ = float(((nte[j] @ ntr[i].t() @ A).argmax(1) == yt).float().mean()); (rw if i == j else rc).append(acc_)
+    r = {'px': int(m.sum()), 'rr_within': round(float(np.mean(rw)), 4), 'rr_cross': round(float(np.mean(rc)), 4),
+         'rr_share': round((float(np.mean(rc)) - ch_cat) / (float(np.mean(rw)) - ch_cat), 3) if float(np.mean(rw)) - ch_cat >= 0.03 else None, 'rr_by_sub': [round(x, 3) for x in rw], 'obj_top1': round(float(np.mean(top1)), 4), 'obj_top1_wc': round(float(np.mean(wc)), 4), 'obj_gap': round(float(np.mean(gap)), 4),
          'cat_cross': round(float(np.mean(cc)), 4), 'cat_within': round(cw, 4),
          'share': round((float(np.mean(cc)) - ch_cat) / (cw - ch_cat), 3) if cw - ch_cat >= 0.03 else None,
          'gap_by_sub': [round(float((per[i].sum() + per[:, i].sum()) / (2 * (len(SUBS) - 1))), 4) for i in range(len(SUBS))]}
@@ -74,9 +82,9 @@ for n, m in RM.items():
 json.dump(R, open(a.out, 'w'), ensure_ascii=False, indent=1)
 rs = [(n, r) for n, r in R['regions'].items() if n != '전체']
 print('전체', json.dumps(R['regions']['전체'], ensure_ascii=False))
-for key, title in (('obj_top1', '같은 물체 고르기 상위'), ('cat_cross', '범주 옮겨 읽기 상위'), ('cat_within', '자기 범주 읽기 상위')):
+for key, title in (('rr_within', '자기 범주 읽기(릿지) 상위'), ('rr_cross', '범주 옮겨 읽기(릿지) 상위'), ('obj_top1', '같은 물체 고르기 상위')):
     print(f'--- {title} 12 (우연 obj {ch_obj:.3f} · cat {ch_cat:.3f})')
-    for n, r in sorted(rs, key=lambda t: -t[1][key])[:12]: print(f'  {n:8s} px {r["px"]:5d} obj {r["obj_top1"]:.3f} wc {r["obj_top1_wc"]:.3f} gap {r["obj_gap"]:.4f} cat_cross {r["cat_cross"]:.3f} cat_within {r["cat_within"]:.3f} share {r["share"]}')
-n_obj = sum(r['obj_top1'] > 3 * ch_obj for _, r in rs); n_cat = sum(r['cat_cross'] > ch_cat + 0.05 for _, r in rs); n_w = sum(r['cat_within'] > ch_cat + 0.05 for _, r in rs)
+    for n, r in sorted(rs, key=lambda t: -t[1][key])[:15]: print(f'  {n:8s} px {r["px"]:5d} rr_within {r["rr_within"]:.3f} rr_cross {r["rr_cross"]:.3f} share {r["rr_share"]} | obj {r["obj_top1"]:.3f} wc {r["obj_top1_wc"]:.3f} | 피험자별 {r["rr_by_sub"]}')
+n_obj = sum(r['obj_top1'] > 3 * ch_obj for _, r in rs); n_cat = sum(r['rr_cross'] > ch_cat + 0.05 for _, r in rs); n_w = sum(r['rr_within'] > ch_cat + 0.05 for _, r in rs)
 print(f'영역 {len(rs)}개 중: 같은 물체 고르기 > 우연 3배 {n_obj}개 · 범주 옮겨 읽기 > 우연 + 0.05 {n_cat}개 · 자기 범주 읽기 > 우연 + 0.05 {n_w}개')
 print('ISC_DONE', a.out, f'{time.time() - t0:.0f}s', flush=True)
