@@ -218,7 +218,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None, rw_range=(0.1, 0.9)):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -237,7 +237,7 @@ class Prism(nn.Module):
         if calib: self.calib = RegionCalib(K, bound=calib_bound, renorm=calib_renorm)
         if region_w:                                                       # 11-20 (b): 공통 영역 가중 (RegionWeight), 새 구조(branch)에서만
             assert mem == 'branch', 'region_w는 --mem branch에서만'
-            self.rw = RegionWeight(K, prior=region_prior)
+            self.rw = RegionWeight(K, prior=region_prior, w_lo=rw_range[0], w_hi=rw_range[1])
         assert len(encs) == K, f'피험자 {K}명인데 ViT {len(encs)}개'
         self.splits = splits
         if feat_norm:

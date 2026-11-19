@@ -10,6 +10,7 @@ import os, json, time, argparse, itertools, numpy as np, torch
 p = argparse.ArgumentParser()
 p.add_argument('--data_root', required=True); p.add_argument('--out', required=True)
 p.add_argument('--subs', default='sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008')
+p.add_argument('--lr_avg', type=int, default=1)   # 11-20: 좌우 같은 이름 영역(L_x · R_x)의 값을 평균 (영역 하나 값이 잡음에 흔들리지 않게, 사용자 승인)
 p.add_argument('--holdout', type=int, default=8); p.add_argument('--min_px', type=int, default=40); p.add_argument('--dev', default='cpu')
 a = p.parse_args()
 t0 = time.time(); SUBS = a.subs.split(','); FRAMES = list(range(2, 8)); dev = a.dev
@@ -50,9 +51,15 @@ labm = lab[M]; prior = np.full(R, np.nan, np.float32); px = np.zeros(R, np.int64
 for r in range(1, R):
     m = labm == r; px[r] = int(m.sum())
     if px[r] >= a.min_px: prior[r] = float(isc[m].mean())
+NAME0 = {int(k): v for k, v in json.load(open(os.path.join(here, 'assets', 'mmp_256_regions.json'), encoding='utf-8')).items()}
+raw = prior.copy()
+if a.lr_avg:                                                                  # 좌우 평균: 두 쪽 다 있으면 평균, 한쪽만 있으면 그 값
+    for r in range(1, R):
+        nm = NAME0.get(r, ''); tw = [q for q, n2 in NAME0.items() if q > 0 and n2.split('_', 1)[-1] == nm.split('_', 1)[-1] and np.isfinite(raw[q])]
+        if np.isfinite(raw[r]) and tw: prior[r] = float(np.mean([raw[q] for q in tw]))
 full = np.zeros(256 * 256, np.float32); full[M.numpy()] = isc.numpy()
 os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-np.savez(a.out, prior=prior, px=px, isc_cat=full.reshape(256, 256), subs=np.array(SUBS), classes=np.array(CL), n_obj=len(KEYS))
+np.savez(a.out, prior=prior, prior_raw=raw, lr_avg=a.lr_avg, px=px, isc_cat=full.reshape(256, 256), subs=np.array(SUBS), classes=np.array(CL), n_obj=len(KEYS))
 NAME = {int(k): v for k, v in json.load(open(os.path.join(here, 'assets', 'mmp_256_regions.json'), encoding='utf-8')).items()}
 ok = np.isfinite(prior); order = np.argsort(-np.where(ok, prior, -9))
 top = [(NAME.get(int(r), str(r)), round(float(prior[r]), 3), int(px[r])) for r in order[:15]]

@@ -36,6 +36,7 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      base_sharedsv_calib_bound_keep) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:?CAL 필요 (크기 묶기 + 보존 항 1단계 calib.pt)}";;   # 11-18 보정 다시: 크기 묶기(bound · renorm) + 보존 항(keep), 설정은 calib.pt에 들어 있음
                      ausvp_sharedsv) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --shared_sv 1 --film 0 --lam_subj 0";;   # 11-18 최종 Ours(ausvp) + S · V 피험자 공통 (FiLM · 피험자 분류 끔)
                      ausvp_regionw) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --region_w 1 --region_prior ${RP:-$W/prism_calib/region_prior.npz}";;   # 11-20 (b): 최종 Ours(ausvp) + 공통 영역 가중 (S · V 따로, 공통 + 피험자별 조정, prep_region_prior.py 사전값)
+                     ausvp_regionw_noprior) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --region_w 1";;   # 11-20 (b) 대조: 사전값 없이 모든 영역 같은 가중에서 시작 (사전값 효과 따로 보기)
                      ausvp_sharedsv_regionw) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --shared_sv 1 --film 0 --lam_subj 0 --region_w 1 --region_prior ${RP:-$W/prism_calib/region_prior.npz}";;   # 11-20 (b): S · V 피험자 공통 한 벌 + 공통 영역 가중 (대조 = ausvp_sharedsv, 11-18 5090)
                      ausvp_oraclesil) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --oracle_sil $TGT/silhouettes32.npz";;   # 11-18 V-0 (진단 전용 상한): 최종 Ours(ausvp) + 정답 실루엣 지도(영상 10프레임 평균)를 V 메모리에
                      ausvp_oraclesil_catmean) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --oracle_sil $W/prism_calib/vmaps/sil_catmean.npz";;   # 11-19 V-0 대조: 정답 범주의 평균 실루엣 지도만 (diag_vceil.py --maps_out)
@@ -49,7 +50,7 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      base_vres_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz} --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # V 잔차 + Perceptive 개선안 둘 다
                      ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";;
                      x) echo "$EX --mem branch";; xp) echo "$EX --mem branch --v_pool 2";; xsv) echo "$EX --mem branch --sv_enc 0";; xc) echo "$EX --mem branch --v_center 1";; *) echo BAD;; esac; }
-for n in $RUNS; do case $n in *regionw*) [ -f "${RP:-$W/prism_calib/region_prior.npz}" ] || { echo "영역 사전값 없음 ${RP:-$W/prism_calib/region_prior.npz} — prep_region_prior.py 먼저"; exit 1; };; esac; done   # 11-20
+for n in $RUNS; do case $n in *_regionw) [ -f "${RP:-$W/prism_calib/region_prior.npz}" ] || { echo "영역 사전값 없음 ${RP:-$W/prism_calib/region_prior.npz} — prep_region_prior.py 먼저"; exit 1; };; esac; done   # 11-20
 EX=${EX:-}; for n in $RUNS; do case $n in x|xp|xsv|xc) [ -n "$EX" ] || { echo "x 계열은 EX(바탕 인코더 옵션)가 필요"; exit 1; };; esac; done
 for n in $RUNS; do [ "$(flags $n)" = BAD ] && { echo "모르는 이름 $n"; exit 1; }; done
 for f in $VT $U; do [ -f $f ] || { echo "없음: $f"; exit 1; }; done

@@ -92,6 +92,7 @@ p.add_argument('--shared_sv', type=int, default=0, choices=[0, 1])   # 11-17: Se
 p.add_argument('--polite', type=float, default=0)   # 11-17: > 0이면 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
 p.add_argument('--region_w', type=int, default=0, choices=[0, 1])   # 11-20 (b): 공통 영역 가중 (prism.RegionWeight) — S · V가 피험자 간 공통 영역을 더 보게
 p.add_argument('--region_prior', default='')   # 11-20: prep_region_prior.py 출력 npz (영역별 공통성 사전값, train 물체만). 없으면 모든 영역 같은 가중에서 시작
+p.add_argument('--rw_lo', type=float, default=0.3); p.add_argument('--rw_hi', type=float, default=0.7)   # 11-20: 사전값을 옮길 초기 가중 범위 (사용자 승인: 0.3 ~ 0.7, 사전값은 방향만)
 p.add_argument('--lam_rw', type=float, default=0.01)   # 11-20: 피험자별 조정 d의 L2 (클수록 피험자 공통 가중에 묶임)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
@@ -196,7 +197,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None), rw_range=(a.rw_lo, a.rw_hi)).to(dev)
 if a.sil_tmpl:                                                                       # 범주 평균 실루엣 = train(검증 물체 뺌) 물체의 영상 10프레임 평균 지도를 범주마다 평균
     _z = np.load(a.sil_tmpl); _M = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
     _ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt')) if l.strip()]; _by = {}
