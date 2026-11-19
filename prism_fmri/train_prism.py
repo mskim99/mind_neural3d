@@ -90,6 +90,9 @@ p.add_argument('--sil_tmpl', default='')   # 11-19 V-T: silhouettes32.npz 경로
 p.add_argument('--oracle_sil', default='')   # 11-18 V-0 (진단 전용 상한): silhouettes32.npz 경로 — 정답 실루엣 지도(영상 10프레임 평균)를 V 메모리에 넣음 (평가도 정답 사용)
 p.add_argument('--shared_sv', type=int, default=0, choices=[0, 1])   # 11-17: Semantic · Variational을 피험자 공통 한 벌로 (2단계)
 p.add_argument('--polite', type=float, default=0)   # 11-17: > 0이면 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
+p.add_argument('--region_w', type=int, default=0, choices=[0, 1])   # 11-20 (b): 공통 영역 가중 (prism.RegionWeight) — S · V가 피험자 간 공통 영역을 더 보게
+p.add_argument('--region_prior', default='')   # 11-20: prep_region_prior.py 출력 npz (영역별 공통성 사전값, train 물체만). 없으면 모든 영역 같은 가중에서 시작
+p.add_argument('--lam_rw', type=float, default=0.01)   # 11-20: 피험자별 조정 d의 L2 (클수록 피험자 공통 가중에 묶임)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 a.calib_bound, a.calib_renorm = 0.0, 0                                   # 11-18: 1단계 보정 파일의 크기 묶기 설정을 그대로 씀 (체크포인트 args에 남아 추론에서도 같게)
@@ -193,7 +196,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None)).to(dev)
 if a.sil_tmpl:                                                                       # 범주 평균 실루엣 = train(검증 물체 뺌) 물체의 영상 10프레임 평균 지도를 범주마다 평균
     _z = np.load(a.sil_tmpl); _M = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
     _ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt')) if l.strip()]; _by = {}
@@ -221,10 +224,14 @@ if a.calib_init:
     model.calib.g.data.copy_(_c['g']); model.calib.b.data.copy_(_c['b']); model.calib.requires_grad_(False)
     print(f"[calib] 1단계 보정 불러와 고정: {a.calib_init} | bound {a.calib_bound:g} renorm {a.calib_renorm} | |g| {float(_c['g'].abs().mean()):.3f} |b| {float(_c['b'].abs().mean()):.3f} | 1단계 검증 {_c.get('summary', '')}", flush=True)
 params = [q for q in model.parameters() if q.requires_grad]
+rw_params = [q for n_, q in model.named_parameters() if n_.startswith('rw.')]   # 11-20: 영역 가중은 weight decay 없이 (사전값이 decay로 지워지지 않게, 피험자별 조정은 lam_rw로 묶음)
+if rw_params:
+    params = [q for q in params if all(q is not r_ for r_ in rw_params)]
+    _w = model.rw.region('s', torch.arange(len(SUBS), device=dev))[0]; print(f'[region_w] 공통 영역 가중 (S · V 따로, 피험자별 조정 L2 {a.lam_rw:g}) | 사전값 {a.region_prior or "없음"} | 초기 가중 범위 {float(_w.min()):.2f} ~ {float(_w.max()):.2f}', flush=True)
 enc_params = model.unfreeze_encoder(a.enc_unfreeze) if a.enc_unfreeze > 0 else []
 if enc_params: print(f'[enc] ViT 마지막 {a.enc_unfreeze}블록 + norm 학습: {sum(q.numel() for q in enc_params) / 1e6:.1f}M, lr {a.enc_lr:g}', flush=True)
 print(f'trainable {sum(q.numel() for q in params) / 1e6:.1f}M, subjects {SUBS}, bs {a.bs}, steps {a.max_step}', flush=True)
-opt = torch.optim.AdamW([{'params': params}] + ([{'params': enc_params, 'lr': a.enc_lr}] if enc_params else []), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
+opt = torch.optim.AdamW([{'params': params}] + ([{'params': enc_params, 'lr': a.enc_lr}] if enc_params else []) + ([{'params': rw_params, 'weight_decay': 0.0}] if rw_params else []), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / a.warmup) * 0.5 * (1 + math.cos(math.pi * min(1, s / a.max_step))))
 class BalancedBatches(torch.utils.data.Sampler):
     """배치마다 피험자를 같은 수로 (bs / 피험자 수). 한 바퀴 = 가장 적은 피험자 기준."""
@@ -398,7 +405,8 @@ while not done:
             if disc is not None: L['tc'] = tc_enc(disc, pt)
             if a.lam_hsic > 0: L['hsic'] = hsic_loss(pt)
         tot = total_loss(L)
-        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params, 1.0); (torch.nn.utils.clip_grad_norm_(enc_params, 1.0) if enc_params else None); opt.step(); sched.step(); step += 1; th.step()
+        if rw_params: tot = tot + a.lam_rw * model.rw.reg()
+        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params + rw_params, 1.0); (torch.nn.utils.clip_grad_norm_(enc_params, 1.0) if enc_params else None); opt.step(); sched.step(); step += 1; th.step()
         if disc is not None: L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt)   # 본 backward 뒤 (판별기를 먼저 바꾸면 그래프가 깨짐)
         if step % a.print_every == 0:
             write('train', L, float(tot))
@@ -417,4 +425,8 @@ while not done:
         if step >= a.max_step: done = True; break
 validate_all()
 torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_final.pt')
+if rw_params:                                                                      # 11-20: 영역 가중 정성 · 정량 자동 저장 (사용자 요구)
+    try:
+        from dump_region_w import dump; dump(f'{a.out_dir}/model_final.pt')
+    except Exception as e: print('[region_w] 저장 실패:', e, flush=True)
 print(f'TRAIN_DONE step {step} {time.time() - t0:.0f}s', flush=True)

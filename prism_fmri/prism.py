@@ -108,9 +108,12 @@ class BranchDecoderLayer(nn.Module):
         self.ca_v = nn.MultiheadAttention(d, nh, dropout=dropout, batch_first=True)
         self.n1 = nn.LayerNorm(d); self.n2 = nn.LayerNorm(d); self.n3 = nn.LayerNorm(d)
         self.f1 = nn.Linear(d, ff); self.f2 = nn.Linear(ff, d); self.do = nn.Dropout(dropout)
-    def forward(self, x, ms, mv):                                               # x [B, Q, d], ms [B, 1, d], mv [B, M, d]
+    def forward(self, x, ms, mv, vb=None):                                      # x [B, Q, d], ms [B, 1, d], mv [B, M, d], vb [B, M] V 토큰별 점수 더하기 (11-20 영역 가중, 없으면 이전과 같음)
         h = self.n1(x); x = x + self.do(self.sa(h, h, h, need_weights=False)[0])
-        h = self.n2(x); x = x + self.do(self.ca_s(h, ms, ms, need_weights=False)[0]) + self.do(self.ca_v(h, mv, mv, need_weights=False)[0])
+        mask = None
+        if vb is not None:
+            nh = self.ca_v.num_heads; mask = vb.to(h.dtype)[:, None, :].expand(-1, h.shape[1], -1).repeat_interleave(nh, 0)   # [B·heads, Q, M]
+        h = self.n2(x); x = x + self.do(self.ca_s(h, ms, ms, need_weights=False)[0]) + self.do(self.ca_v(h, mv, mv, attn_mask=mask, need_weights=False)[0])
         return x + self.do(self.f2(self.do(F.gelu(self.f1(self.n3(x))))))
 
 
@@ -179,11 +182,43 @@ class RegionCalib(nn.Module):
         return x
 
 
+class RegionWeight(nn.Module):
+    """11-20 (b) 피험자 간 공통 영역을 더 보고, 아닌 영역은 덜 보게 — Semantic · Variational이 "어디를 볼지"만 영역 단위로 조절 (입력 값은 안 바꿈, 영역을 버리지 않음).
+    영역 r(HCP-MMP, assets/mmp_256_regions.npy, 0 = 영역 없음)의 가중 w[k, r] = sigmoid(a[r] + d[k, r]): a = 피험자 공통, d = 피험자별 조정(0 초기화, 학습 스크립트가 L2로 묶음).
+    S용 · V용을 따로 둠. a 초기값 = 공통성 사전값(prep_region_prior.py: train 물체만으로 잰 범주 단위 피험자 간 상관, 영역 평균)을 [w_lo, w_hi]로 옮긴 것. 사전값이 없으면 0(모두 같은 가중 → 기준 모델과 같음).
+    patch 가중 = 그 16×16 patch 안 픽셀의 영역 구성비 × w (patch마다 평균). 쓰는 곳: Semantic attention pooling 점수에 + log, Variational head 입력의 patch 평균을 가중 평균으로,
+    Variational patch 토큰에 디코더 cross-attention 점수 + log(가중 / patch 평균)."""
+    def __init__(self, n_subjects, prior=None, w_lo=0.1, w_hi=0.9):
+        super().__init__()
+        import os, numpy as np
+        lab = torch.as_tensor(np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'mmp_256_regions.npy'))).long(); R = int(lab.max()) + 1
+        A = F.one_hot(lab.view(16, 16, 16, 16).permute(0, 2, 1, 3).reshape(256, 256), R).float().mean(1)   # [patch 256, R] patch 안 영역 구성비 (patch = ViT 16×16 격자 순서)
+        self.register_buffer('A', A)
+        a0 = torch.zeros(R)
+        if prior is not None:                                                    # 사전값 [R] (NaN = 정보 없음 → 가운데) → 0~1로 → w 초기 [w_lo, w_hi] → logit
+            p_ = torch.as_tensor(prior).float(); ok = torch.isfinite(p_)
+            q = torch.full_like(p_, 0.5); lo, hi = p_[ok].min(), p_[ok].max(); q[ok] = (p_[ok] - lo) / (hi - lo).clamp_min(1e-8)
+            w0 = w_lo + (w_hi - w_lo) * q; a0 = torch.log(w0 / (1 - w0))
+        self.register_buffer('a_init', a0.clone())
+        self.a_s = nn.Parameter(a0.clone()); self.a_v = nn.Parameter(a0.clone())
+        self.d_s = nn.Parameter(torch.zeros(n_subjects, R)); self.d_v = nn.Parameter(torch.zeros(n_subjects, R))
+
+    def region(self, which, subj):                                              # [B, R] 영역 가중 0~1
+        a, d = (self.a_s, self.d_s) if which == 's' else (self.a_v, self.d_v)
+        return torch.sigmoid(a[None] + d[subj])
+
+    def patch(self, which, subj):                                               # [B, 256] patch 가중
+        return self.region(which, subj) @ self.A.t()
+
+    def reg(self):                                                              # 피험자별 조정 크기 (L2)
+        return (self.d_s ** 2).mean() + (self.d_v ** 2).mean()
+
+
 class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -200,6 +235,9 @@ class Prism(nn.Module):
         Ks = 1 if shared_sv else K                                          # 11-17 Perceptive 개선안 2단계: Semantic · Variational을 피험자 공통 한 벌로 (보정은 RegionCalib가 맡음)
         self.shared_sv = bool(shared_sv)
         if calib: self.calib = RegionCalib(K, bound=calib_bound, renorm=calib_renorm)
+        if region_w:                                                       # 11-20 (b): 공통 영역 가중 (RegionWeight), 새 구조(branch)에서만
+            assert mem == 'branch', 'region_w는 --mem branch에서만'
+            self.rw = RegionWeight(K, prior=region_prior)
         assert len(encs) == K, f'피험자 {K}명인데 ViT {len(encs)}개'
         self.splits = splits
         if feat_norm:
@@ -371,7 +409,9 @@ class Prism(nn.Module):
         # Semantic (피험자별): 프레임 평균(정적 성분) → (front) CLIP Projection → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
         st = s[:, :, 1:].mean(1)                                                     # [B, 256, ds]
         if self.mem == 'branch':                                                     # 11-13: attention pooling → CLIP Projection → 벡터 1개
-            aw = torch.softmax(_route(self.sem_pool, subj, st).squeeze(-1).float(), -1); out['sem_attn'] = aw   # [B, 256] 어느 뇌 조각을 보나
+            sl = _route(self.sem_pool, subj, st).squeeze(-1).float()
+            if hasattr(self, 'rw'): pw_s = self.rw.patch('s', subj); sl = sl + torch.log(pw_s + 1e-4); out['rw_s'] = pw_s   # 11-20 (b): 공통 영역 가중
+            aw = torch.softmax(sl, -1); out['sem_attn'] = aw   # [B, 256] 어느 뇌 조각을 보나
             sv = _route(self.sem_clip_proj, subj, (aw[..., None].to(st.dtype) * st).sum(1))                     # [B, 1024]
             if hasattr(self, 'sem_lin'):
                 xl = fmri
@@ -399,7 +439,11 @@ class Prism(nn.Module):
         if self.sem_clip == 'back':
             out['sem_clip'] = F.normalize(_route(self.sem_proj, subj, out['sem_vec']), dim=-1)
         # Variational (피험자별): 프레임마다 [CLS; 패치 평균] → Scale · Ratio (csr: Center · Scale · Rotate) → Aggregate → Variational Features [B, T, dc]
-        vin = torch.cat([v[:, :, 0], v[:, :, 1:].mean(2)], -1)
+        if hasattr(self, 'rw'):                                                       # 11-20 (b): patch 평균 → 영역 가중 평균
+            pw_v = self.rw.patch('v', subj); out['rw_v'] = pw_v; wn = (pw_v / pw_v.sum(-1, keepdim=True))[:, None, :, None].to(v.dtype)
+            vin = torch.cat([v[:, :, 0], (v[:, :, 1:] * wn).sum(2)], -1)
+        else:
+            vin = torch.cat([v[:, :, 0], v[:, :, 1:].mean(2)], -1)
         if self.var_heads in ('sil', 'view', 'shape'):
             q, fq = _route(self.vhead, subj, vin); out['vt'] = q                    # [B, T, vdim] 표준화된 변화량
             feats = [fq]; vals = [q]
@@ -427,6 +471,11 @@ class Prism(nn.Module):
             else:
                 pt = (_route(self.var_tok, subj, vp) + self.var_pos + te[:, :, None] + self.type_emb[2]).flatten(1, 2)
             var_feat = torch.cat([var_feat + self.type_emb[1] + te, pt], 1)
+            if hasattr(self, 'rw'):                                                  # 11-20 (b): V patch 토큰마다 디코더 cross-attention 점수에 더할 log(가중 / patch 평균), head 토큰은 0
+                k = self.v_pool; pp = out['rw_v'].reshape(B, 16 // k, k, 16 // k, k).mean((2, 4)).flatten(1)   # [B, (16/k)²]
+                lb = torch.log(pp / pp.mean(-1, keepdim=True) + 1e-4)
+                nrep = (pt.shape[1] // lb.shape[1])
+                vbias = torch.cat([torch.zeros(B, T, device=lb.device), lb.repeat(1, nrep)], 1)   # v_center: 평균 토큰 + 프레임별 / 아니면 프레임 T개 × patch (프레임 바깥 순서)
             if getattr(self, 'sil_tmpl', False):                                     # V-T: 예측 범주 확률(기울기 안 보냄, _res_tokens와 같은 식) × 범주 평균 지도
                 pr = torch.softmax(out['sem_clip'].float() @ self.prototypes.t().float() / 0.07, -1).detach()
                 sil = (pr @ self.cat_sil.flatten(1).float()).view(B, 32, 32)
@@ -434,6 +483,7 @@ class Prism(nn.Module):
                 assert sil is not None, 'oracle_sil 모델은 sil(정답 실루엣 지도) 필요'
                 m = sil.float().reshape(B, 8, 4, 8, 4).permute(0, 1, 3, 2, 4).reshape(B, 64, 16).to(var_feat.dtype)
                 var_feat = torch.cat([var_feat, self.osil_proj(m) + self.osil_pos + self.osil_type], 1)
+                if hasattr(self, 'rw'): vbias = torch.cat([vbias, torch.zeros(B, 64, device=vbias.device)], 1)
         if hasattr(self, 'v_adv'):
             out['v_adv_logit'] = self.v_adv(GradReverse.apply(out['var_vec'], float(self.grl_lam)))
         # Perceptive (공유): Token Pooling → Subject Projector
@@ -455,7 +505,8 @@ class Prism(nn.Module):
                 gamma, beta = self.film(h).chunk(2, -1)
                 ms = ms * (1 + gamma[:, None]) + beta[:, None]; mv = mv * (1 + gamma[:, None]) + beta[:, None]
             x = self.query.expand(B, -1, -1)
-            for l in self.dec: x = l(x, ms, mv)
+            vb = vbias if hasattr(self, 'rw') and var_override is None else None
+            for l in self.dec: x = l(x, ms, mv, vb)
             out['cond_tokens'] = self.tok_out(x)                                     # [B, 1374, 1024]
             if self.v_res: out['cond_tokens'] = out['cond_tokens'] + self._res_tokens(out)
             return out
@@ -497,7 +548,7 @@ def build_from_ckpt(ck, repo):
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
                   mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
                   calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
-                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)), csr_drop=args.get('csr_drop', '') or '', no_frame_emb=bool(int(args.get('no_frame_emb', 0) or 0)))
+                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)), csr_drop=args.get('csr_drop', '') or '', no_frame_emb=bool(int(args.get('no_frame_emb', 0) or 0)), region_w=bool(int(args.get('region_w', 0) or 0)))
     check_load(model, ck['model'])
     return model
 
