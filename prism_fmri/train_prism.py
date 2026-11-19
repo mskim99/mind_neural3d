@@ -83,6 +83,7 @@ p.add_argument('--save_steps', default='')              # '5000,10000': 그 스�
 p.add_argument('--v_res_basis', default='')   # 11-17: prep_vres_basis.py npz — 범주 평균 토큰 + Variational 잔차(PCA)를 출력에 더함. 주면 --view_tgt도 이 파일로, --var_heads shape 필요
 p.add_argument('--calib', type=int, default=0, choices=[0, 1])   # 11-17 Perceptive 개선안: 피험자 · 영역별 입력 보정 (prism.RegionCalib)
 p.add_argument('--calib_init', default='')   # 1단계(train_calib.py) 결과 calib.pt — 주면 보정값을 불러와 고정 (2단계). 안 주면 보정도 같이 학습
+p.add_argument('--sil_tmpl', default='')   # 11-19 V-T: silhouettes32.npz 경로 — 범주 평균 실루엣(train, 검증 물체 뺌)을 Semantic 예측 범주 확률로 섞어 V 메모리에 (정답 안 씀, 체크포인트 buffer cat_sil)
 p.add_argument('--oracle_sil', default='')   # 11-18 V-0 (진단 전용 상한): silhouettes32.npz 경로 — 정답 실루엣 지도(영상 10프레임 평균)를 V 메모리에 넣음 (평가도 정답 사용)
 p.add_argument('--shared_sv', type=int, default=0, choices=[0, 1])   # 11-17: Semantic · Variational을 피험자 공통 한 벌로 (2단계)
 p.add_argument('--polite', type=float, default=0)   # 11-17: > 0이면 같은 GPU 다른 사람 SM%를 이 값 이상으로 유지하게 스텝 사이 쉼 (polite.py)
@@ -189,7 +190,17 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl)).to(dev)
+if a.sil_tmpl:                                                                       # 범주 평균 실루엣 = train(검증 물체 뺌) 물체의 영상 10프레임 평균 지도를 범주마다 평균
+    _z = np.load(a.sil_tmpl); _M = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
+    _ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt')) if l.strip()]; _by = {}
+    for k in _ids: _by.setdefault(k.split('/')[0], []).append(k)
+    _H = {k for v in _by.values() for k in v[-a.holdout:]} if a.holdout > 0 else set()
+    with torch.no_grad():
+        for c, syn in enumerate(SYN):
+            _m = [_M[k.split('/')[1]] for k in _by.get(syn, []) if k not in _H and k.split('/')[1] in _M]
+            assert _m, f'범주 {syn} 실루엣 없음'; model.cat_sil[c] = torch.from_numpy(np.mean(_m, 0))
+    print(f'[sil_tmpl] 범주 평균 실루엣 {len(SYN)}장 (V-T)', flush=True)
 STATE = lambda: model.trainable_state_dict()
 SEP = a.lam_tc > 0 or a.lam_hsic > 0
 disc = TCDisc().to(dev) if a.lam_tc > 0 else None

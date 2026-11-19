@@ -183,7 +183,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -278,6 +278,8 @@ class Prism(nn.Module):
                 self.sem_loc_pos = nn.Parameter(torch.randn(sem_loc * sem_loc, dc) * 0.02)
             assert v_pool in (1, 2, 4, 8); self.v_pool = v_pool           # 11-13: patch 토큰을 이웃 k×k끼리 평균 (2 → 프레임당 64개), 토큰 수 줄이기
             self.var_pos = nn.Parameter(torch.randn(256 // v_pool ** 2, dc) * 0.02)      # patch(뇌 조각) 위치 embedding, 공유 (피험자 모두 같은 평면 지도)
+            self.sil_tmpl = bool(sil_tmpl)                                      # 11-19 V-T: 범주 평균 실루엣(train) 13장을 Semantic 예측 범주 확률로 섞어 같은 자리에 (정답 안 씀)
+            if self.sil_tmpl: self.register_buffer('cat_sil', torch.zeros(n_classes, 32, 32)); oracle_sil = True
             self.oracle_sil = bool(oracle_sil)                                  # 11-18 V-0 (진단 전용, 상한): 정답 실루엣 지도(영상 10프레임 평균 32×32)를 4×4 조각 64개 토큰으로 V 메모리에 붙임 (공통, 평가 입력으로 못 씀)
             if self.oracle_sil:
                 self.osil_proj = nn.Sequential(nn.Linear(16, dc), nn.GELU(), nn.Linear(dc, dc))
@@ -415,6 +417,9 @@ class Prism(nn.Module):
             else:
                 pt = (_route(self.var_tok, subj, vp) + self.var_pos + te[:, :, None] + self.type_emb[2]).flatten(1, 2)
             var_feat = torch.cat([var_feat + self.type_emb[1] + te, pt], 1)
+            if getattr(self, 'sil_tmpl', False):                                     # V-T: 예측 범주 확률(기울기 안 보냄, _res_tokens와 같은 식) × 범주 평균 지도
+                pr = torch.softmax(out['sem_clip'].float() @ self.prototypes.t().float() / 0.07, -1).detach()
+                sil = (pr @ self.cat_sil.flatten(1).float()).view(B, 32, 32)
             if getattr(self, 'oracle_sil', False):                                   # V-0: [B, 32, 32] → 8×8 격자 · 조각 4×4 → [B, 64, dc]
                 assert sil is not None, 'oracle_sil 모델은 sil(정답 실루엣 지도) 필요'
                 m = sil.float().reshape(B, 8, 4, 8, 4).permute(0, 1, 3, 2, 4).reshape(B, 64, 16).to(var_feat.dtype)
@@ -482,7 +487,7 @@ def build_from_ckpt(ck, repo):
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
                   mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
                   calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
-                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''))
+                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''))
     check_load(model, ck['model'])
     return model
 
