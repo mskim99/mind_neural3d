@@ -13,7 +13,8 @@ from prism import build_from_ckpt
 p = argparse.ArgumentParser()
 p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--ckpt', required=True); p.add_argument('--out', required=True)
 p.add_argument('--subs', required=True); p.add_argument('--fmri_subs', required=True); p.add_argument('--ns', default='0,50,100,300,600,1300')
-p.add_argument('--lams', default='0.01,0.03,0.1,0.3,1,3'); p.add_argument('--save', default=''); p.add_argument('--bs', type=int, default=8); p.add_argument('--self_ref', type=int, default=1)
+p.add_argument('--lams', default='0.01,0.03,0.1,0.3,1,3,10,30'); p.add_argument('--save', default=''); p.add_argument('--bs', type=int, default=8); p.add_argument('--self_ref', type=int, default=1)
+p.add_argument('--fit', default='frame', choices=['frame', 'mean'])   # frame: (물체, 프레임)을 표본으로 / mean: 물체의 프레임 평균 패턴을 표본으로 맞춘 사상을 프레임마다 적용 (잡음이 적음, diag_align.py와 같은 단위)
 a = p.parse_args()
 dev = 'cuda'; t0 = time.time(); ck = torch.load(a.ckpt, map_location='cpu'); SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8)); T = len(FRAMES)
 model = build_from_ckpt(ck, a.repo).cuda().eval()
@@ -72,8 +73,8 @@ for A in a.subs.split(','):
                 acc = run(raw(B, TE), si, f'{a.out}/n0_g1/{B}_as{A[-2:]}_keep' if ('0', 'g1') in SAVE else None); r['n']['0'] = {'g1': round(acc, 4)}
                 print(f'[{A} ← {B}] N 0 (정렬 없음) 범주 {acc:.3f}', flush=True); continue
             xa, xb = FA[:N], FB[:N]; mua, mub = xa.mean(0, keepdim=True), xb.mean(0, keepdim=True)        # 프레임별 평균 [1, T, P]
-            da, db = (xa - mua).flatten(0, 1), (xb - mub).flatten(0, 1)                                    # [N·T, P]
-            nf = max(int(N * 0.8), 1) * T; best = None                                                    # λ · gain: 앞 80 % 물체로 맞추고 뒤 20 %에서
+            da, db = ((xa - mua).flatten(0, 1), (xb - mub).flatten(0, 1)) if a.fit == 'frame' else ((xa - mua).mean(1), (xb - mub).mean(1))   # [N·T, P] 또는 [N, P]
+            nf = max(int(N * 0.8), 1) * (T if a.fit == 'frame' else 1); best = None                                                    # λ · gain: 앞 80 % 물체로 맞추고 뒤 20 %에서
             Kf = db[:nf] @ db[:nf].t(); Kc = db[nf:] @ db[:nf].t()
             for lam in LAMS:
                 pc = Kc @ solve(Kf, da[:nf], lam); c = rcorr(pc, da[nf:])
