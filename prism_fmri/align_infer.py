@@ -76,8 +76,8 @@ class Map:                                                                  # B 
     def __init__(s, xb, xa, mub, mua, lam):
         s.mub, s.mua, s.g = mub, mua, 1.0
         if a.fmap == 'full':
-            db = (xb.float() - mub); da = (xa.float() - mua)
-            db, da = (db.flatten(0, 1), da.flatten(0, 1)) if a.fit == 'frame' else (db.mean(1), da.mean(1))
+            if a.fit == 'frame': db, da = (xb.float() - mub).flatten(0, 1), (xa.float() - mua).flatten(0, 1)
+            else: db, da = (torch.cat([(x[i:i + 64].float() - mu).mean(1) for i in range(0, len(x), 64)]) for x, mu in ((xb, mub), (xa, mua)))   # 64개씩 (fp16 → fp32 사본을 한꺼번에 안 만듦)
             s.db = db; s.Wd = ksolve(db @ db.t(), da, lam)
         else:
             D = xb.shape[-1] // 257; G = torch.zeros(257, D, D, device=dev); C = torch.zeros(257, D, D, device=dev)
@@ -93,6 +93,7 @@ class Map:                                                                  # B 
     def __call__(s, x): return s.mua + s.g * s.dev_(x)
 
 
+def fmean(x): return sum(x[i:i + 64].float().sum(0, keepdim=True) for i in range(0, len(x), 64)) / len(x)                       # [1, T, F] (64개씩)
 def rcorr(A, B): A = A - A.mean(-1, keepdim=True); B = B - B.mean(-1, keepdim=True); return float((F.normalize(A, dim=-1) * F.normalize(B, dim=-1)).sum(-1).mean())
 NSL = [int(v) for v in a.ns.split(',')]; LAMS = [float(v) for v in a.lams.split(',')]; NM = max(NSL)
 R = {'ckpt': a.ckpt, 'space': a.space, 'fmap': a.fmap, 'fit': a.fit, 'chance': round(1 / len(SYN), 4), 'pairs': {}}
@@ -111,7 +112,7 @@ for A in a.subs.split(','):
                 (ma, sa), (mb, sb) = st(FA), st(FB[:N]); acc = run(lambda i, j: (FBte[i:j].float() - mb) / sb * sa + ma, si, TE, od)
                 r['n'][str(N)] = {'test': round(acc, 4)}; print(f'[{A} ← {B}] N {N} | test 범주 {acc:.3f} (통계만 맞춤) | {time.time() - t0:.0f}s', flush=True); del ma, sa, mb, sb; continue
             xa, xb = FA[:N], FB[:N]; nf = max(int(N * 0.8), 1); hk = TRP[nf:N]; best = None; tab = {}
-            mua, mub = xa[:nf].float().mean(0, keepdim=True), xb[:nf].float().mean(0, keepdim=True)
+            mua, mub = fmean(xa[:nf]), fmean(xb[:nf])
             for lam in LAMS:                                                # 앞 80 %로 맞추고 뒤 20 % 물체에서 고름
                 m = Map(xb[:nf], xa[:nf], mub, mua, lam); ph = torch.cat([m.dev_(xb[i:i + 16]) for i in range(nf, N, 16)]); ah = xa[nf:N].float() - mua
                 c = rcorr(ph, ah); g = float(ah.pow(2).mean().sqrt() / ph.pow(2).mean().sqrt().clamp_min(1e-8)); del ph, ah
@@ -120,7 +121,7 @@ for A in a.subs.split(','):
                     if best is None or h > best[0]: best = (h, lam, tag, gg, c)
                 del m; torch.cuda.empty_cache()
             h, lam, tag, gg, c = best
-            m = Map(xb, xa, xb.float().mean(0, keepdim=True), xa.float().mean(0, keepdim=True), lam); m.g = gg
+            m = Map(xb, xa, fmean(xb), fmean(xa), lam); m.g = gg
             acc = run(lambda i, j: m(FBte[i:j]), si, TE, od)
             r['n'][str(N)] = {'test': round(acc, 4), 'lam': lam, 'gain': tag, 'g': round(gg, 3), 'hold_acc': round(h, 4), 'hold_n': len(hk), 'corr20': round(c, 4), 'hold_tab': tab}
             print(f'[{A} ← {B}] N {N} | test 범주 {acc:.3f} | 고른 λ {lam:g} · {tag}({gg:.2f}) · 20 % 범주 {h:.3f} · 상관 {c:.3f} | {time.time() - t0:.0f}s', flush=True)
