@@ -43,6 +43,7 @@ for s in SUBS:
     tr = collect('train', s).float(); te = collect('test', s).float(); mu = tr.mean(0, keepdim=True); X[s] = {'train': (tr - mu).half(), 'test': (te - mu).half()}
 print(f'읽기 끝 {time.time() - t0:.0f}s | train {len(SPL["train"])} · test {len(SPL["test"])} · 피험자 {NS}', flush=True)
 sub_m = {g: m[G['전체']] for g, m in G.items()}; ytr, yte = Y['train'], Y['test']; oh = F.one_hot(ytr, len(CL)).double(); ntr = len(ytr)
+ORD = lambda s: s[-1] in '1678'   # 11-20: 자극 제시 순서 묶음 (beh csv 확인: 피험자 1 · 6 · 7 · 8끼리, 2 · 3 · 5끼리 run · 순서가 96 ~ 97 % 같음)
 def solve(K, T, lam): return torch.linalg.solve(K.double() + (lam * K.diagonal().mean().double() + 1e-6) * torch.eye(len(K), device=dev, dtype=torch.float64), T.double()).float()
 NSH = [int(v) for v in a.ns.split(',')]; g_perm = torch.randperm(ntr, generator=torch.Generator().manual_seed(0)).to(dev)   # 정렬에 쓸 공유 물체 순서 (고정)
 R = {'chance': round(1 / len(CL), 4), 'pairs': NS * (NS - 1), 'groups': {}}
@@ -52,19 +53,20 @@ for g, m in sub_m.items():
     pred = lambda i, Z: (Z @ tr[i].t() @ cls[i]).argmax(1)                                       # Z [n, P] (A 공간) → 범주
     within = float(np.mean([float((pred(i, te[i]) == yte).float().mean()) for i in range(NS)]))
     raw = float(np.mean([float((pred(i, te[j]) == yte).float().mean()) for i in range(NS) for j in range(NS) if i != j]))
-    r = {'px': int(m.sum()), 'within': round(within, 4), 'cross_noalign': round(raw, 4), 'aligned': {}}
+    raw_so = {k_: round(float(np.mean([float((pred(i, te[j]) == yte).float().mean()) for i in range(NS) for j in range(NS) if i != j and (ORD(SUBS[i]) == ORD(SUBS[j])) == v_])), 4) for k_, v_ in (('same_order', True), ('diff_order', False))}
+    r = {'px': int(m.sum()), 'within': round(within, 4), 'cross_noalign': round(raw, 4), 'cross_noalign_by_order': raw_so, 'aligned': {}}
     for n in NSH:
         idx = g_perm[:min(n, ntr)]; best = None
         for lam in (0.03, 0.3, 3.0):
-            accs = []
+            accs = []; same = []
             for i in range(NS):
                 for j in range(NS):
                     if i == j: continue
                     Kb = tr[j][idx] @ tr[j][idx].t(); Wd = solve(Kb, tr[i][idx], lam)            # B → A (dual): [n, P_a]
-                    Z = F.normalize(te[j] @ tr[j][idx].t() @ Wd, dim=-1); accs.append(float((pred(i, Z) == yte).float().mean()))
+                    Z = F.normalize(te[j] @ tr[j][idx].t() @ Wd, dim=-1); accs.append(float((pred(i, Z) == yte).float().mean())); same.append(ORD(SUBS[i]) == ORD(SUBS[j]))
             v = float(np.mean(accs))
-            if best is None or v > best[0]: best = (v, lam)
-        r['aligned'][str(min(n, ntr))] = {'acc': round(best[0], 4), 'lam': best[1]}
+            if best is None or v > best[0]: best = (v, lam, float(np.mean([x for x, s_ in zip(accs, same) if s_])), float(np.mean([x for x, s_ in zip(accs, same) if not s_])))
+        r['aligned'][str(min(n, ntr))] = {'acc': round(best[0], 4), 'lam': best[1], 'same_order': round(best[2], 4), 'diff_order': round(best[3], 4)}   # 11-20: 제시 순서가 같은 쌍 / 다른 쌍 따로
     # (추가) ① 자기 데이터 N개로만 분류기를 학습했을 때 (정렬 N개와 같은 물체, 라벨 사용) — 정렬이 few-shot보다 나은지의 기준
     r['own_nshot'] = {}
     for n in NSH:
