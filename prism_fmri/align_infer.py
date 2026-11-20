@@ -5,6 +5,7 @@
 #          feat  : 고정 ViT 출력 토큰 [257, 1024]에서 맞춤 (ViT는 A의 것을 B에도 그대로) → A 갈래 (feat_norm은 A의 값)
 #  --fmap full : 전체를 한 벡터로 본 커널 릿지 (--fit frame = (물체, 프레임)이 표본 / mean = 물체의 프레임 평균이 표본, 사상은 프레임마다 적용)
 #         pos  : (feat만) 토큰 위치마다 1024 → 1024 릿지 (표본 = 물체 × 프레임). 위치를 섞지 않는 가벼운 사상
+#         stat : (feat만, 짝이 필요 없음) B의 토큰을 위치 · 차원마다 B 자신의 평균 · 표준편차(물체 N개)로 표준화한 뒤 A의 평균 · 표준편차로 되돌림 — 통계만 맞추는 기준
 #  사상은 프레임별 평균을 뺀 값끼리 맞추고 A의 평균을 더해 돌려줌. 짝에는 같은 자극을 본 fMRI만 있으면 됨
 #  λ · 배율 고르기 (test 안 씀): 짝의 앞 80 %로 맞추고 뒤 20 % 물체를 옮겨 A 갈래에 넣었을 때의 범주 정확도가 가장 높은 것 (자극의 범주는 아는 값).
 #   배율 g1 = 그대로, gm = 릿지가 줄인 변화 크기를 같은 20 %에서 A의 실제 크기에 맞춤. 고른 뒤 N개 전부로 다시 맞춰 test 104개에 적용
@@ -19,7 +20,7 @@ from prism import build_from_ckpt
 p = argparse.ArgumentParser()
 p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--ckpt', required=True); p.add_argument('--out', required=True)
 p.add_argument('--subs', required=True); p.add_argument('--fmri_subs', required=True); p.add_argument('--ns', default='0,50,100,300,600,1300')
-p.add_argument('--space', default='feat', choices=['input', 'feat']); p.add_argument('--fmap', default='full', choices=['full', 'pos']); p.add_argument('--fit', default='mean', choices=['frame', 'mean'])
+p.add_argument('--space', default='feat', choices=['input', 'feat']); p.add_argument('--fmap', default='full', choices=['full', 'pos', 'stat']); p.add_argument('--fit', default='mean', choices=['frame', 'mean'])
 p.add_argument('--lams', default='0.01,0.03,0.1,0.3,1,3,10'); p.add_argument('--save', default=''); p.add_argument('--bs', type=int, default=16)
 a = p.parse_args(); assert a.fmap == 'full' or a.space == 'feat'
 dev = 'cuda'; t0 = time.time(); ck = torch.load(a.ckpt, map_location='cpu'); SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8)); T = len(FRAMES)
@@ -105,6 +106,10 @@ for A in a.subs.split(','):
             od = f'{a.out}/n{N}/{B}_as{A[-2:]}_keep' if str(N) in SAVE else None
             if N == 0:
                 acc = run(lambda i, j: FBte[i:j], si, TE, od); r['n']['0'] = {'test': round(acc, 4)}; print(f'[{A} ← {B}] N 0 (정렬 없음) 범주 {acc:.3f}', flush=True); continue
+            if a.fmap == 'stat':
+                st = lambda x: (lambda f: (f.mean((0, 1), keepdim=True), f.std((0, 1), keepdim=True) + 1e-6))(x.float())
+                (ma, sa), (mb, sb) = st(FA), st(FB[:N]); acc = run(lambda i, j: (FBte[i:j].float() - mb) / sb * sa + ma, si, TE, od)
+                r['n'][str(N)] = {'test': round(acc, 4)}; print(f'[{A} ← {B}] N {N} | test 범주 {acc:.3f} (통계만 맞춤) | {time.time() - t0:.0f}s', flush=True); del ma, sa, mb, sb; continue
             xa, xb = FA[:N], FB[:N]; nf = max(int(N * 0.8), 1); hk = TRP[nf:N]; best = None; tab = {}
             mua, mub = xa[:nf].float().mean(0, keepdim=True), xb[:nf].float().mean(0, keepdim=True)
             for lam in LAMS:                                                # 앞 80 %로 맞추고 뒤 20 % 물체에서 고름
