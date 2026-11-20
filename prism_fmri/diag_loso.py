@@ -12,6 +12,7 @@ import torch.nn.functional as F
 p = argparse.ArgumentParser()
 p.add_argument('--data_root', required=True); p.add_argument('--subs', required=True); p.add_argument('--ap', default=''); p.add_argument('--out', required=True)
 p.add_argument('--min_px', type=int, default=40); p.add_argument('--perm', type=int, default=10000); p.add_argument('--no_region', action='store_true')
+p.add_argument('--extra', default=''); p.add_argument('--only_extra', action='store_true'); p.add_argument('--same', default='1,6,7,8')   # 11-20: train도 있는 새 피험자(4번)에 7명 분류기 적용 + 제시 순서 묶음별
 a = p.parse_args()
 dev = 'cuda'; t0 = time.time(); SUBS = a.subs.split(','); NS = len(SUBS); FRAMES = list(range(2, 8)); LAM = 0.1
 lst = lambda s: [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{s}_list.txt')) if l.strip()]
@@ -43,6 +44,7 @@ def collect(s, keys):                                                      # →
 
 RAW = {s: {'train': collect(s, TR), 'test': collect(s, TE)} for s in SUBS}
 if TE9: RAW[a.ap] = {'test': collect(a.ap, TE9)}
+if a.extra: RAW[a.extra] = {'train': collect(a.extra, TR), 'test': collect(a.extra, TE)}; assert all(ex(a.extra, k_) for k_ in TR + TE)
 print(f'읽기 끝 {time.time() - t0:.0f}s', flush=True)
 
 
@@ -107,23 +109,42 @@ def run(feat, tag, full=True):                                             # fea
     return R, CF
 
 
+def run_extra(feat):                                                       # 새 피험자 E (train · test 다 있음): 7명 / 같은 묶음 / 다른 묶음으로 맞춘 분류기를 E의 test에
+    E_ = a.extra; R = {}; same = [s for s in SUBS if sh(s) in a.same.split(',')]; GR = {'all7': SUBS, 'same_order': same, 'diff_order': [s for s in SUBS if s not in same]}
+    zE = {'raw': None, 'ztrain': zs(feat[E_]['test'], feat[E_]['train']), 'ztest': zs(feat[E_]['test'], feat[E_]['test'])}
+    for g, ss in GR.items():
+        R[g] = {'subs': [sh(s) for s in ss]}
+        for nm in ('raw', 'ztrain', 'ztest'):
+            if nm == 'raw': mu = torch.cat([feat[t]['train'] for t in ss]).mean(0, keepdim=True); Xtr = torch.cat([feat[t]['train'] for t in ss]) - mu; Xe = feat[E_]['test'] - mu
+            else: Xtr = torch.cat([zs(feat[t]['train'], feat[t]['train']) for t in ss]); Xe = zE[nm]
+            pr = predict(fit(Xtr, ytr.repeat(len(ss))), Xe); R[g][nm] = round(float((pr == yte).float().mean()), 4); R[g][nm + '_p'] = round(perm_p(pr, yte), 4); CFS[f'extra|{g}|{nm}|' + CUR[0]] = conf(pr, yte); del Xtr
+    R['own'] = round(float((predict(fit(zs(feat[E_]['train'], feat[E_]['train']), ytr), zE['ztrain']) == yte).float().mean()), 4)
+    return R
+
+
+CUR = ['']
 OUT = {'chance': round(1 / NC, 4), 'subs': SUBS, 'ap': a.ap, 'n_test': nte, 'n_test_ap': len(TE9), 'classes': CL, 'lam': LAM, 'perm': a.perm, 'formats': {}}; CFS = {}
 for f, fn in FMT.items():
     feat = {s: {k_: fn(v) for k_, v in d.items()} for s, d in RAW.items()}
-    R, CF = run(feat, f); OUT['formats'][f] = R; CFS.update(CF); OUT['formats'][f]['dim'] = int(feat[SUBS[0]]['test'].shape[1])
+    CUR[0] = f
+    if a.only_extra:
+        OUT['formats'][f] = {'extra': run_extra(feat)}; print(f'[{f}] {a.extra} ' + json.dumps(OUT['formats'][f]['extra'], ensure_ascii=False), flush=True); del feat; torch.cuda.empty_cache(); continue
+    R, CF = run({s: d for s, d in feat.items() if s != a.extra}, f); OUT['formats'][f] = R; CFS.update(CF); OUT['formats'][f]['dim'] = int(feat[SUBS[0]]['test'].shape[1])
+    if a.extra: R['extra'] = run_extra(feat)
     print(f'[{f}] ' + ' | '.join(f'{nm} 평균 {R[nm]["mean"]} ({R[nm]["n_over_0.15"]}/{NS}명 > 0.15)' + (f' AP {R[nm]["ap"]}' if 'ap' in R[nm] else '') for nm in ('raw', 'ztrain', 'ztest')) + f' | 자기 {R["own"]["mean"]} · 1→1 {R["one2one"]["mean"]} | {time.time() - t0:.0f}s', flush=True)
     del feat; torch.cuda.empty_cache()
-if not a.no_region:                                                        # 영역 하나씩 (화소, ztrain · AP는 ztest)
+if not a.no_region and not a.only_extra:                                                        # 영역 하나씩 (화소, ztrain · AP는 ztest)
     OUT['regions'] = {}
     for n in RNAMES:
         m = torch.isin(labm, torch.tensor(REG[n], device=dev))
         if int(m.sum()) < a.min_px: continue
-        feat = {s: {k_: v.flatten(1)[:, M][:, m].float() for k_, v in d.items()} for s, d in RAW.items()}
+        feat = {s: {k_: v.flatten(1)[:, M][:, m].float() for k_, v in d.items()} for s, d in RAW.items() if s != a.extra}
         R, _ = run(feat, n, full=False); r = {'px': int(m.sum()), 'loso': R['ztrain']['mean'], 'loso_by_sub': R['ztrain']['by_sub'], 'own': R['own']['mean']}
         if TE9:
             Xtr = torch.cat([zs(feat[t]['train'], feat[t]['train']) for t in SUBS]); r['ap'] = round(float((predict(fit(Xtr, ytr.repeat(NS)), zs(feat[a.ap]['test'], feat[a.ap]['test'])) == yte9).float().mean()), 4)
         OUT['regions'][n] = r
     top = sorted(OUT['regions'].items(), key=lambda kv: -kv[1]['loso'])[:8]; print('영역 단위 상위:', [(n, r['loso'], r.get('ap'), r['own']) for n, r in top], f'{time.time() - t0:.0f}s', flush=True)
 os.makedirs(a.out, exist_ok=True)
-json.dump(OUT, open(f'{a.out}/loso.json', 'w'), ensure_ascii=False, indent=1); np.savez_compressed(f'{a.out}/loso_conf.npz', **CFS)
+OUT['extra'] = a.extra; FN = 'loso_extra' if a.only_extra else 'loso'
+json.dump(OUT, open(f'{a.out}/{FN}.json', 'w'), ensure_ascii=False, indent=1); np.savez_compressed(f'{a.out}/{FN}_conf.npz', **CFS)
 print('LOSO_DONE', a.out, f'{time.time() - t0:.0f}s', flush=True)
