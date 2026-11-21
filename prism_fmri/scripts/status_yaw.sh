@@ -12,7 +12,7 @@ since() { local t=$(grep -h "^=== $1 $2" $L 2>/dev/null | tail -1 | grep -oE '[0
 npng() { find $1 -name '*.png' 2>/dev/null | wc -l; }
 printf "%-14s %-12s %-10s %-10s %-9s %s\n" 세트 단계 진행 속도 남은시간 "종료(KST)"; last=0
 for s in $SETS; do
-  IFS=: read n mode rt <<< "$s"; R=$W/fair_eval_v2; need=104; [ "$rt" = apac ] && { R=$W/fair_eval_v2_apac; need=220; }
+  IFS=: read n mode rt <<< "$s"; R=${FE2:-$W/fair_eval_v2}; need=104; [ "$rt" = apac ] && { R=${FEA:-$W/fair_eval_v2_apac}; need=220; }   # 11-21: FE2 · FEA로 다른 번들
   V=$R/out/yaw_$n/values.txt; k=$(( need * 100 / 104 ))                      # 104개 대비 배율(%)
   tsel=$(( 240 * k / 100 )); tmet=$(( 720 * k / 100 )); tev=0; [ $mode = full ] && tev=$(( need * 60 * 10 / 27 ))
   if [ -s $V ] && grep -q '^FPD' $V; then

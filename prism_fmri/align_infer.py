@@ -22,9 +22,14 @@ p.add_argument('--repo', required=True); p.add_argument('--data_root', required=
 p.add_argument('--subs', required=True); p.add_argument('--fmri_subs', required=True); p.add_argument('--ns', default='0,50,100,300,600,1300')
 p.add_argument('--space', default='feat', choices=['input', 'feat']); p.add_argument('--fmap', default='full', choices=['full', 'pos', 'stat']); p.add_argument('--fit', default='mean', choices=['frame', 'mean'])
 p.add_argument('--lams', default='0.01,0.03,0.1,0.3,1,3,10'); p.add_argument('--save', default=''); p.add_argument('--bs', type=int, default=16)
+p.add_argument('--rw_common', type=int, default=0, choices=[0, 1])   # 11-21 P-2: 영역 가중 피험자별 조정 d를 0으로 (새 피험자는 공통 가중만)
 a = p.parse_args(); assert a.fmap == 'full' or a.space == 'feat'
 dev = 'cuda'; t0 = time.time(); ck = torch.load(a.ckpt, map_location='cpu'); SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8)); T = len(FRAMES)
 model = build_from_ckpt(ck, a.repo).cuda().eval(); ENC = model.encode_frames; model.encode_frames = lambda f, s: f     # 모델에는 ViT 토큰을 바로 넣음
+if a.rw_common:
+    assert hasattr(model, 'rw'), '--rw_common: 영역 가중 없는 모델'
+    with torch.no_grad(): model.rw.d_s.zero_(); model.rw.d_v.zero_()
+    print('[rw_common] 영역 가중 피험자별 조정 0 → 공통 가중만', flush=True)
 lst = lambda s: [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{s}_list.txt')) if l.strip()]
 TR, TE = lst('train'), lst('test'); TRP = [TR[i] for i in torch.randperm(len(TR), generator=torch.Generator().manual_seed(0)).tolist()]
 lab = lambda keys: np.array([SYN.index(k.split('/')[0]) for k in keys]); SAVE = {s for s in a.save.split(',') if s}; GRP = lambda s: 'a' if s[-1] in '1678' else 'b'

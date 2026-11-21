@@ -14,6 +14,7 @@
 # 사용: GPU=1 nohup bash run_branch.sh > $W/logs/prism_branch.log 2>&1 < /dev/null & disown
 #       동작 확인(60스텝, 차례로): TEST=1 GPU=1 bash run_branch.sh        진행: SET=branch watch -n 1 bash status_reg.sh
 SUBS=${SUBS:-sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008}   # 11-15: 2명 학습은 SUBS=sub-0001,sub-0006
+SUBS8=${SUBS8:-sub-0001,sub-0002,sub-0003,sub-0004,sub-0005,sub-0006,sub-0007,sub-0008}   # 11-21 P-2: 이름이 _8sub로 끝나는 run (4번 포함 8명)
 source $(dirname $0)/common.sh || exit 1
 [ -f "$W/STOP_GPU${GPU:-x}" ] && { echo "STOP_GPU${GPU} 있음 — 이 GPU에서는 띄우지 않음 ($(date +%H:%M:%S))"; exit 0; }   # 11-19: 예약된 run을 kill 없이 건너뛰게 (GPU 할당이 바뀔 때 $W/STOP_GPU<번호> 파일을 만듦)
 RUNS=${RUNS:-"a asv ac ap au"}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000,15000}; HOLD=${HOLD:-8}; TEST=${TEST:-0}
@@ -35,6 +36,7 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      base_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # + 1단계 영역별 보정(고정) = Perceptive 개선안
                      base_sharedsv_calib_bound_keep) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:?CAL 필요 (크기 묶기 + 보존 항 1단계 calib.pt)}";;   # 11-18 보정 다시: 크기 묶기(bound · renorm) + 보존 항(keep), 설정은 calib.pt에 들어 있음
                      ausvp_sharedsv) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --shared_sv 1 --film 0 --lam_subj 0";;   # 11-18 최종 Ours(ausvp) + S · V 피험자 공통 (FiLM · 피험자 분류 끔)
+                     ausvp_8sub) echo "$EU --mem branch --v_pool 2 --sv_enc 0";;   # 11-21 P-2 ㉰: 최종 Ours(ausvp) 설정 그대로 + 4번 포함 8명 학습 (피험자는 SUBS8)
                      ausvp_regionw) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --region_w 1 --region_prior ${RP:-$W/prism_calib/region_prior.npz}";;   # 11-20 (b): 최종 Ours(ausvp) + 공통 영역 가중 (S · V 따로, 공통 + 피험자별 조정, prep_region_prior.py 사전값)
                      ausvp_regionw_noprior) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --region_w 1";;   # 11-20 (b) 대조: 사전값 없이 모든 영역 같은 가중에서 시작 (사전값 효과 따로 보기)
                      ausvp_sharedsv_regionw) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --shared_sv 1 --film 0 --lam_subj 0 --region_w 1 --region_prior ${RP:-$W/prism_calib/region_prior.npz}";;   # 11-20 (b): S · V 피험자 공통 한 벌 + 공통 영역 가중 (대조 = ausvp_sharedsv, 11-18 5090)
@@ -62,8 +64,9 @@ one() {
   local n=$1 M=$O/$1 L=$W/logs/${LP}_$1.log; [ $TEST = 1 ] && L=$W/logs/${LP}_test_$1.log
   [ -f $W/SKIP_$n ] && { echo "SKIP_$n 있음 — 건너뜀 (다른 서버 몫)"; return; }   # 11-19: run 하나만 kill 없이 건너뛰기
   [ -f $M/model_final.pt ] && { echo "이미 있음 $n"; return; }
-  echo "=== 학습 시작 $n ($(flags $n)) $(date +%H:%M:%S)"
-  $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $SUBS --bs 14 --max_step $STEPS \
+  local S=$SUBS; case $n in *_8sub) S=$SUBS8;; esac   # 11-21 P-2: 8명 run만 피험자 목록을 따로
+  echo "=== 학습 시작 $n ($(flags $n)) 피험자 $S $(date +%H:%M:%S)"
+  $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $S --bs 14 --max_step $STEPS \
     --workers ${WK:-4} --polite ${POLITE:-65} --per_subject 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
     --seed 1 --holdout $HOLD ${SAVE:+--save_steps $SAVE} $(flags $n) $X --resume --out_dir $M > $L 2>&1
   echo "=== 학습 끝 $n $(date +%H:%M:%S) | $(grep -E '^\[hold\]' $L | tail -1 | cut -c1-200)"

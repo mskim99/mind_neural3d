@@ -18,11 +18,12 @@ case "${PRESET:-}" in   # 미리 정한 묶음 (ablation 먼저)
   5090)    SETS="$(ab onlyS) $(ab onlyV) $(ab noS) $(ab noV)";;
 esac
 : ${SETS:?SETS="이름:GLB 폴더:토큰 폴더:full|shape:v2|apac …"}
-FE2=${FE2:-$W/fair_eval_v2}; FEA=${FEA:-$W/fair_eval_v2_apac}; PAR=${PAR:-4}; G=$CUDA_VISIBLE_DEVICES; Y=$W/prism_yaw; PY=$W/venv/bin/python
+FE2=${FE2:-$W/fair_eval_v2}; FEA=${FEA:-$W/fair_eval_v2_apac}; FE_RUN=${FE_RUN:-run_v2.sh};   # 11-21 P-2: 기준 번들(5090과 같은 파일, 축 고정)은 FE2=$W/fair_eval_ref FEA=$W/fair_eval_ref_apac FE_RUN=run_eval.sh
+ PAR=${PAR:-4}; G=$CUDA_VISIBLE_DEVICES; Y=$W/prism_yaw; PY=$W/venv/bin/python
 export FE_PY=$PY FE_BLENDER=${FE_BLENDER:-$W/tools/blender-4.2.3-linux-x64/blender} FE_WORKERS=${FE_WORKERS:-8} FE_THREADS=${FE_THREADS:-8} TORCH_HOME=$W/cache/torch
 VIEWS=$(seq -s, 0 30 330 | sed 's/\([0-9]*\)/\1:30/g')
 trel() { (cd $MG && source $MG/mg_guard.sh && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
-[ -f $FE2/run_v2.sh ] && [ -f $FE2/scripts/render.py ] || { echo "v2 번들 없음 $FE2"; exit 1; }
+[ -f $FE2/$FE_RUN ] && [ -f $FE2/scripts/render.py ] || { echo "번들 없음 $FE2/$FE_RUN"; exit 1; }
 cd $W/run; mkdir -p $Y
 one() {   # 이름 · GLB 폴더 · 토큰 폴더 · full|shape · v2|apac
   local n=$1 d=$2 tk=$3 mode=$4 rt=$5 O=$Y/$1 R=$FE2 need=104
@@ -30,7 +31,7 @@ one() {   # 이름 · GLB 폴더 · 토큰 폴더 · full|shape · v2|apac
   cnt() { ls $d/*/*.glb 2>/dev/null | wc -l; }
   if [ $(cnt) -lt $need ] && [ "${WAIT:-0}" = 1 ]; then echo "기다림 $n ($(cnt)/$need) $(date +%H:%M:%S)"; until [ $(cnt) -ge $need ]; do sleep 60; done; sleep 60; fi
   [ $(cnt) -ge $need ] && [ $(ls $tk/*.npy 2>/dev/null | wc -l) -ge $need ] || { echo "건너뜀 $n (GLB $(cnt) · 토큰 $(ls $tk/*.npy 2>/dev/null | wc -l) / $need)"; return; }
-  [ -f $R/run_v2.sh ] || { echo "건너뜀 $n (번들 없음 $R — run_v2_apac.sh 먼저)"; return; }
+  [ -f $R/$FE_RUN ] || { echo "건너뜀 $n (번들 없음 $R/$FE_RUN)"; return; }
   mkdir -p $O
   if [ ! -f $O/yawsel.json ]; then
     echo "=== $n 12방위 렌더 $(date +%H:%M:%S)"; ls $d/*/*.glb > $O/list.txt
@@ -43,7 +44,7 @@ one() {   # 이름 · GLB 폴더 · 토큰 폴더 · full|shape · v2|apac
   [ $n = vt_s1 ] && [ -f $W/prism_sep/yaw/ours_g0.json ] && $PY $PR/yaw_compare.py --yaw $W/prism_sep/yaw/ours_g0.json --sel $O/yawsel.json --name vt_s1_txt | grep -E "^YAWCMP\|vt_s1_txt (정한|반대)"
   if [ ! -f $R/out/yaw_$n/values.txt ]; then
     echo "=== $n v2 평가 ($mode) $(date +%H:%M:%S)"
-    FE_SKIP_TEX=$([ $mode = shape ] && echo 1 || echo 0) bash $R/run_v2.sh yaw_$n $O/glb glb $G > $W/logs/yawv2_$n.log 2>&1
+    FE_SKIP_TEX=$([ $mode = shape ] && echo 1 || echo 0) bash $R/$FE_RUN yaw_$n $O/glb glb $G > $W/logs/yawv2_$n.log 2>&1
   fi
   echo "YV2|$n | $(grep -E '^frame|^R2\|(2way|10way|LPIPS|PSNR|SSIM)|^(CD|EMD|FPD)\s|dist\|n_objects' $R/out/yaw_$n/values.txt 2>/dev/null | tr -s ' \t\n' ' ') $(date +%H:%M:%S)"
   echo "YV2|$n 좌표축 분포 | $(grep '분포' $R/out/yaw_$n/logs/frame.log 2>/dev/null | cut -c1-260)"
