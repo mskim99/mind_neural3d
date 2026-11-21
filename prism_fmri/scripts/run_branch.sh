@@ -15,7 +15,7 @@
 #       동작 확인(60스텝, 차례로): TEST=1 GPU=1 bash run_branch.sh        진행: SET=branch watch -n 1 bash status_reg.sh
 SUBS=${SUBS:-sub-0001,sub-0002,sub-0003,sub-0005,sub-0006,sub-0007,sub-0008}   # 11-15: 2명 학습은 SUBS=sub-0001,sub-0006
 SUBS8=${SUBS8:-sub-0001,sub-0002,sub-0003,sub-0004,sub-0005,sub-0006,sub-0007,sub-0008}   # 11-21 P-2: 이름이 _8sub로 끝나는 run (4번 포함 8명)
-source $(dirname $0)/common.sh || exit 1
+source "$(cd "$(dirname "$0")" && pwd)/common.sh" || exit 1   # 11-21: 가드가 작업 위치를 바꾸므로 절대 경로로
 [ -f "$W/STOP_GPU${GPU:-x}" ] && { echo "STOP_GPU${GPU} 있음 — 이 GPU에서는 띄우지 않음 ($(date +%H:%M:%S))"; exit 0; }   # 11-19: 예약된 run을 kill 없이 건너뛰게 (GPU 할당이 바뀔 때 $W/STOP_GPU<번호> 파일을 만듦)
 RUNS=${RUNS:-"a asv ac ap au"}; STEPS=${STEPS:-20000}; SAVE=${SAVE:-5000,10000,15000}; HOLD=${HOLD:-8}; TEST=${TEST:-0}
 PY=$W/venv/bin/python; PUB=$W/weights/MinD-3D-pp/fMRI-Shape; U=$W/weights/LEA_Visual_UKB/ukb_encoder.pt; VT=$TGT/view_targets_shape.npz; O=${OUT:-$W/prism_branch}; LP=${LP:-prism_branch}   # OUT · LP: 다른 스텝 수로 처음부터 다시 돌릴 때 폴더 · 로그 이름을 따로 (예: OUT=$W/prism_branch40 LP=prism_branch40 STEPS=40000)
@@ -77,6 +77,6 @@ else J=""   # 11-17: 공용 GPU 배려 — 동시에 MAXJ개까지, GPU 남은 �
   MAXJ=${MAXJ:-2}; MINFREE=${MINFREE:-20000}; LOADMAX=${LOADMAX:-40}
   gate() { while :; do nrun=$(jobs -rp | wc -l); free=$(nvidia-smi -i $CUDA_VISIBLE_DEVICES --query-gpu=memory.free --format=csv,noheader,nounits); load=$(cut -d' ' -f1 /proc/loadavg)
     [ $nrun -lt $MAXJ ] && [ $free -ge $MINFREE ] && awk "BEGIN{exit !($load < $LOADMAX)}" && return; sleep 30; done; }
-  for n in $RUNS; do gate; echo "=== 띄움 $n $(date +%H:%M:%S) | 도는 것 $nrun/$MAXJ · GPU 남은 ${free} MiB · 부하 $load"; one $n & J="$J $!"; sleep 120; done; wait $J
+  for n in $RUNS; do gate; wait_gpu_free "학습 $n"; echo "=== 띄움 $n $(date +%H:%M:%S) | 도는 것 $nrun/$MAXJ · GPU 남은 ${free} MiB · 부하 $load"; one $n & J="$J $!"; sleep 120; done; wait $J
   echo "=== 요약 (검증 물체 기준)"; SET=branch OUT=$O LP=$LP RUNS="$RUNS" bash $PR/scripts/status_reg.sh | sed -n '/^요약/,$p'; fi
 echo "=== BRANCH_DONE $(date +%H:%M:%S)"

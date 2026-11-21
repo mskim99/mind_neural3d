@@ -10,7 +10,7 @@
 #  → $FE2/out/yaw_<이름>/values.txt (apac은 $FEA/out), 로그 YV2|… (YAW_V2_DONE)
 #  PRESET=pro6000 (ablation w/o all · w/o P · only P + 피험자 1 · 8 · 2 · 3 · 5 · 6 · 7 + AP · APAC) / PRESET=5090 (only S · only V · w/o S · w/o V)
 # 사용: PRESET=pro6000 | SETS="…" [PAR=4] [WAIT=1] [FE2=…] nohup bash run_yaw_v2.sh > $W/logs/yaw_v2.log 2>&1 < /dev/null & disown
-source $(dirname $0)/common.sh || exit 1
+source "$(cd "$(dirname "$0")" && pwd)/common.sh" || exit 1   # 11-21: 가드가 작업 위치를 바꾸므로 절대 경로로
 A=$W/prism_abl/infer; T=$W/prism_vshape/text/glb; I=$W/prism_vshape/infer/vshape_g0; K=sub-0001_keep; AP=$W/prism_apac/ours
 ab() { echo "abl_$1:$A/$1/$K/glb_text:$A/$1/$K/tokens:full:v2"; }; sb() { echo "vt_s$1:$T/vt_s$1:$I/sub-000$1_keep/tokens:full:v2"; }
 case "${PRESET:-}" in   # 미리 정한 묶음 (ablation 먼저)
@@ -52,6 +52,7 @@ one() {   # 이름 · GLB 폴더 · 토큰 폴더 · full|shape · v2|apac
 for s in $SETS; do
   IFS=: read n d tk mode rt <<< "$s"
   while [ $(jobs -rp | wc -l) -ge $PAR ]; do sleep 20; done
+  wait_gpu_free "평가 $n"   # 11-21: 세트마다 새로 띄우기 전에 확인
   one $n $d $tk ${mode:-full} ${rt:-v2} &
 done
 wait

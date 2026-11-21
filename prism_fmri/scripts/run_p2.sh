@@ -17,8 +17,9 @@
 #       STAGE=check bash run_p2.sh  (번들 지문 · 데이터 · GPU 확인만, 아무것도 안 띄움)
 #       STAGE=post  … (학습을 건너뛰고 추론부터 — 코드를 고친 뒤 이어 갈 때, 이미 있는 결과는 건너뜀) · STAGE=train (학습만)
 #       세트 더하기(예: 짝 100 · 300개, 사용자 확인 뒤): ADD="ausvp_sharedsv_regionw:s04_pair100as01 …" STAGE=post …
-source $(dirname $0)/common.sh || exit 1
-SD=$(cd $(dirname $0) && pwd); PY=$W/venv/bin/python; P=$W/prism_p2; G=$CUDA_VISIBLE_DEVICES; STAGE=${STAGE:-all}
+SD=$(cd "$(dirname "$0")" && pwd)   # 11-21: 가드가 작업 위치를 바꾸므로 source 전에 절대 경로로 (상대 경로로 불려도 PR · SD가 맞게)
+source $SD/common.sh || exit 1
+PY=$W/venv/bin/python; P=$W/prism_p2; G=$CUDA_VISIBLE_DEVICES; STAGE=${STAGE:-all}
 M1=ausvp_sharedsv; M2=ausvp_sharedsv_regionw; M3=ausvp_8sub
 MAXJ=${MAXJ:-3}; GENPAR=${GENPAR:-2}; PAR=${PAR:-4}; TM=${TEXT_MODEL:-microsoft/TRELLIS-text-base}
 FER=$W/fair_eval_ref; FERA=$W/fair_eval_ref_apac; V2=$W/fair_eval_v2; RP=$W/prism_calib/region_prior.npz
@@ -29,10 +30,7 @@ ALL="$SETS0 ${ADD:-}"
 mkdir -p $P $W/logs; cd $W/run
 
 # ---- GPU 1에 다른 사람 작업이 있으면 기다림
-others() { local u=$(nvidia-smi -i $G --query-gpu=uuid --format=csv,noheader)
-  nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | awk -F', ' -v u="$u" '$1==u{print $2}' | while read p; do
-    c=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null); case "$c" in *"/home/oem/jhj"*) ;; *) echo "pid $p $(ps -o user= -p $p 2>/dev/null) ${c:0:60}";; esac; done; }
-wait_free() { local o; while o=$(others); [ -n "$o" ]; do echo "GPU $G에 다른 사람 작업 — 띄우지 않고 기다림 ($1, $(date +%m-%d\ %H:%M)): $(echo $o | tr '\n' ';')"; sleep 300; done; }
+others() { others_on_gpu; }; wait_free() { wait_gpu_free "$@"; }   # common.sh (세트마다도 부름: infer_one · glb_one · run_yaw_v2 · run_branch)
 
 # ---- 기준 번들: 5090 fair_eval과 같은 파일인지 지문으로 확인한 뒤 링크 (계산 코드는 안 고침)
 fp() { find -L $1 -type f -exec md5sum {} + | awk '{print $1}' | sort | md5sum | cut -c1-12; }
@@ -69,6 +67,7 @@ infer_one() {   # 모델 조건 → 토큰 · components.npz, 범주 정확도 C
   local m=$1 c=$2 d=$(setdir $1 $2) k=$(need $2) CK=$P/$1/model_final.pt L=$W/logs/p2_infer_${1}_$2.log
   [ -f $d/components.npz ] && [ $(ls $d/tokens/*.npy 2>/dev/null | wc -l) -ge $k ] && return 0
   [ -f $CK ] || { echo "체크포인트 없음 $CK — 건너뜀 p2_${m}_$c"; return 1; }
+  wait_free "추론 p2_${m}_$c"
   local IP="$PY $PR/infer_prism.py --repo $W/MinD-3D --data_root $DR --ckpt $CK --out $P/infer/$m"
   case $c in
     s0[0-9]) $IP --subs sub-00${c#s} > $L 2>&1;;
@@ -84,7 +83,7 @@ infer_one() {   # 모델 조건 → 토큰 · components.npz, 범주 정확도 C
 trel() { (cd $MG && source $MG/mg_guard.sh >/dev/null && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 gcnt() { ls $1/*/*.glb 2>/dev/null | wc -l; }
 glb_one() { local m=$1 c=$2 d=$(setdir $1 $2) k=$(need $2) t0=$(date +%s)
-  [ -f $d/components.npz ] || return 1
+  [ -f $d/components.npz ] || return 1; [ $(gcnt $d/glb_text) -ge $k ] || wait_free "GLB p2_${m}_$c"
   [ -f $d/prompt_text.json ] || $PY $PR/text_prompts.py --comp $d/components.npz --out $d/prompt_text.json > /dev/null
   [ $(gcnt $d/glb_text) -ge $k ] || trel gen --pred $d/tokens --slat_text $d/prompt_text.json --text_model $TM --out $d/glb_text 2>&1 | grep -aE "GEN_DONE|Error|없음"
   echo "GLB|p2_${m}_$c|$(gcnt $d/glb_text)/$k개|$(( $(date +%s) - t0 ))s|$(date +%H:%M:%S)"; }
@@ -95,6 +94,7 @@ echo "=== P-2 시작 $(date '+%m-%d %H:%M') | STAGE=$STAGE | 세트 $(echo $ALL 
 for s in sub-0001 sub-0002 sub-0003 sub-0004 sub-0005 sub-0006 sub-0007 sub-0008 sub-0009 sub-0011; do echo -n "$s $(find -L $DR/$s/npy_data -name '*.npy' | wc -l) · "; done; echo
 for s in $ALL; do [ "$(setdir ${s%%:*} ${s#*:})" = BAD ] && { echo "모르는 조건 $s"; exit 1; }; done
 [ -f $RP ] || { echo "영역 사전값 없음 $RP"; exit 1; }
+for f in $PR/infer_prism.py $PR/align_infer.py $PR/text_prompts.py $PR/trellis_tools.py $SD/run_branch.sh $SD/run_yaw_v2.sh; do [ -f $f ] || { echo "코드 없음 $f (PR=$PR SD=$SD) — 멈춤"; exit 1; }; done; echo "코드 위치 PR=$PR"
 REF=1; ref_ok || REF=0
 o=$(others); echo "GPU $G 다른 사람 작업: ${o:-없음}"
 [ $STAGE = check ] && exit 0
