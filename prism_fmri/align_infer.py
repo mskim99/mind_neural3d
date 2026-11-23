@@ -35,7 +35,7 @@ if a.rw_common:
     print('[rw_common] 영역 가중 피험자별 조정 0 → 공통 가중만', flush=True)
 lst = lambda s: [l.strip() for l in open(os.path.join(a.data_root, 'annotations', f'core_{s}_list.txt')) if l.strip()]
 TR, TE = lst('train'), lst('test'); TRP = [TR[i] for i in torch.randperm(len(TR), generator=torch.Generator().manual_seed(0)).tolist()]
-lab = lambda keys: np.array([SYN.index(k.split('/')[0]) for k in keys]); SAVE = {s for s in a.save.split(',') if s}; GRP = lambda s: 'a' if s[-1] in '1678' else 'b'
+lab = lambda keys: np.array([SYN.index(k.split('/')[0]) for k in keys]); SAVE = {s for s in a.save.split(',') if s}; GRP = lambda s: 'a' if s[-1] in '14678' else 'b'   # 제시 순서 묶음 {1,4,6,7,8} · {2,3,5} (11-23: 4번이 빠져 있던 것 고침. 9번 등 그 밖은 확인 안 됨)
 os.makedirs(a.out, exist_ok=True)
 
 
