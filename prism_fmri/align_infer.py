@@ -25,6 +25,7 @@ p.add_argument('--lams', default='0.01,0.03,0.1,0.3,1,3,10'); p.add_argument('--
 p.add_argument('--rw_common', type=int, default=0, choices=[0, 1])   # 11-21 P-2: 영역 가중 피험자별 조정 d를 0으로 (새 피험자는 공통 가중만)
 p.add_argument('--save_tok', type=int, default=1, choices=[0, 1])    # 11-23: 0이면 components.npz만 (조건 토큰 저장 안 함)
 p.add_argument('--tgt_pool', type=int, default=0, choices=[0, 1]); p.add_argument('--pool_lam', type=float, default=0.1)   # 11-23: 목표 = A + (다른 학습 피험자를 A로 옮긴 값)의 평균 — 2겹 밖 예측, 새 피험자 데이터는 안 씀
+p.add_argument('--cv', default='')   # 11-23: train을 안 본 새 피험자(AP 9번)용. "K,…" — test 물체를 K겹으로 나눠, 한 겹을 뺀 나머지 물체 짝으로 변환을 맞추고 뺀 겹에 적용 (모든 test 물체가 자기를 안 쓴 변환으로 옮겨짐)
 a = p.parse_args(); assert a.fmap == 'full' or a.space == ('input' if a.fmap == 'region' else 'feat')
 dev = 'cuda'; t0 = time.time(); ck = torch.load(a.ckpt, map_location='cpu'); SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8)); T = len(FRAMES)
 model = build_from_ckpt(ck, a.repo).cuda().eval(); ENC = model.encode_frames; model.encode_frames = lambda f, s: f     # 모델에는 ViT 토큰을 바로 넣음
@@ -111,6 +112,36 @@ class Map:                                                                  # B 
 
 def fmean(x): return sum(x[i:i + 64].float().sum(0, keepdim=True) for i in range(0, len(x), 64)) / len(x)                       # [1, T, F] (64개씩)
 def rcorr(A, B): A = A - A.mean(-1, keepdim=True); B = B - B.mean(-1, keepdim=True); return float((F.normalize(A, dim=-1) * F.normalize(B, dim=-1)).sum(-1).mean())
+def pick_fit(xb, xa, keys, si):                                             # 짝 [N, T, F] → 앞 80 %로 맞추고 뒤 20 %에서 λ · 배율을 고른 뒤 전부로 다시 맞춘 사상
+    N = len(xb); nf = max(int(N * 0.8), 1); hk = keys[nf:]; best = None; mua, mub = fmean(xa[:nf]), fmean(xb[:nf])
+    for lam in LAMS:
+        m = Map(xb[:nf], xa[:nf], mub, mua, lam); ph = torch.cat([m.dev_(xb[i:i + 16]) for i in range(nf, N, 16)]); ah = xa[nf:N].float() - mua
+        g = float(ah.pow(2).mean().sqrt() / ph.pow(2).mean().sqrt().clamp_min(1e-8)); del ph, ah
+        for tag, gg in (('g1', 1.0), ('gm', g)):
+            m.g = gg; h = run(lambda i, j: m(xb[nf + i:nf + j]), si, hk)
+            if best is None or h > best[0]: best = (h, lam, tag, gg)
+        del m; torch.cuda.empty_cache()
+    h, lam, tag, gg = best; m = Map(xb, xa, fmean(xb), fmean(xa), lam); m.g = gg; return m, {'lam': lam, 'gain': tag, 'hold_acc': round(h, 4)}
+
+
+def cv_run(A, si):
+    FAte = feat(A, TE, si); own = run(lambda i, j: FAte[i:j], si, TE); print(f'[{A}] 자기 test 범주 정확도 {own:.3f} | {time.time() - t0:.0f}s', flush=True)
+    for B in a.fmri_subs.split(','):
+        FBte = feat(B, TE, si); r = {'own_A': round(own, 4), 'same_order': GRP(A) == GRP(B), 'n': {}}
+        od = f'{a.out}/n0/{B}_as{A[-2:]}_keep' if '0' in SAVE else None
+        acc = run(lambda i, j: FBte[i:j], si, TE, od); r['n']['0'] = {'test': round(acc, 4)}; print(f'[{A} ← {B}] 짝 0 (그대로) 범주 {acc:.3f}', flush=True)
+        for K in [int(v) for v in a.cv.split(',')]:
+            pm = torch.randperm(len(TE), generator=torch.Generator().manual_seed(0)); Z = torch.zeros_like(FBte); info = []
+            for k in range(K):
+                te_ix = pm[k::K]; fi = torch.cat([pm[q::K] for q in range(K) if q != k]); fd = fi.to(dev)
+                m, inf = pick_fit(FBte[fd], FAte[fd], [TE[i] for i in fi.tolist()], si); info.append(inf)
+                Z[te_ix.to(dev)] = m(FBte[te_ix.to(dev)]).half(); del m; torch.cuda.empty_cache()
+            n = len(TE) - len(pm[0::K]); od = f'{a.out}/n{n}/{B}_as{A[-2:]}_keep' if str(K) in SAVE else None
+            acc = run(lambda i, j: Z[i:j], si, TE, od); r['n'][str(n)] = {'test': round(acc, 4), 'folds': K, 'fit': info}
+            print(f'[{A} ← {B}] {K}겹 (짝 약 {n}개) | test 범주 {acc:.3f} | {time.time() - t0:.0f}s', flush=True); del Z
+        R['pairs'][f'{A}<-{B}'] = r; json.dump(R, open(f'{a.out}/align.json', 'w'), ensure_ascii=False, indent=1); del FBte; torch.cuda.empty_cache()
+
+
 NSL = [int(v) for v in a.ns.split(',')]; LAMS = [float(v) for v in a.lams.split(',')]; NM = max(NSL)
 @torch.no_grad()
 def pool_target(A, FA):                                                     # [NM, T, F] fp16: A와, 다른 학습 피험자를 A로 옮긴 값의 평균
@@ -128,7 +159,9 @@ def pool_target(A, FA):                                                     # [N
 
 R = {'ckpt': a.ckpt, 'space': a.space, 'fmap': a.fmap, 'fit': a.fit, 'tgt_pool': a.tgt_pool, 'chance': round(1 / len(SYN), 4), 'pairs': {}}
 for A in a.subs.split(','):
-    si = SUBS.index(A); FA = feat(A, TRP[:NM], si); FAte = feat(A, TE, si)
+    si = SUBS.index(A)
+    if a.cv: cv_run(A, si); continue
+    FA = feat(A, TRP[:NM], si); FAte = feat(A, TE, si)
     own = run(lambda i, j: FAte[i:j], si, TE); print(f'[{A}] 자기 test 범주 정확도 {own:.3f} | {time.time() - t0:.0f}s', flush=True); del FAte
     if a.tgt_pool: FA = pool_target(A, FA); torch.cuda.empty_cache()
     for B in a.fmri_subs.split(','):
@@ -160,7 +193,7 @@ for A in a.subs.split(','):
         R['pairs'][f'{A}<-{B}'] = r; json.dump(R, open(f'{a.out}/align.json', 'w'), ensure_ascii=False, indent=1); del FB, FBte; torch.cuda.empty_cache()
     del FA; torch.cuda.empty_cache()
 S = {}
-for N in NSL:
+for N in ([int(k) for k in next(iter(R['pairs'].values()))['n']] if a.cv else NSL):
     for nm, sel in (('all', lambda r: True), ('same_order', lambda r: r['same_order']), ('diff_order', lambda r: not r['same_order'])):
         v = [r['n'][str(N)]['test'] for r in R['pairs'].values() if sel(r)]
         if v: S.setdefault(nm, {})[str(N)] = round(float(np.mean(v)), 4)
