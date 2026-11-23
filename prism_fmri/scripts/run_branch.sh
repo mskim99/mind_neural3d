@@ -64,9 +64,9 @@ one() {
   local n=$1 M=$O/$1 L=$W/logs/${LP}_$1.log; [ $TEST = 1 ] && L=$W/logs/${LP}_test_$1.log
   [ -f $W/SKIP_$n ] && { echo "SKIP_$n 있음 — 건너뜀 (다른 서버 몫)"; return; }   # 11-19: run 하나만 kill 없이 건너뛰기
   [ -f $M/model_final.pt ] && { echo "이미 있음 $n"; return; }
-  local S=$SUBS; case $n in *_8sub) S=$SUBS8;; esac   # 11-21 P-2: 8명 run만 피험자 목록을 따로
+  local S=$SUBS B=14; case $n in *_8sub) S=$SUBS8; B=16;; esac   # 11-21 P-2: 8명 run만 피험자 목록을 따로 · 11-23 사용자: bs 16 (피험자당 2, 14는 8명으로 안 나뉨)
   echo "=== 학습 시작 $n ($(flags $n)) 피험자 $S $(date +%H:%M:%S)"
-  $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $S --bs 14 --max_step $STEPS \
+  $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $S --bs $B --max_step $STEPS \
     --workers ${WK:-4} --polite ${POLITE:-65} --per_subject 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
     --seed 1 --holdout $HOLD ${SAVE:+--save_steps $SAVE} $(flags $n) $X --resume --out_dir $M > $L 2>&1
   echo "=== 학습 끝 $n $(date +%H:%M:%S) | $(grep -E '^\[hold\]' $L | tail -1 | cut -c1-200)"

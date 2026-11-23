@@ -155,6 +155,6 @@ F=""; for s in $ALL; do m=${s%%:*} c=${s#*:}; n=p2_${m}_$c; R=$FER; [ "$(evmode 
   d=$(setdir $m $c); for f in components.npz prompt_text.json; do [ -f $d/$f ] && F="$F ${d#$W/}/$f"; done
 done
 for m in $M1 $M2 $M3; do for f in train_log.csv region_w; do [ -e $P/$m/$f ] && F="$F prism_p2/$m/$f"; done; done
-F="$F $(cd $W && ls -d prism_p2/align/*/*/align.json logs/p2.log logs/p2_yaw.log logs/p2_infer_*.log logs/prism_p2_*.log 2>/dev/null | tr '\n' ' ')"
+F="$F $(cd $W && ls -d prism_p2/align/*/*/align.json logs/p2*.log logs/p2_infer_*.log logs/prism_p2_*.log 2>/dev/null | tr '\n' ' ')"
 (cd $W && tar cf $P/p2_pack.tar $F) && echo "PACK $P/p2_pack.tar $(tar tf $P/p2_pack.tar | wc -l)개 · $(du -h $P/p2_pack.tar | cut -f1)"
 echo "=== P2_DONE $(date +%H:%M:%S)"
