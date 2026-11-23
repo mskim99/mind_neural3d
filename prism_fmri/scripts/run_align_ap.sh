@@ -10,6 +10,8 @@ AL="$PY $PR/align_infer.py --repo $W/MinD-3D --data_root $DR --ckpt $CK --fmri_s
 if [ ! -f $O/ap_cls/DONE ]; then wait_gpu_free ap_cls; echo "=== ap_cls $(date +%H:%M:%S)"; $AL --subs $S7 --save 0,2,4,13 --save_tok 0 --out $O/ap_cls && touch $O/ap_cls/DONE; fi
 $PY $PR/align_ens.py $O | grep -E "ap_cls|ENS"
 if [ ! -f $O/ap_3d/DONE ]; then wait_gpu_free ap_3d; echo "=== ap_3d $(date +%H:%M:%S)"; $AL --subs sub-0001 --save 0,4,13 --save_tok 1 --out $O/ap_3d && touch $O/ap_3d/DONE; fi
-wait_gpu_free dir_eval
-GPU=0 SETS="ap9_n0_as01=$O/ap_3d/n0/${B}_as01_keep ap9_n78_as01=$O/ap_3d/n78/${B}_as01_keep ap9_n96_as01=$O/ap_3d/n96/${B}_as01_keep" bash $PR/scripts/run_dir_eval.sh
+for n in 0 78 96; do   # 한 세트씩 (생성과 평가가 GPU에서 겹치지 않게)
+  wait_gpu_free dir_eval_n$n
+  GPU=0 SETS="ap9_n${n}_as01=$O/ap_3d/n$n/${B}_as01_keep" bash $PR/scripts/run_dir_eval.sh
+done
 echo "=== ALIGN_AP_DONE $(date +%H:%M:%S)"
