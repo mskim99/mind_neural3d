@@ -20,10 +20,12 @@ from prism import build_from_ckpt
 p = argparse.ArgumentParser()
 p.add_argument('--repo', required=True); p.add_argument('--data_root', required=True); p.add_argument('--ckpt', required=True); p.add_argument('--out', required=True)
 p.add_argument('--subs', required=True); p.add_argument('--fmri_subs', required=True); p.add_argument('--ns', default='0,50,100,300,600,1300')
-p.add_argument('--space', default='feat', choices=['input', 'feat']); p.add_argument('--fmap', default='full', choices=['full', 'pos', 'stat']); p.add_argument('--fit', default='mean', choices=['frame', 'mean'])
+p.add_argument('--space', default='feat', choices=['input', 'feat']); p.add_argument('--fmap', default='full', choices=['full', 'pos', 'stat', 'region']); p.add_argument('--fit', default='mean', choices=['frame', 'mean'])
 p.add_argument('--lams', default='0.01,0.03,0.1,0.3,1,3,10'); p.add_argument('--save', default=''); p.add_argument('--bs', type=int, default=16)
 p.add_argument('--rw_common', type=int, default=0, choices=[0, 1])   # 11-21 P-2: 영역 가중 피험자별 조정 d를 0으로 (새 피험자는 공통 가중만)
-a = p.parse_args(); assert a.fmap == 'full' or a.space == 'feat'
+p.add_argument('--save_tok', type=int, default=1, choices=[0, 1])    # 11-23: 0이면 components.npz만 (조건 토큰 저장 안 함)
+p.add_argument('--tgt_pool', type=int, default=0, choices=[0, 1]); p.add_argument('--pool_lam', type=float, default=0.1)   # 11-23: 목표 = A + (다른 학습 피험자를 A로 옮긴 값)의 평균 — 2겹 밖 예측, 새 피험자 데이터는 안 씀
+a = p.parse_args(); assert a.fmap == 'full' or a.space == ('input' if a.fmap == 'region' else 'feat')
 dev = 'cuda'; t0 = time.time(); ck = torch.load(a.ckpt, map_location='cpu'); SUBS = ck['subs']; SYN = ck['classes']; FRAMES = list(range(2, 8)); T = len(FRAMES)
 model = build_from_ckpt(ck, a.repo).cuda().eval(); ENC = model.encode_frames; model.encode_frames = lambda f, s: f     # 모델에는 ViT 토큰을 바로 넣음
 if a.rw_common:
@@ -41,6 +43,7 @@ def norm_in(x):
     sd = (((x - mu) ** 2 * m).sum((2, 3), keepdim=True) / n).sqrt() + 1e-6; return (x - mu) / sd * m
 def raw(s, keys): return torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, s, 'npy_data', k + '.npy')).astype(np.float32)[FRAMES] for k in keys]))
 M = (raw(a.subs.split(',')[0], TE[:4]) != 0).any(0).any(0).flatten().to(dev); P = int(M.sum())
+if a.fmap == 'region': LABM = torch.as_tensor(np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'mmp_256_regions.npy'))).long().flatten().to(dev)[M]; print(f'[region] 픽셀 {P} · 영역 {len(LABM.unique())} (라벨 0 = 영역 밖 한 묶음)', flush=True)
 
 
 @torch.no_grad()
@@ -62,13 +65,13 @@ def to_tok(z, si):                                                          # �
 @torch.no_grad()
 def run(zf, si, keys, od=None):                                             # zf(i0, i1) → [n, T, F] 옮긴 값. 범주 정확도 (+ 저장)
     y = lab(keys); pr, comp = [], {k: [] for k in ('sem', 'var', 'perc', 'cls_score', 'clip', 'vt')}
-    if od: os.makedirs(f'{od}/tokens', exist_ok=True)
+    if od: os.makedirs(f'{od}/tokens' if a.save_tok else od, exist_ok=True)
     for i in range(0, len(keys), a.bs):
         tok = to_tok(zf(i, min(i + a.bs, len(keys))), si); fi = torch.tensor(FRAMES, device=dev).expand(len(tok), -1)
         with torch.autocast('cuda', dtype=torch.bfloat16): out = model(tok, fi, torch.full((len(tok),), si, dtype=torch.long, device=dev))
         sc = (out['sem_clip'].float() @ model.prototypes.t()).cpu(); pr.append(sc.argmax(-1))
         if od:
-            for j, k in enumerate(keys[i:i + a.bs]): np.save(f'{od}/tokens/{k.split("/")[1]}.npy', out['cond_tokens'][j].float().half().cpu().numpy())
+            for j, k in enumerate(keys[i:i + a.bs] if a.save_tok else []): np.save(f'{od}/tokens/{k.split("/")[1]}.npy', out['cond_tokens'][j].float().half().cpu().numpy())
             comp['sem'].append(out['sem_vec'].float().cpu()); comp['var'].append(out['var_vec'].float().cpu()); comp['perc'].append(out['perc_vec'].float().cpu()); comp['cls_score'].append(sc); comp['clip'].append(out['sem_clip'].float().cpu())
             if 'vt' in out: comp['vt'].append(out['vt'].float().mean(1).cpu())
     pr = torch.cat(pr).numpy()
@@ -84,6 +87,10 @@ class Map:                                                                  # B 
             if a.fit == 'frame': db, da = (xb.float() - mub).flatten(0, 1), (xa.float() - mua).flatten(0, 1)
             else: db, da = (torch.cat([(x[i:i + 64].float() - mu).mean(1) for i in range(0, len(x), 64)]) for x, mu in ((xb, mub), (xa, mua)))   # 64개씩 (fp16 → fp32 사본을 한꺼번에 안 만듦)
             s.db = db; s.Wd = ksolve(db @ db.t(), da, lam)
+        elif a.fmap == 'region':                                             # 11-23: 뇌 영역마다 따로 (영역 r의 픽셀 → 같은 영역 r의 픽셀). 표본 = 물체의 프레임 평균
+            db, da = (torch.cat([(x[i:i + 64].float() - mu).mean(1) for i in range(0, len(x), 64)]) for x, mu in ((xb, mub), (xa, mua))); s.parts = []
+            for r in LABM.unique().tolist():
+                ix = (LABM == r).nonzero(as_tuple=True)[0]; d = db[:, ix]; s.parts.append((ix, d, ksolve(d @ d.t(), da[:, ix], lam)))
         else:
             D = xb.shape[-1] // 257; G = torch.zeros(257, D, D, device=dev); C = torch.zeros(257, D, D, device=dev)
             for i in range(0, len(xb), 64):
@@ -94,6 +101,10 @@ class Map:                                                                  # B 
     def dev_(s, x):                                                         # [n, T, F] → 옮긴 변화량 [n, T, F]
         d = x.float() - s.mub
         if a.fmap == 'full': return (d @ s.db.t()) @ s.Wd
+        if a.fmap == 'region':
+            o = torch.zeros_like(d)
+            for ix, db, Wd in s.parts: o[..., ix] = (d[..., ix] @ db.t()) @ Wd
+            return o
         return torch.einsum('ntpd,pde->ntpe', d.view(*d.shape[:2], 257, s.D), s.W).flatten(2)
     def __call__(s, x): return s.mua + s.g * s.dev_(x)
 
@@ -101,10 +112,25 @@ class Map:                                                                  # B 
 def fmean(x): return sum(x[i:i + 64].float().sum(0, keepdim=True) for i in range(0, len(x), 64)) / len(x)                       # [1, T, F] (64개씩)
 def rcorr(A, B): A = A - A.mean(-1, keepdim=True); B = B - B.mean(-1, keepdim=True); return float((F.normalize(A, dim=-1) * F.normalize(B, dim=-1)).sum(-1).mean())
 NSL = [int(v) for v in a.ns.split(',')]; LAMS = [float(v) for v in a.lams.split(',')]; NM = max(NSL)
-R = {'ckpt': a.ckpt, 'space': a.space, 'fmap': a.fmap, 'fit': a.fit, 'chance': round(1 / len(SYN), 4), 'pairs': {}}
+@torch.no_grad()
+def pool_target(A, FA):                                                     # [NM, T, F] fp16: A와, 다른 학습 피험자를 A로 옮긴 값의 평균
+    oth = [s for s in SUBS if s != A and s not in a.fmri_subs.split(',')]; acc = FA.clone(); h = NM // 2
+    for j in oth:
+        Fj = feat(j, TRP[:NM], SUBS.index(j))
+        for f0, f1, a0, a1 in ((h, NM, 0, h), (0, h, h, NM)):                 # 절반으로 맞추고 나머지 절반에 적용
+            m = Map(Fj[f0:f1], FA[f0:f1], fmean(Fj[f0:f1]), fmean(FA[f0:f1]), a.pool_lam)
+            for i in range(a0, a1, 32): e = min(i + 32, a1); acc[i:e] = (acc[i:e].float() + m(Fj[i:e])).half()
+            del m; torch.cuda.empty_cache()
+        del Fj; torch.cuda.empty_cache()
+    for i in range(0, NM, 64): acc[i:i + 64] = (acc[i:i + 64].float() / (len(oth) + 1)).half()
+    print(f'[{A}] 목표 평균 (다른 학습 피험자 {len(oth)}명을 옮겨 더함) | {time.time() - t0:.0f}s', flush=True); return acc
+
+
+R = {'ckpt': a.ckpt, 'space': a.space, 'fmap': a.fmap, 'fit': a.fit, 'tgt_pool': a.tgt_pool, 'chance': round(1 / len(SYN), 4), 'pairs': {}}
 for A in a.subs.split(','):
     si = SUBS.index(A); FA = feat(A, TRP[:NM], si); FAte = feat(A, TE, si)
     own = run(lambda i, j: FAte[i:j], si, TE); print(f'[{A}] 자기 test 범주 정확도 {own:.3f} | {time.time() - t0:.0f}s', flush=True); del FAte
+    if a.tgt_pool: FA = pool_target(A, FA); torch.cuda.empty_cache()
     for B in a.fmri_subs.split(','):
         if B == A: continue
         FB = feat(B, TRP[:NM], si); FBte = feat(B, TE, si); r = {'own_A': round(own, 4), 'same_order': GRP(A) == GRP(B), 'n': {}}
