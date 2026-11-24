@@ -162,7 +162,7 @@ for A in a.subs.split(','):
     si = SUBS.index(A)
     if a.cv: cv_run(A, si); continue
     FA = feat(A, TRP[:NM], si); FAte = feat(A, TE, si)
-    own = run(lambda i, j: FAte[i:j], si, TE); print(f'[{A}] 자기 test 범주 정확도 {own:.3f} | {time.time() - t0:.0f}s', flush=True); del FAte
+    own = run(lambda i, j: FAte[i:j], si, TE, f'{a.out}/own/{A}_as{A[-2:]}_keep' if 'own' in SAVE else None); print(f'[{A}] 자기 test 범주 정확도 {own:.3f} | {time.time() - t0:.0f}s', flush=True); del FAte   # 11-24 P-3: --save에 own을 넣으면 자기 갈래 점수도 저장
     if a.tgt_pool: FA = pool_target(A, FA); torch.cuda.empty_cache()
     for B in a.fmri_subs.split(','):
         if B == A: continue
