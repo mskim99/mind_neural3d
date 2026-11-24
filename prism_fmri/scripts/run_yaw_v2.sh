@@ -29,7 +29,9 @@ one() {   # 이름 · GLB 폴더 · 토큰 폴더 · full|shape · v2|apac
   local n=$1 d=$2 tk=$3 mode=$4 rt=$5 O=$Y/$1 R=$FE2 need=104
   [ "$rt" = apac ] && { R=$FEA; need=220; }
   cnt() { ls $d/*/*.glb 2>/dev/null | wc -l; }
-  if [ $(cnt) -lt $need ] && [ "${WAIT:-0}" = 1 ]; then echo "기다림 $n ($(cnt)/$need) $(date +%H:%M:%S)"; until [ $(cnt) -ge $need ]; do sleep 60; done; sleep 60; fi
+  nf=$(dirname $d)/NEED   # 11-24 V-4: GLB를 다 만든 쪽이 실제 개수를 적어 두면(빈 형상 · 정답 없는 물체로 104보다 적을 때) 그 개수까지만 기다림
+  if [ $(cnt) -lt $need ] && [ "${WAIT:-0}" = 1 ]; then echo "기다림 $n ($(cnt)/$need) $(date +%H:%M:%S)"; until [ $(cnt) -ge $need ] || { [ -f $nf ] && [ $(cnt) -ge $(cat $nf) ]; }; do sleep 60; done; sleep 60; fi
+  [ -f $nf ] && [ $(cat $nf) -lt $need ] && { echo "개수 $n: $(cat $nf)/$need (GLB 쪽이 적어 둔 실제 개수)"; need=$(cat $nf); }
   [ $(cnt) -ge $need ] && [ $(ls $tk/*.npy 2>/dev/null | wc -l) -ge $need ] || { echo "건너뜀 $n (GLB $(cnt) · 토큰 $(ls $tk/*.npy 2>/dev/null | wc -l) / $need)"; return; }
   [ -f $R/$FE_RUN ] || { echo "건너뜀 $n (번들 없음 $R/$FE_RUN)"; return; }
   mkdir -p $O

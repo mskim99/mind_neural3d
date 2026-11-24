@@ -18,6 +18,7 @@ p.add_argument('--repo', required=True); p.add_argument('--data_root', required=
 p.add_argument('--out', required=True); p.add_argument('--subs', default=''); p.add_argument('--split', default='test')
 p.add_argument('--perceptive', default='keep', choices=['keep', 'mean']); p.add_argument('--bs', type=int, default=8)
 p.add_argument('--fold', default=''); p.add_argument('--tok_pool', type=int, default=0); p.add_argument('--save_tokens', type=int, default=1)
+p.add_argument('--save_var', type=int, default=0)   # 11-24 V-4: 1이면 디코더가 받는 Variational 특징 var_feat [T + patch, 768]을 <od>/var/<uid>.npy (fp16)
 p.add_argument('--names', default='')   # uid 목록 파일: 이 물체만 (fold 거른 뒤)
 p.add_argument('--fmri_sub', default='')   # AP · APAC (MinD-3D++ Tab.3, "model trained on Subject 1"): 학습에 없던 피험자 fMRI(예: sub-0009)를 --subs 하나(예: sub-0001)의 갈래로 추론
 p.add_argument('--list', default='')       # 물체 목록 파일 (기본 annotations/core_<split>_list.txt, APAC는 annotations/apac_list.txt)
@@ -69,6 +70,9 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
         if a.tok_pool: comp['tok_pool'].append(pool(out['cond_tokens'].float()).half().cpu())
         for j, k in enumerate(ks if a.save_tokens else []):
             np.save(f'{od}/tokens/{k.split("/")[1]}.npy', out['cond_tokens'][j].float().half().cpu().numpy())
+        if a.save_var:
+            os.makedirs(f'{od}/var', exist_ok=True)
+            for j, k in enumerate(ks): np.save(f'{od}/var/{k.split("/")[1]}.npy', out['var_feat'][j].float().half().cpu().numpy())
         comp['name'] += ks; comp['cls'] += [SYN.index(k.split('/')[0]) if k.split('/')[0] in SYN else -1 for k in ks]   # APAC: 학습에 없는 범주 = −1
         comp['sem'].append(out['sem_vec'].float().cpu()); comp['var'].append(out['var_vec'].float().cpu()); comp['perc'].append(out['perc_vec'].float().cpu())
         sc = (out['sem_clip'].float() @ model.prototypes.t()).cpu(); comp['cls_score'].append(sc)   # CLIP 텍스트 프로토타입과 cos
