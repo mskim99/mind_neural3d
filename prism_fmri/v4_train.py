@@ -14,6 +14,7 @@
 #         이후 외형은 trellis_tools.py gen --ss_z <out> --slat_text (지금 Ours와 같은 텍스트판)
 # 사용: python v4_train.py encz --tgt $TGT --out $V/zgt
 #       python v4_train.py train --cond tok|tokv --data <infer_train/sub-0001_keep,infer_train/sub-0006_keep> --z $V/zgt --out $V/ft/A
+#       (V-4b) --ckpt를 빼면 미세조정 없는 원래 가중치로 같은 경로 · 같은 sampler
 #       python v4_train.py genz --cond tok|tokv --ckpt $V/ft/A/ft_4000.pt --data <infer_test/sub-0001_keep> --out $V/gen/A_s01/z
 import os, sys, glob, json, time, argparse
 import numpy as np
@@ -122,9 +123,11 @@ if a.mode == 'train':
 
 if a.mode == 'genz':
     tokv = a.cond == 'tokv'; m = build(tokv).eval()
-    sd = torch.load(a.ckpt, map_location='cpu'); miss = [n_ for n_, q in m.named_parameters() if q.requires_grad and n_ not in sd]
-    assert not miss, f'체크포인트에 없는 파라미터 {miss[:3]}'
-    m.load_state_dict(sd, strict=False)
+    if a.ckpt:   # --ckpt 없으면 원래 TRELLIS 형상 단계 그대로 (V-4b 0 step 대조행, --cond tok만)
+        sd = torch.load(a.ckpt, map_location='cpu'); miss = [n_ for n_, q in m.named_parameters() if q.requires_grad and n_ not in sd]
+        assert not miss, f'체크포인트에 없는 파라미터 {miss[:3]}'
+        m.load_state_dict(sd, strict=False)
+    else: assert not tokv, '0 step은 --cond tok만 (V 어댑터는 학습 전 문이 0이라 tok와 같음)'
     from trellis.pipelines import samplers
     SJ = json.load(open(snaps[-1]))['args']['sparse_structure_sampler']; smp = getattr(samplers, SJ['name'])(**SJ['args']); sp = SJ['params']
     U = sorted(os.path.basename(f)[:-4] for f in glob.glob(f'{a.data}/tokens/*.npy'))[: a.limit or None]; n = 0
