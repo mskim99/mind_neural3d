@@ -40,6 +40,8 @@ p.add_argument('--pool', type=int, default=0)   # dino: 1이면 토큰 [1374, 10
 p.add_argument('--rembg', type=int, default=0)   # dino: 1이면 흰 배경 문턱값 대신 TRELLIS preprocess_image의 rembg로 배경 제거 (unCLIP 생성 이미지용, 11-09)
 p.add_argument('--ss_z', default='')   # gen (11-10, B 3단계): 1단계(형상)를 건너뛰고 이 폴더의 형상 잠재 z [8,16³] → 디코더 > 0 → coords. 외형은 --slat_text 필수, 각 z 옆 흰 배경 스냅샷 png도 저장
 p.add_argument('--ss_noise', default='cuda', choices=['cuda', 'cpu'])   # ss (11-12, 판정 1c): cpu면 TRELLIS sample_sparse_structure처럼 CPU에서 noise를 뽑아 옮김 → bs 1 · 같은 seed면 gen의 1단계 z와 같음
+p.add_argument('--z32', type=int, default=0)   # ss: 1이면 z를 fp16으로 줄이지 않고 그대로 저장 (V-4c, --pred 경로와 같은 점유를 얻으려고)
+p.add_argument('--ss_rng', type=int, default=0)   # gen --ss_z (11-25, V-4c): 1이면 seed 뒤에 형상 단계가 쓰는 CPU noise [1, 8, 16³]를 한 번 뽑아 버림 → 외형 단계 noise가 --pred 경로와 같은 무작위 수에서 시작
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
 os.environ.setdefault('SPCONV_ALGO', 'native')
@@ -183,7 +185,7 @@ elif a.mode in ('ss', 'ssdec'):
                 z = X
             occ = (dec(z) > 0)[:, 0].cpu().numpy()
         for j, n in enumerate(nb):
-            if a.mode == 'ss': np.save(f'{a.out}/z/{n}.npy', z[j].half().cpu().numpy())
+            if a.mode == 'ss': np.save(f'{a.out}/z/{n}.npy', (z[j].float() if a.z32 else z[j].half()).cpu().numpy())
             np.save(f'{a.out}/occ/{n}.npy', np.packbits(occ[j].reshape(-1)))
         if (b // a.bs) % 50 == 0: print(f'[{a.mode} {b + len(nb)}/{len(names)}] 점유 평균 {occ.reshape(len(nb), -1).sum(1).mean():.0f} {time.time() - t0:.0f}s', flush=True)
     print('SS_DONE', flush=True)
@@ -230,6 +232,8 @@ else:
             (cond, cond2), z = load_conds(name), None
         if cond2 is None: print('외형 토큰 없음', name, flush=True); continue
         torch.manual_seed(a.seed)
+        if a.ss_z and a.ss_rng:   # TRELLIS sample_sparse_structure: torch.randn(n, C, R, R, R) (CPU) → .to(device)와 같은 소비
+            _fm = pipe.models['sparse_structure_flow_model']; torch.randn(1, _fm.in_channels, _fm.resolution, _fm.resolution, _fm.resolution)
         with torch.no_grad():
             outs = generate(cond, cond2, z)
         if outs is None: print('빈 형상', name, flush=True); continue
