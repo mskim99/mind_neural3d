@@ -107,11 +107,14 @@ if __name__ == '__main__':
         P = json.load(open(pj)); allp[name] = P
         for k in KEYS:
             w = P.get(k.split('/')[-1]); w and CATWORD.setdefault(k.split('/')[0], []).append(w)
-    CATWORD = {c: max(set(v), key=v.count) for c, v in CATWORD.items()}   # 범주마다 가장 많이 나온 문장 = 그 범주의 문장
+    NAME = {'02691156': 'airplane', '02828884': 'bench', '02933112': 'cabinet', '02958343': 'car', '03001627': 'chair', '03211117': 'monitor',
+            '03636649': 'lamp', '03691459': 'loudspeaker', '04090263': 'rifle', '04256520': 'sofa', '04379243': 'table', '04401088': 'telephone',
+            '04530566': 'boat'}   # text_prompts.py와 같은 표 — 외형 문장 끝 단어로 예측 범주를 판정
+    CATWORD = {c: NAME[c] for c in CATWORD}
     print('범주 문장', CATWORD, flush=True)
     for name, d, pj in SETS:
         rows = json.load(open(f'{a.out}/perobj_{name}.json')); P = allp[name]
-        CO = {r['uid']: P.get(r['uid']) == CATWORD[r['cat']] for r in rows}
+        CO = {r['uid']: (P.get(r['uid']) or '').split(' ')[-1] == CATWORD[r['cat']] for r in rows}
         out = {'n': len(rows), 'cat_acc': float(np.mean(list(CO.values())))}
         for key, better in (('cd', 'min'), ('iou', 'max')):
             acc, p, ok, kept = ident(rows, key, better); co = np.array([CO[u] for u in kept])
