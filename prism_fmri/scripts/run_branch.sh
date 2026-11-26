@@ -36,6 +36,8 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      base_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # + 1단계 영역별 보정(고정) = Perceptive 개선안
                      base_sharedsv_calib_bound_keep) echo "$EU --mem branch --v_pool 2 --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:?CAL 필요 (크기 묶기 + 보존 항 1단계 calib.pt)}";;   # 11-18 보정 다시: 크기 묶기(bound · renorm) + 보존 항(keep), 설정은 calib.pt에 들어 있음
                      ausvp_sharedsv) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --shared_sv 1 --film 0 --lam_subj 0";;   # 11-18 최종 Ours(ausvp) + S · V 피험자 공통 (FiLM · 피험자 분류 끔)
+                     ausvp_s1) echo "$EU --mem branch --v_pool 2 --sv_enc 0";;   # 11-26 V-7 대조: 최종 Ours(ausvp) 설정 그대로 + 피험자 1번만 학습
+                     ausvp_vtgt_bandenergy_s1) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --view_tgt ${V7T:-$TGT/v7_bandenergy.npz}";;   # 11-26 V-7: ausvp_s1에서 Variational 정답만 범주 뺀 공간 주파수 에너지 3개로 (prep_v7_bandenergy.py)
                      ausvp_8sub) echo "$EU --mem branch --v_pool 2 --sv_enc 0";;   # 11-21 P-2 ㉰: 최종 Ours(ausvp) 설정 그대로 + 4번 포함 8명 학습 (피험자는 SUBS8)
                      ausvp_regionw) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --region_w 1 --region_prior ${RP:-$W/prism_calib/region_prior.npz}";;   # 11-20 (b): 최종 Ours(ausvp) + 공통 영역 가중 (S · V 따로, 공통 + 피험자별 조정, prep_region_prior.py 사전값)
                      ausvp_regionw_noprior) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --region_w 1";;   # 11-20 (b) 대조: 사전값 없이 모든 영역 같은 가중에서 시작 (사전값 효과 따로 보기)
@@ -52,6 +54,7 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      base_vres_sharedsv_calib) echo "$EU --mem branch --v_pool 2 --v_res_basis ${VRB:-$TGT/vres_basis_k32.npz} --shared_sv 1 --film 0 --lam_subj 0 --calib 1 --calib_init ${CAL:-$W/prism_calib/s16/calib.pt}";;   # V 잔차 + Perceptive 개선안 둘 다
                      ausv) echo "$EU --mem branch --sv_enc 0";; auc) echo "$EU --mem branch --v_center 1";;
                      x) echo "$EX --mem branch";; xp) echo "$EX --mem branch --v_pool 2";; xsv) echo "$EX --mem branch --sv_enc 0";; xc) echo "$EX --mem branch --v_center 1";; *) echo BAD;; esac; }
+for n in $RUNS; do case $n in *_vtgt_bandenergy_*) [ -f "${V7T:-$TGT/v7_bandenergy.npz}" ] || { echo "V-7 정답 없음 — prep_v7_bandenergy.py 먼저"; exit 1; };; esac; done   # 11-26
 for n in $RUNS; do case $n in *_regionw) [ -f "${RP:-$W/prism_calib/region_prior.npz}" ] || { echo "영역 사전값 없음 ${RP:-$W/prism_calib/region_prior.npz} — prep_region_prior.py 먼저"; exit 1; };; esac; done   # 11-20
 EX=${EX:-}; for n in $RUNS; do case $n in x|xp|xsv|xc) [ -n "$EX" ] || { echo "x 계열은 EX(바탕 인코더 옵션)가 필요"; exit 1; };; esac; done
 for n in $RUNS; do [ "$(flags $n)" = BAD ] && { echo "모르는 이름 $n"; exit 1; }; done
@@ -64,7 +67,7 @@ one() {
   local n=$1 M=$O/$1 L=$W/logs/${LP}_$1.log; [ $TEST = 1 ] && L=$W/logs/${LP}_test_$1.log
   [ -f $W/SKIP_$n ] && { echo "SKIP_$n 있음 — 건너뜀 (다른 서버 몫)"; return; }   # 11-19: run 하나만 kill 없이 건너뛰기
   [ -f $M/model_final.pt ] && { echo "이미 있음 $n"; return; }
-  local S=$SUBS B=14; case $n in *_8sub) S=$SUBS8; B=16;; esac   # 11-21 P-2: 8명 run만 피험자 목록을 따로 · 11-23 사용자: bs 16 (피험자당 2, 14는 8명으로 안 나뉨)
+  local S=$SUBS B=14; case $n in *_8sub) S=$SUBS8; B=16;; *_s1) S=sub-0001;; esac   # 11-26 V-7: 이름이 _s1로 끝나면 피험자 1번만   # 11-21 P-2: 8명 run만 피험자 목록을 따로 · 11-23 사용자: bs 16 (피험자당 2, 14는 8명으로 안 나뉨)
   echo "=== 학습 시작 $n ($(flags $n)) 피험자 $S $(date +%H:%M:%S)"
   $PY $PR/train_prism.py --repo $W/MinD-3D --data_root $DR --tgt $TGT --subs $S --bs $B --max_step $STEPS \
     --workers ${WK:-4} --polite ${POLITE:-65} --per_subject 1 --arch fig --sem_clip front --var_mode feat --var_heads shape --view_tgt $VT --lam_vadv 0 \
