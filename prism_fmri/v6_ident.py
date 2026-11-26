@@ -14,6 +14,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--fe', default='/home/oem/jhj/fair_eval/fair_eval'); ap.add_argument('--m3', default='/home/oem/jhj/MinD-3D++')
 ap.add_argument('--out', required=True); ap.add_argument('--workers', type=int, default=6); ap.add_argument('--subs', default='01,02,03,05,06,07,08')
 ap.add_argument('--perm', type=int, default=10000)
+ap.add_argument('--sets', default='')   # 11-26 V-7: '이름:평가폴더이름:문장json,…'로 세트를 직접 (주면 --subs의 Ours · noV 대신)
 a = ap.parse_args()
 sys.path.insert(0, f'{a.fe}/scripts'); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(a.out, exist_ok=True)
@@ -21,8 +22,8 @@ KEYS = [l.strip() for l in open(f'{a.fe}/core_test_list.txt') if l.strip()]
 UID = [k.split('/')[-1] for k in KEYS]; CAT = np.array([k.split('/')[0] for k in KEYS]); IDX = {u: i for i, u in enumerate(UID)}
 CANDS = {c: np.where(CAT == c)[0] for c in sorted(set(CAT))}
 print('범주별 test 물체 수', {c: len(v) for c, v in CANDS.items()}, flush=True)
-SETS = []
-for s in a.subs.split(','):
+SETS = [tuple(x.split(':')) for x in a.sets.split(',')] if a.sets else []
+for s in ([] if a.sets else a.subs.split(',')):
     SETS.append((f'Ours_s{s}', f'yaw_fullausvp_s{s}', f'{a.m3}/prism_full/eval_ausvp/text/s{s}/prompt.json'))
     SETS.append((f'noV_s{s}', f'yaw_abl_noV_s{s}', f'{a.m3}/prism_full_abl/eval_noV/text/s{s}/prompt.json'))
 
