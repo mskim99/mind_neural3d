@@ -9,7 +9,7 @@ echo "=== V-6 ③ 단색 정답 렌더 시작 $(date '+%m-%d %H:%M') | 코드 $(
 [ -x $BL ] || { echo "Blender 없음 $BL — 멈춤"; exit 1; }
 # 정답 메시 찾기: <루트>/<범주>/<uid>/models/model_normalized.obj
 k1=$(head -1 $FER/core_test_list.txt | tr -d '\r'); SN=""
-for r in $W/data/shapenet_b $W/data/ShapeNetCore.v2 $W/data/shapenet $W/data/GT; do [ -f $r/$k1/models/model_normalized.obj ] && { SN=$r; break; }; done
+for r in ${GT_MESH:-} $W/eval_gt_shape/ShapeNetCore_sub01 $W/data/shapenet_b $W/data/ShapeNetCore.v2 $W/data/shapenet $W/data/GT; do [ -f $r/$k1/models/model_normalized.obj ] && { SN=$r; break; }; done
 [ -z "$SN" ] && SN=$(dirname $(dirname $(dirname $(find $W/data -maxdepth 6 -path "*${k1#*/}/models/model_normalized.obj" 2>/dev/null | head -1))) 2>/dev/null)
 [ -n "$SN" ] && [ -f $SN/$k1/models/model_normalized.obj ] || { echo "정답 메시를 찾지 못함 ($k1) — 멈춤"; exit 1; }
 tr -d '\r' < $FER/core_test_list.txt | awk -v r=$SN 'NF{print r"/"$1"/models/model_normalized.obj"}' > $O/gray_list.txt
