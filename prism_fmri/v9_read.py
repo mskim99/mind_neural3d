@@ -18,7 +18,7 @@ sys.path.insert(0, '.'); sys.path.insert(0, os.path.dirname(os.path.abspath(__fi
 from prism import build_from_ckpt
 p = argparse.ArgumentParser()
 for k in ('repo', 'data_root', 'ckpt', 'v9', 'v5', 'subs', 'out'): p.add_argument('--' + k, required=True)
-p.add_argument('--vae', default=''); p.add_argument('--nperm', type=int, default=10000); p.add_argument('--inputs', default='enc,v1v4,cortex')
+p.add_argument('--vae', default=''); p.add_argument('--v9b', default=''); p.add_argument('--targets', default=''); p.add_argument('--nperm', type=int, default=10000); p.add_argument('--inputs', default='enc,v1v4,cortex')
 a = p.parse_args(); dev = 'cuda'; t0 = time.time(); os.makedirs(a.out, exist_ok=True); rng = np.random.default_rng(0)
 ck = torch.load(a.ckpt, map_location='cpu'); SUBS = ck['subs']; FRAMES = list(range(2, 8))
 model = build_from_ckpt(ck, a.repo).cuda().eval(); ENC = model.encode_frames
@@ -40,6 +40,26 @@ if 'mask8_avg' in Z9.files:   # 실루엣 대조 (11-28): 마스크만 줄인 �
             mx, mm = Xt.mean(0), Mt.mean(0); _c['b'] = ((Xt - mx) * (Mt - mm)).sum(0) / (((Mt - mm) ** 2).sum(0) + 1e-9); _c['mx'], _c['mm'] = mx, mm
         return (X - _c['mx'] - _c['b'] * (M - _c['mm'])).reshape(len(ks), -1)
     TG['blur8_avg_nomask'] = _nomask
+def _resid(X, M, tr_rows):   # 칸마다 X ~ β · M + c (train으로 맞춤) 의 나머지 — X [n, …, C], M [n, …, 1]
+    mx, mm = X[tr_rows].mean(0), M[tr_rows].mean(0); b = ((X[tr_rows] - mx) * (M[tr_rows] - mm)).sum(0) / (((M[tr_rows] - mm) ** 2).sum(0) + 1e-9)
+    return X - mx - b * (M - mm)
+if a.v9b:   # 11-28 총괄 추가 ② 자르고 키운 흐릿한 이미지 ③ 고주파 에너지 공간 지도 (v9_feat2.py)
+    ZB = np.load(a.v9b); KB = {str(k): i for i, k in enumerate(ZB['keys'])}; keys_ok &= set(KB)
+    TR = [k for k in TR if k in keys_ok]; TE = [k for k in TE if k in keys_ok]
+    _ALL = TR + TE; _IX = {k: i for i, k in enumerate(_ALL)}; _tr = np.arange(len(TR))
+    def _arr(z, kk, n): return z[n][[kk[k] for k in _ALL]].astype(np.float64)
+    _c = _arr(ZB, KB, 'crop8_avg'); _cm = _arr(ZB, KB, 'cmask8_avg')[..., None]
+    _h4 = _arr(ZB, KB, 'hbmap4_avg'); _m4 = _arr(ZB, KB, 'mask4_avg'); _h8 = _arr(ZB, KB, 'hbmap8_avg'); _m8 = _arr(Z9, K9, 'mask8_avg')
+    D2 = {'crop8_avg': _c, 'cmask8_avg': _cm[..., 0], 'crop8_avg_nomask': _resid(_c, _cm, _tr), 'hbmap4_avg': _h4, 'hbmap4_nomask': _resid(_h4, _m4, _tr),
+          'hbmap8_avg': _h8, 'hbmap8_nomask': _resid(_h8, _m8, _tr)}
+    for n, X in D2.items(): TG[n] = (lambda X: lambda ks: X[[_IX[k] for k in ks]].reshape(len(ks), -1))(X)
+    # ① 질감 통계 12개를 train(범주 평균 뺀 값, train 표준편차로 나눔)의 PCA로 돌림 → 성분마다 따로 읽음
+    _t = Z9['tex_ob'].astype(np.float64); _ttr = _t[[K9[k] for k in TR]]
+    _cmt = {c: _ttr[[i for i, k in enumerate(TR) if cat(k) == c]].mean(0) for c in CL}
+    _rt = _ttr - np.stack([_cmt[cat(k)] for k in TR]); _sdt = _rt.std(0); _, _St, _Vt = np.linalg.svd(_rt / _sdt, full_matrices=False)
+    print('질감 PCA 설명 분산 비율', np.round(_St ** 2 / (_St ** 2).sum(), 3).tolist(), flush=True)
+    print('질감 PC1 ~ 3 적재 (대역 저 · 중 · 고 × 방향 0 · 45 · 90 · 135):', [np.round(_Vt[i], 2).tolist() for i in range(3)], flush=True)
+    for i in range(6): TG[f'tex_pc{i + 1}'] = (lambda i: lambda ks: (Z9['tex_ob'][[K9[k] for k in ks]].astype(np.float64) / _sdt) @ _Vt[i][:, None])(i)
 N5 = [str(x) for x in Z5['names']]; I5 = [N5.index(n) for n in N5 if n != 'area']
 TG['v5'] = lambda ks: Z5['feat'][[K5[k] for k in ks]][:, I5].astype(np.float64)
 if a.vae:
@@ -47,6 +67,7 @@ if a.vae:
     U, S, Vt = np.linalg.svd(Lt - mu_v, full_matrices=False)                       # PCA를 train으로만 맞춤
     for d in (32, 64): TG[f'vae{d}'] = (lambda d: lambda ks: (ZV['lat'][[KV[k] for k in ks]].reshape(len(ks), -1).astype(np.float64) - mu_v) @ Vt[:d].T)(d)
     print('VAE PCA 설명 분산 32 · 64:', round(float((S[:32] ** 2).sum() / (S ** 2).sum()), 3), round(float((S[:64] ** 2).sum() / (S ** 2).sum()), 3), flush=True)
+if a.targets: TG = {n: f for n, f in TG.items() if n in a.targets.split(',')}
 Y = {}
 for n, f in TG.items():
     ytr, yte = f(TR), f(TE); cm = {c: ytr[[i for i, k in enumerate(TR) if cat(k) == c]].mean(0) for c in CL}
