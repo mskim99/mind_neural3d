@@ -22,8 +22,8 @@ def lookat(eye):
     M = np.eye(4); M[0, :3], M[1, :3], M[2, :3] = x, y, z; M[:3, 3] = -M[:3, :3] @ eye; return torch.tensor(M, dtype=torch.float32)
 
 
-P = persp(56)
-VIEWS = [lookat([1.5 * math.cos(math.radians(30)) * math.sin(math.radians(az)), 1.5 * math.sin(math.radians(30)), 1.5 * math.cos(math.radians(30)) * math.cos(math.radians(az))]) for az in range(0, 360, 60)]
+P = persp(56); AZ0 = 90   # 방위 0이 평가 렌더(Blender render.py) 방위 0과 같은 쪽을 보게
+VIEWS = [lookat([1.5 * math.cos(math.radians(30)) * math.sin(math.radians(az + AZ0)), 1.5 * math.sin(math.radians(30)), 1.5 * math.cos(math.radians(30)) * math.cos(math.radians(az + AZ0))]) for az in range(0, 360, 60)]
 files = sorted(glob.glob(f'{a.glb}/*/*.glb')); n_ok = 0
 for f in files:
     uid = os.path.basename(f)[:-4]; od = f'{a.out}/{uid}'
