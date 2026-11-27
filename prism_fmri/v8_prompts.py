@@ -30,9 +30,10 @@ if a.src == 'gt':
     hi = {uid(k): BH[K5[k]] - cm_hi[cat(k)] for k in TE}
     lab = {uid(k): LAB[K9[k]] for k in TE} if a.v9 else {}
 else:
-    P = np.load(a.pred); names = [uid(str(x)) for x in P['name']]
-    hi = dict(zip(names, P['band_hi_res'].astype(np.float64)))
-    lab = {u: cm_lab[N2C[noun[u]]] + r for u, r in zip(names, P['lab_res'].astype(np.float64))} if 'lab_res' in P.files else {}
+    P = np.load(a.pred); names = [uid(str(x)) for x in P['name']]   # v9_read.py pred_<피험자>.npz (enc 입력): pred_v5 = V-5 특징 9개(band_hi = 6번째), pred_color 앞 3개 = Lab
+    assert P['ok_v5'].all() and P['ok_color'][:3].all()
+    hi = dict(zip(names, P['pred_v5'][:, 5].astype(np.float64)))
+    lab = {u: cm_lab[N2C[noun[u]]] + r for u, r in zip(names, P['pred_color'][:, :3].astype(np.float64))} if a.v9 else {}
 # 색 이름 (11-28: 원형과의 Lab 거리 대신 색상각으로 — 어두운 파랑이 보라로 가는 문제): cv2 Lab(L* 0 ~ 100, a* · b*)에서
 #  채도 C = √(a² + b²) < 12 → L < 25 black · < 70 gray · 그 위 white
 #  색상각 h = atan2(b, a) (도): 20 ~ 75이고 L < 45 → brown, 20 ~ 50 red, 50 ~ 80 orange, 80 ~ 120 yellow, 120 ~ 180 green, 180 ~ 240 cyan,
