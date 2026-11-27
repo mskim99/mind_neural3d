@@ -7,6 +7,7 @@
 #  평가: run_eval.sh (8지표). 생성은 GPU 한 번에 하나(gen.lock), 평가는 CPU 한 번에 하나(eval.lock) — 여러 번 불러도 줄을 섬
 # 사용 (절대 경로로): SETS="gt_detail|text|$W/prism_v8/prompts/gt_detail.json …" nohup bash /home/oem/jhj/MinD-3D++/mind_neural3d/prism_fmri/scripts/run_v8.sh > $W/logs/v8_<묶음>.log 2>&1 < /dev/null &
 GPU=0 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh" || exit 1
+GPU=0   # 11-28: source 앞 임시 지정은 끝나면 사라짐 → run_eval에 빈 GPU 번호가 넘어가 렌더가 CPU로 돌고 텍스처 지표가 실패했음
 PY=$W/venv/bin/python; TM=microsoft/TRELLIS-text-base; F=/home/oem/jhj/fair_eval; V=$F/fair_eval; O=$W/prism_v8; mkdir -p $O
 export FE_PY=$F/venv/bin/python FE_BLENDER=$W/tools/blender-4.2.3-linux-x64/blender TORCH_HOME=$F/torch_home
 TOK=$W/prism_full/eval_ausvp/infer/s01/sub-0001_keep/tokens; SEL=$W/prism_yaw/fullausvp_s01/yawsel.json
