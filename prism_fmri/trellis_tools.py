@@ -36,6 +36,9 @@ p.add_argument('--slat_t0', type=float, default=1.0)   # < 1이면 외형 단계
 p.add_argument('--names', default='')   # gscheck: 이 목록의 이름만
 p.add_argument('--slat_text', default='')   # 외형 = 텍스트판, {이름: 문장} json
 p.add_argument('--text_model', default='microsoft/TRELLIS-text-base')
+p.add_argument('--slat_steer', default='')   # 11-28 V-8 ㉥ (SemanticSlider3D식 속도 차이 조향, --slat_text와 같이): {이름: {"plus": 문장, "minus": 문장, "alpha": α}}
+#   외형 단계 스텝마다 v = v_CFG(기준 문장) + α · [v(plus) − v(minus)] (차이에는 CFG 배율을 곱하지 않음, 모든 스텝). α = 0이거나 이름이 없으면 기준 그대로
+p.add_argument('--gen_names', default='')   # gen: 이 목록(줄마다 이름)의 것만 생성
 p.add_argument('--pool', type=int, default=0)   # dino: 1이면 토큰 [1374, 1024] 대신 token_util.pool 요약 [54, 1024]만 저장 (V 시점 특징 정답용, 11-09)
 p.add_argument('--thr', type=int, default=235)   # dino: 물체 알파 문턱값 min(RGB) < thr (11-28 V-8 ㉣: 16×16 흐릿한 그림은 물체가 옅어 245)
 p.add_argument('--rembg', type=int, default=0)   # dino: 1이면 흰 배경 문턱값 대신 TRELLIS preprocess_image의 rembg로 배경 제거 (unCLIP 생성 이미지용, 11-09)
@@ -88,6 +91,26 @@ if a.slat_text:
     print('텍스트판', a.text_model, '| SLat 정규화 같음', same, '| 디코더 같음', dec, '| sampler', TP.slat_sampler_params, '| 문장', len(PROMPT), flush=True)
     assert all(same.values()) and dec and all(dec.values()), '텍스트판과 이미지판의 SLat 공간이 다름 → 외형만 바꿔 끼울 수 없음'
 if a.slat_t0 < 1: assert a.slat_pred and hasattr(pipe.slat_sampler, 'sample_once') and hasattr(pipe.slat_sampler, 'sigma_min'), 'SDEdit은 --slat_pred와 FlowEuler sampler 필요'
+STEER = {}; CUR = {'name': None}
+if a.slat_steer:
+    import json as _js
+    STEER = _js.load(open(a.slat_steer, encoding='utf-8')); assert a.slat_text, '--slat_steer는 --slat_text와 같이'
+    from trellis.pipelines.samplers import FlowEulerSampler as _FES
+    _smp = TP.slat_sampler; _base_inf = type(_smp)._inference_model
+    print('조향', len(STEER), '| sampler', type(_smp).__name__, flush=True)
+def set_steer(name):
+    if not STEER: return
+    st = STEER.get(name); _smp.__dict__.pop('_inference_model', None)
+    if not st or float(st['alpha']) == 0: return
+    cp, cm, al = TP.encode_text([st['plus']]), TP.encode_text([st['minus']]), float(st['alpha'])
+    def inf(model, x_t, t, cond, **kw):
+        v = _base_inf(_smp, model, x_t, t, cond, **kw)
+        kw2 = {k: x for k, x in kw.items() if k not in ('neg_cond', 'cfg_strength', 'cfg_interval')}
+        d = _FES._inference_model(_smp, model, x_t, t, cp, **kw2) - _FES._inference_model(_smp, model, x_t, t, cm, **kw2)
+        return v + d * al
+    _smp._inference_model = inf
+
+
 def make_cond(c):
     return {'cond': c, 'neg_cond': torch.zeros_like(c)}      # TRELLIS get_cond와 같은 형식 (neg_cond = 0)
 
@@ -223,6 +246,7 @@ else:
     from trellis.utils import postprocessing_utils, render_utils
     if a.ss_z: assert TP is not None, '--ss_z는 --slat_text와 같이'
     files = sorted(glob.glob(f'{a.ss_z or a.pred}/*.npy'))[: a.limit or None]
+    if a.gen_names: _keep = {l.strip() for l in open(a.gen_names) if l.strip()}; files = [f for f in files if os.path.basename(f)[:-4] in _keep]
     for i, f in enumerate(files):
         name = os.path.basename(f)[:-4]; od = f'{a.out}/{name}'
         if os.path.exists(f'{od}/{name}.glb'): continue
@@ -232,6 +256,7 @@ else:
         else:
             (cond, cond2), z = load_conds(name), None
         if cond2 is None: print('외형 토큰 없음', name, flush=True); continue
+        set_steer(name)
         torch.manual_seed(a.seed)
         if a.ss_z and a.ss_rng:   # TRELLIS sample_sparse_structure: torch.randn(n, C, R, R, R) (CPU) → .to(device)와 같은 소비
             _fm = pipe.models['sparse_structure_flow_model']; torch.randn(1, _fm.in_channels, _fm.resolution, _fm.resolution, _fm.resolution)
