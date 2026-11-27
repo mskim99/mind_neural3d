@@ -31,6 +31,15 @@ TR = [k for k in lst('train') if k in keys_ok]; TE = [k for k in lst('test') if 
 def g9(n): return lambda ks: Z9[n][[K9[k] for k in ks]].reshape(len(ks), -1).astype(np.float64)
 TG = {'blur8_f0': g9('blur8_f0'), 'blur16_f0': g9('blur16_f0'), 'blur8_avg': g9('blur8_avg'), 'blur16_avg': g9('blur16_avg'),
       'color': lambda ks: np.concatenate([g9('lab_mean')(ks), g9('ab_hist')(ks)], 1), 'tex': g9('tex_ob')}
+if 'mask8_avg' in Z9.files:   # 실루엣 대조 (11-28): 마스크만 줄인 것 + 흐릿한 RGB에서 같은 칸 마스크의 선형 몫(train으로 맞춤)을 뺀 나머지
+    for n in ('mask8_f0', 'mask8_avg', 'mask16_avg'): TG[n] = g9(n)
+    def _nomask(ks, _c={}):
+        X = Z9['blur8_avg'][[K9[k] for k in ks]].astype(np.float64); M = Z9['mask8_avg'][[K9[k] for k in ks]].astype(np.float64)[..., None]
+        if not _c:
+            Xt = Z9['blur8_avg'][[K9[k] for k in TR]].astype(np.float64); Mt = Z9['mask8_avg'][[K9[k] for k in TR]].astype(np.float64)[..., None]
+            mx, mm = Xt.mean(0), Mt.mean(0); _c['b'] = ((Xt - mx) * (Mt - mm)).sum(0) / (((Mt - mm) ** 2).sum(0) + 1e-9); _c['mx'], _c['mm'] = mx, mm
+        return (X - _c['mx'] - _c['b'] * (M - _c['mm'])).reshape(len(ks), -1)
+    TG['blur8_avg_nomask'] = _nomask
 N5 = [str(x) for x in Z5['names']]; I5 = [N5.index(n) for n in N5 if n != 'area']
 TG['v5'] = lambda ks: Z5['feat'][[K5[k] for k in ks]][:, I5].astype(np.float64)
 if a.vae:

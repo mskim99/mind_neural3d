@@ -4,6 +4,7 @@
 #  ③ 색 분포: 물체 안쪽(마스크 6 px 깎음) 평균 Lab(L* 0 ~ 100, a* · b*) + a* · b* 4×4 histogram(각 −48 ~ 48, 24 간격, 밖은 끝 칸, 비율) → 10프레임 평균
 #  ④ 질감 통계: v5_feat.py의 대역 3개(4 ~ 16 · 16 ~ 48 · 48 ~ 160 주기)를 방향 4개(0 · 45 · 90 · 135°, ±22.5°)로 나눈 log 에너지 12개 → 10프레임 평균
 #     (방향 = 주파수 벡터의 각도 mod 180, 0° = 가로 주파수 = 세로 줄무늬)
+#  (11-28 추가 대조) mask8_f0 · mask8_avg · mask16_avg: 물체 마스크(min RGB < 235, 0/1)만 같은 식으로 줄인 것 — 흐릿한 이미지가 실루엣 이상을 담는지 가르는 대조
 # 출력: <out> npz — keys [N], blur8_f0 [N,8,8,3], blur16_f0 [N,16,16,3], blur8_avg, blur16_avg, lab_mean [N,3], ab_hist [N,16], tex_ob [N,12] (대역 × 방향), frames
 # 사용: python -I v9_feat.py --out <npz> [--workers 10]
 import os, zipfile, argparse, tempfile
@@ -27,8 +28,9 @@ EDGES = np.array([-48, -24, 0, 24, 48])
 
 def frame_feat(f, cv2):
     rgb = f[..., ::-1].astype(np.float32) / 255
-    b8 = cv2.resize(rgb, (8, 8), interpolation=cv2.INTER_AREA); b16 = cv2.resize(rgb, (16, 16), interpolation=cv2.INTER_AREA)
-    m0 = f.min(2) < 235
+    m0 = f.min(2) < 235; mf = m0.astype(np.float32)
+    b8 = np.concatenate([cv2.resize(rgb, (8, 8), interpolation=cv2.INTER_AREA), cv2.resize(mf, (8, 8), interpolation=cv2.INTER_AREA)[..., None]], -1)
+    b16 = np.concatenate([cv2.resize(rgb, (16, 16), interpolation=cv2.INTER_AREA), cv2.resize(mf, (16, 16), interpolation=cv2.INTER_AREA)[..., None]], -1)
     if m0.sum() < 500: return b8, b16, None
     f = cv2.resize(f, (R, R), interpolation=cv2.INTER_AREA)
     m = cv2.resize(m0.astype(np.uint8), (R, R), interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -72,6 +74,8 @@ if __name__ == '__main__':
     keys = [k for k in IDS if res.get(k) is not None]
     st = lambda j: np.stack([res[k][j] for k in keys]).astype(np.float32)
     V = st(4)
-    np.savez(a.out, keys=np.array(keys), blur8_f0=st(0), blur16_f0=st(1), blur8_avg=st(2), blur16_avg=st(3),
+    B8f, B16f, B8a, B16a = st(0), st(1), st(2), st(3)
+    np.savez(a.out, keys=np.array(keys), blur8_f0=B8f[..., :3], blur16_f0=B16f[..., :3], blur8_avg=B8a[..., :3], blur16_avg=B16a[..., :3],
+             mask8_f0=B8f[..., 3], mask8_avg=B8a[..., 3], mask16_avg=B16a[..., 3],
              lab_mean=V[:, :3], ab_hist=V[:, 3:19], tex_ob=V[:, 19:31], frames=np.array(VF))
     print('V9_FEAT_DONE', len(keys), '/', len(IDS), a.out, flush=True)
