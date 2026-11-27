@@ -37,6 +37,7 @@ p.add_argument('--names', default='')   # gscheck: 이 목록의 이름만
 p.add_argument('--slat_text', default='')   # 외형 = 텍스트판, {이름: 문장} json
 p.add_argument('--text_model', default='microsoft/TRELLIS-text-base')
 p.add_argument('--pool', type=int, default=0)   # dino: 1이면 토큰 [1374, 1024] 대신 token_util.pool 요약 [54, 1024]만 저장 (V 시점 특징 정답용, 11-09)
+p.add_argument('--thr', type=int, default=235)   # dino: 물체 알파 문턱값 min(RGB) < thr (11-28 V-8 ㉣: 16×16 흐릿한 그림은 물체가 옅어 245)
 p.add_argument('--rembg', type=int, default=0)   # dino: 1이면 흰 배경 문턱값 대신 TRELLIS preprocess_image의 rembg로 배경 제거 (unCLIP 생성 이미지용, 11-09)
 p.add_argument('--ss_z', default='')   # gen (11-10, B 3단계): 1단계(형상)를 건너뛰고 이 폴더의 형상 잠재 z [8,16³] → 디코더 > 0 → coords. 외형은 --slat_text 필수, 각 z 옆 흰 배경 스냅샷 png도 저장
 p.add_argument('--ss_noise', default='cuda', choices=['cuda', 'cpu'])   # ss (11-12, 판정 1c): cpu면 TRELLIS sample_sparse_structure처럼 CPU에서 noise를 뽑아 옮김 → bs 1 · 같은 seed면 gen의 1단계 z와 같음
@@ -138,7 +139,7 @@ if a.mode == 'dino':
             img = pipe.preprocess_image(Image.open(f'{a.frames}/{uid}/{a.view}.png').convert('RGB'))
         else:
             rgb = np.asarray(Image.open(f'{a.frames}/{uid}/{a.view}.png').convert('RGB'))
-            alpha = ((rgb.min(2) < 235) * 255).astype(np.uint8)
+            alpha = ((rgb.min(2) < a.thr) * 255).astype(np.uint8)
             img = pipe.preprocess_image(Image.fromarray(np.dstack([rgb, alpha]), 'RGBA'))
         if i == 0: img.save(f'{a.out}/_check_preprocessed.png')
         cond = pipe.get_cond([img])['cond'][0]
