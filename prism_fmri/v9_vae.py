@@ -11,7 +11,7 @@ p.add_argument('--model', default='sd2-community/stable-diffusion-2-1-unclip'); 
 a = p.parse_args()
 keys = [l.strip() for f in ('core_train_list.txt', 'core_test_list.txt') for l in open(os.path.join(a.ann, f)) if l.strip()]
 keys = [k for k in keys if os.path.exists(f'{a.frames}/{k.split("/")[-1]}/0.png')]
-vae = AutoencoderKL.from_pretrained(a.model, subfolder='vae', torch_dtype=torch.float16).cuda().eval(); sf = vae.config.scaling_factor
+vae = AutoencoderKL.from_pretrained(a.model, subfolder='vae', torch_dtype=torch.float16, variant='fp16').cuda().eval(); sf = vae.config.scaling_factor
 print('VAE', a.model, 'scaling', sf, '물체', len(keys), flush=True); out = []
 with torch.no_grad():
     for i in range(0, len(keys), a.bs):
