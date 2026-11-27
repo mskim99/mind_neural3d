@@ -33,13 +33,17 @@ else:
     P = np.load(a.pred); names = [uid(str(x)) for x in P['name']]
     hi = dict(zip(names, P['band_hi_res'].astype(np.float64)))
     lab = {u: cm_lab[N2C[noun[u]]] + r for u, r in zip(names, P['lab_res'].astype(np.float64))} if 'lab_res' in P.files else {}
-# 기본 색 원형 (sRGB) → cv2 Lab (v9_feat와 같은 변환: L* 0 ~ 100, a* · b* = 값 − 128)
-PROTO = {'red': (200, 30, 30), 'orange': (230, 120, 20), 'yellow': (230, 210, 40), 'green': (40, 150, 50), 'blue': (30, 70, 200), 'purple': (120, 40, 160),
-         'pink': (230, 120, 170), 'brown': (120, 70, 30), 'black': (25, 25, 25), 'white': (240, 240, 240), 'gray': (128, 128, 128)}
-def tolab(rgb):
-    l = cv2.cvtColor(np.uint8([[rgb[::-1]]]), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float64); return np.array([l[0] * 100 / 255, l[1] - 128, l[2] - 128])
-PL = {n: tolab(c) for n, c in PROTO.items()}
-cname = lambda v: min(PL, key=lambda n: np.linalg.norm(PL[n] - v))
+# 색 이름 (11-28: 원형과의 Lab 거리 대신 색상각으로 — 어두운 파랑이 보라로 가는 문제): cv2 Lab(L* 0 ~ 100, a* · b*)에서
+#  채도 C = √(a² + b²) < 12 → L < 25 black · < 70 gray · 그 위 white
+#  색상각 h = atan2(b, a) (도): 20 ~ 75이고 L < 45 → brown, 20 ~ 50 red, 50 ~ 80 orange, 80 ~ 120 yellow, 120 ~ 180 green, 180 ~ 240 cyan,
+#  240 ~ 317 blue, 317 ~ 345 purple, 그 밖(345 ~ 20) L > 55 pink, 아니면 red   (경계: cv2 Lab에서 순수 파랑 306° · 자홍 328° · 빨강 40° · 노랑 100°)
+def cname(v):
+    L, A, B = v; C = np.hypot(A, B); h = np.degrees(np.arctan2(B, A)) % 360
+    if C < 12: return 'black' if L < 25 else ('gray' if L < 70 else 'white')
+    if 20 <= h < 75 and L < 45: return 'brown'
+    for lo, hi, n in ((20, 50, 'red'), (50, 80, 'orange'), (80, 120, 'yellow'), (120, 180, 'green'), (180, 240, 'cyan'), (240, 317, 'blue'), (317, 345, 'purple')):
+        if lo <= h < hi: return n
+    return 'pink' if L > 55 else 'red'
 us = [uid(k) for k in TE if uid(k) in BASE]
 r = np.argsort(np.argsort([hi[u] for u in us])); n3 = len(us) / 3
 det, col = {}, {}
