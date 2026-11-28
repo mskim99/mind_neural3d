@@ -9,7 +9,7 @@ if [ -n "$last" ]; then
   s=$(echo "$last" | grep -oE 'step [0-9]+/[0-9]+' | head -1 | tr -dc '0-9/'); cur=${s%/*}; tot=${s#*/}; el=$(echo "$last" | grep -oE ' [0-9]+s ' | tail -1 | tr -dc '0-9')
   if [ -n "$el" ] && [ "$cur" -gt 0 ]; then r=$(( (tot - cur) * el / cur ))
     echo "진행 $cur/$tot · $(awk "BEGIN{printf \"%.2f스텝/초\", $cur/$el}") · 남은 $(( r / 60 ))분 · 끝 $(kst $(( now + r ))) KST"; fi
-  echo "$last" | grep -oE 'total [0-9.]+|tok_cos [0-9.]+|proto_acc [0-9.]+|subj_acc [0-9.]+|w_ent [0-9.]+|w_max [0-9.]+|mem [0-9.]+GB' | tr '\n' ' '; echo
+  echo "$last" | grep -oE 'total [0-9.]+|tok_cos [0-9.]+|proto_acc [0-9.]+|subj_acc [0-9.]+|w_ent [0-9.]+|w_max [0-9.]+|tau [0-9.]+|mem [0-9.]+GB' | tr '\n' ' '; echo
   echo "(균등이면 w_ent = ln 1300 = 7.170, w_max = 1/1300 = 0.00077)"
 fi
 grep -a "^\[val\]" $L 2>/dev/null | tail -2 | cut -c1-300

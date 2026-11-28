@@ -94,7 +94,7 @@ p.add_argument('--region_w', type=int, default=0, choices=[0, 1])   # 11-20 (b):
 p.add_argument('--region_prior', default='')   # 11-20: prep_region_prior.py 출력 npz (영역별 공통성 사전값, train 물체만). 없으면 모든 영역 같은 가중에서 시작
 p.add_argument('--rw_lo', type=float, default=0.3); p.add_argument('--rw_hi', type=float, default=0.7)   # 11-20: 사전값을 옮길 초기 가중 범위 (사용자 승인: 0.3 ~ 0.7, 사전값은 방향만)
 p.add_argument('--lam_rw', type=float, default=0.01)   # 11-20: 피험자별 조정 d의 L2 (클수록 피험자 공통 가중에 묶임)
-p.add_argument('--bank', type=int, default=0, choices=[0, 1]); p.add_argument('--bank_c', type=int, default=32); p.add_argument('--bank_lam', type=float, default=0.9)   # 11-28 P-5 Perceptive Bank (기준 객체 = train 전부)
+p.add_argument('--bank', type=int, default=0, choices=[0, 1]); p.add_argument('--bank_c', type=int, default=32); p.add_argument('--bank_lam', type=float, default=0.9); p.add_argument('--bank_temp', type=int, default=0, choices=[0, 1])   # P-5b: 학습되는 온도 τ (처음 0.07, weight decay 없음)   # 11-28 P-5 Perceptive Bank (기준 객체 = train 전부)
 p.add_argument('--lam_app', type=float, default=0.0)   # 11-28 F-1: > 0이면 Statistic Regressor(prism.AppHead) + L_app 가중치
 p.add_argument('--app_tgt', default='')   # F-1 정답 npz (prep_app_target.py: keys · app [N, 2] · ok)
 p.add_argument('--comp_sel', type=int, default=0, choices=[0, 1])   # 11-28 M-1: 갈래별 채널 gate(Component Selector)로 성분 고르기 (자르기 대신)
@@ -211,7 +211,7 @@ if a.bank:
     BANK_K = len([k for k in (l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt'))) if k and os.path.exists(f'{a.tgt}/dino/{k.split("/")[1]}.npy')])
 else: BANK_K = 0
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None), rw_range=(a.rw_lo, a.rw_hi), comp_sel=bool(a.comp_sel), bank=BANK_K, bank_c=a.bank_c, bank_lam=a.bank_lam, app_head=a.lam_app > 0).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None), rw_range=(a.rw_lo, a.rw_hi), comp_sel=bool(a.comp_sel), bank=BANK_K, bank_c=a.bank_c, bank_lam=a.bank_lam, app_head=a.lam_app > 0, bank_temp=bool(a.bank_temp)).to(dev)
 if a.sil_tmpl:                                                                       # 범주 평균 실루엣 = train(검증 물체 뺌) 물체의 영상 10프레임 평균 지도를 범주마다 평균
     _z = np.load(a.sil_tmpl); _M = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
     _ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt')) if l.strip()]; _by = {}
@@ -243,10 +243,12 @@ rw_params = [q for n_, q in model.named_parameters() if n_.startswith('rw.')]   
 if rw_params:
     params = [q for q in params if all(q is not r_ for r_ in rw_params)]
     _w = model.rw.region('s', torch.arange(len(SUBS), device=dev))[0]; print(f'[region_w] 공통 영역 가중 (S · V 따로, 피험자별 조정 L2 {a.lam_rw:g}) | 사전값 {a.region_prior or "없음"} | 초기 가중 범위 {float(_w.min()):.2f} ~ {float(_w.max()):.2f}', flush=True)
+nd_params = [q for n_, q in model.named_parameters() if n_ == 'bank_t']   # P-5b: 온도는 weight decay 없이 (decay가 t를 0, τ를 1로 끌지 않게)
+if nd_params: params = [q for q in params if all(q is not r_ for r_ in nd_params)]
 enc_params = model.unfreeze_encoder(a.enc_unfreeze) if a.enc_unfreeze > 0 else []
 if enc_params: print(f'[enc] ViT 마지막 {a.enc_unfreeze}블록 + norm 학습: {sum(q.numel() for q in enc_params) / 1e6:.1f}M, lr {a.enc_lr:g}', flush=True)
 print(f'trainable {sum(q.numel() for q in params) / 1e6:.1f}M, subjects {SUBS}, bs {a.bs}, steps {a.max_step}', flush=True)
-opt = torch.optim.AdamW([{'params': params}] + ([{'params': enc_params, 'lr': a.enc_lr}] if enc_params else []) + ([{'params': rw_params, 'weight_decay': 0.0}] if rw_params else []), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
+opt = torch.optim.AdamW([{'params': params}] + ([{'params': enc_params, 'lr': a.enc_lr}] if enc_params else []) + ([{'params': rw_params, 'weight_decay': 0.0}] if rw_params else []) + ([{'params': nd_params, 'weight_decay': 0.0}] if nd_params else []), lr=a.lr, betas=(0.9, 0.95), weight_decay=a.wd)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / a.warmup) * 0.5 * (1 + math.cos(math.pi * min(1, s / a.max_step))))
 class BalancedBatches(torch.utils.data.Sampler):
     """배치마다 피험자를 같은 수로 (bs / 피험자 수). 한 바퀴 = 가장 적은 피험자 기준."""
@@ -325,7 +327,7 @@ if a.lam_nce > 0: KEYS += ['tok_nce', 'tok_nce_acc']
 if PAIRED or a.lam_rem > 0: KEYS += ['share_s', 'share_s_acc', 'share_v', 'share_v_acc', 'rem_g', 'rem', 'rem_r2_sv', 'rem_r2_svp']   # 11-11 P = 나머지
 if a.comp_sel: KEYS += ['sel']
 if a.lam_app > 0: KEYS += ['app']
-if a.bank: KEYS += ['w_ent', 'w_max', 'r_mean']
+if a.bank: KEYS += ['w_ent', 'w_max', 'r_mean', 'tau']
 if SEP: KEYS += ['tc', 'd_loss', 'd_acc', 'hsic']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
@@ -383,7 +385,7 @@ def validate(loader=None, tag='val'):
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'], sil=b.get('osil'))
         L = prism_losses(out, b)
-        if a.bank: L['w_ent'], L['w_max'], L['r_mean'] = out['bank_w_ent'], out['bank_w_max'], out['bank_r_mean']
+        if a.bank: L['w_ent'], L['w_max'], L['r_mean'], L['tau'] = out['bank_w_ent'], out['bank_w_max'], out['bank_r_mean'], out['bank_tau']
         if a.lam_nce > 0 and len(b['cls']) > 1: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if PAIRED or a.lam_rem > 0:
             for k in G: G[k].append((out[k] if k in out else b[k]).float().cpu()) if (k in out or k in b) else None
@@ -405,7 +407,7 @@ def validate(loader=None, tag='val'):
     tot = float(total_loss(L)); write(tag, L, tot)
     print(f'[{tag}] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
           f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} '
-          + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '') + (f'w_ent {L["w_ent"]:.3f} w_max {L["w_max"]:.5f} r {L["r_mean"]:.3f} ' if a.bank else '')
+          + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '') + (f'w_ent {L["w_ent"]:.3f} w_max {L["w_max"]:.5f} r {L["r_mean"]:.3f} tau {L["tau"]:.4f} ' if a.bank else '')
           + (f'tc {L.get("tc", 0):.4f} d_acc {L.get("d_acc", 0):.3f} hsic {L.get("hsic", 0):.4f} ' if SEP else '') + (f'검색 S {L.get("share_s_acc", 0):.3f} V {L.get("share_v_acc", 0):.3f} rem R2 {L.get("rem_r2_sv", 0):.2f}>{L.get("rem_r2_svp", 0):.2f} ' if PAIRED or a.lam_rem > 0 else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
@@ -434,7 +436,7 @@ while not done:
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'], sil=b.get('osil'), bank_idx=b['obj'] if a.bank else None)
         L = prism_losses(out, b); prem_losses(out, b, L, PAIRED)
-        if a.bank: L['w_ent'], L['w_max'], L['r_mean'] = out['bank_w_ent'].detach(), out['bank_w_max'].detach(), out['bank_r_mean'].detach()
+        if a.bank: L['w_ent'], L['w_max'], L['r_mean'], L['tau'] = out['bank_w_ent'].detach(), out['bank_w_max'].detach(), out['bank_r_mean'].detach(), out['bank_tau']
         if a.lam_nce > 0: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if SEP:
             pt = PARTS(out)
@@ -442,14 +444,14 @@ while not done:
             if a.lam_hsic > 0: L['hsic'] = hsic_loss(pt)
         tot = total_loss(L)
         if rw_params: tot = tot + a.lam_rw * model.rw.reg()
-        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params + rw_params, 1.0); (torch.nn.utils.clip_grad_norm_(enc_params, 1.0) if enc_params else None); opt.step(); sched.step(); step += 1; th.step()
+        opt.zero_grad(set_to_none=True); tot.backward(); torch.nn.utils.clip_grad_norm_(params + rw_params + nd_params, 1.0); (torch.nn.utils.clip_grad_norm_(enc_params, 1.0) if enc_params else None); opt.step(); sched.step(); step += 1; th.step()
         if disc is not None: L['d_loss'], L['d_acc'] = tc_disc_update(disc, d_opt, pt)   # 본 backward 뒤 (판별기를 먼저 바꾸면 그래프가 깨짐)
         if step % a.print_every == 0:
             write('train', L, float(tot))
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
                   f'vt {float(L["vt"]):.4f} v_adv_acc {float(L["v_adv_acc"]):.3f} grl {model.grl_lam:.3f} '
-                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'w_ent {float(L["w_ent"]):.3f} w_max {float(L["w_max"]):.5f} r {float(L["r_mean"]):.3f} ' if a.bank else '') + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s {th.tag()}', flush=True)
+                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'w_ent {float(L["w_ent"]):.3f} w_max {float(L["w_max"]):.5f} r {float(L["r_mean"]):.3f} tau {float(L["tau"]):.4f} ' if a.bank else '') + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s {th.tag()}', flush=True)
         if step % a.val_every == 0: validate_all()
         if step in SAVE_STEPS:
             torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_step{step}.pt'); print(f'saved model_step{step}.pt', flush=True)

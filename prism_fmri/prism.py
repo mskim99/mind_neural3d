@@ -231,7 +231,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None, rw_range=(0.1, 0.9), comp_sel=False, bank=0, bank_c=32, bank_lam=0.9, app_head=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None, rw_range=(0.1, 0.9), comp_sel=False, bank=0, bank_c=32, bank_lam=0.9, app_head=False, bank_temp=False):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -330,6 +330,7 @@ class Prism(nn.Module):
             self.bank_lin = nn.Linear(dp, self.bank_c); self.bank_bn = nn.BatchNorm1d(self.bank_c)
             self.register_buffer('bank_h', torch.zeros(n_subjects, self.bank_K, 256 * self.bank_c)); self.register_buffer('bank_ok', torch.zeros(n_subjects, self.bank_K, dtype=torch.bool))
             self.subj_proj = nn.Sequential(nn.Linear(self.bank_K, 256), nn.BatchNorm1d(256), nn.GELU())   # Subject Projector (입력 = Profile 가중합 p ∈ R^K)
+            if bank_temp: self.bank_t = nn.Parameter(torch.tensor(-2.659260036932778))   # P-5b (사용자 11-28 16:11, 원문에 없음): w = softmax(r / τ), τ = exp(t) 학습, 처음 0.07, 0.01 ~ 1로 자름
         self.subj_cls = nn.Linear(256, max(n_subjects, 1))
         self.film = nn.Linear(256, 2 * dc); nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)   # 처음엔 보정 없음
         if remainder:                                                       # 11-11 P = 나머지: 고정 ViT 특징 중 S · V로 설명 안 되는 부분을 P가 복원 (sep_losses.rem_losses)
@@ -386,16 +387,18 @@ class Prism(nn.Module):
         with torch.autocast('cuda', enabled=False):
             q = cn(hc); U = cn(self.bank_h.float()); S, K, D = U.shape; B = q.shape[0]
             r = (q @ U.reshape(S * K, D).t()).view(B, S, K)[torch.arange(B, device=q.device), subj]   # [B, K] Pearson 상관
+            tau = self.bank_t.exp().clamp(0.01, 1.0) if hasattr(self, 'bank_t') else None
+            r_mean = r.mean().detach(); lg = r / tau if tau is not None else r                 # P-5b: 나누기는 가리기 전에 (−inf / τ의 기울기가 nan이 되지 않게)
             own = None
             if bank_idx is not None:
                 own = (bank_idx >= 0) & (bank_idx < K)
-                if own.any(): r = r.masked_fill(F.one_hot(bank_idx.clamp(0, K - 1), K).bool() & own[:, None], float('-inf'))   # w_{k*} = 0
-            w = torch.softmax(r, -1)
+                if own.any(): lg = lg.masked_fill(F.one_hot(bank_idx.clamp(0, K - 1), K).bool() & own[:, None], float('-inf'))   # w_{k*} = 0
+            w = torch.softmax(lg, -1)
             A = torch.einsum('bk,skd->bsd', w, U); Sv = torch.einsum('bsd,skd->bsk', A, U)   # Sv[b, s'] = (wᵀU_s')U_s'ᵀ
             mine = Sv[torch.arange(B, device=q.device), subj]
             pv = mine - (Sv.sum(1) - mine) / max(S - 1, 1) if S > 1 else mine         # Σ_k w_k ΔS_s[k]
             ent = -(w * torch.log(w.clamp_min(1e-30))).sum(-1)
-            info = {'bank_w_ent': ent.mean(), 'bank_w_max': w.max(-1).values.mean(), 'bank_r_mean': r[torch.isfinite(r)].mean(), 'bank_w_ent_b': ent, 'bank_w_max_b': w.max(-1).values}
+            info = {'bank_w_ent': ent.mean(), 'bank_w_max': w.max(-1).values.mean(), 'bank_r_mean': r_mean, 'bank_w_ent_b': ent, 'bank_w_max_b': w.max(-1).values, 'bank_tau': (tau.detach() if tau is not None else torch.ones((), device=q.device))}
         if self.training and own is not None and own.any():                         # Accum: EMA h ← λh + (1 − λ)sg(h_cur)
             with torch.no_grad():
                 s_, k_ = subj[own], bank_idx[own]; new = hc[own].detach().float(); old = self.bank_h[s_, k_]
@@ -620,7 +623,7 @@ def build_from_ckpt(ck, repo):
                   calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
                   calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)), csr_drop=args.get('csr_drop', '') or '', no_frame_emb=bool(int(args.get('no_frame_emb', 0) or 0)), region_w=bool(int(args.get('region_w', 0) or 0)), comp_sel=bool(int(args.get('comp_sel', 0) or 0)),
                   bank=int(ck['model']['bank_h'].shape[1]) if 'bank_h' in ck['model'] else 0, bank_c=int(args.get('bank_c', 32) or 32), bank_lam=float(args.get('bank_lam', 0.9) or 0.9),
-                  app_head=float(args.get('lam_app', 0) or 0) > 0)
+                  app_head=float(args.get('lam_app', 0) or 0) > 0, bank_temp=bool(int(args.get('bank_temp', 0) or 0)))
     check_load(model, ck['model'])
     return model
 
