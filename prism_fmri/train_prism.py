@@ -94,6 +94,8 @@ p.add_argument('--region_w', type=int, default=0, choices=[0, 1])   # 11-20 (b):
 p.add_argument('--region_prior', default='')   # 11-20: prep_region_prior.py 출력 npz (영역별 공통성 사전값, train 물체만). 없으면 모든 영역 같은 가중에서 시작
 p.add_argument('--rw_lo', type=float, default=0.3); p.add_argument('--rw_hi', type=float, default=0.7)   # 11-20: 사전값을 옮길 초기 가중 범위 (사용자 승인: 0.3 ~ 0.7, 사전값은 방향만)
 p.add_argument('--lam_rw', type=float, default=0.01)   # 11-20: 피험자별 조정 d의 L2 (클수록 피험자 공통 가중에 묶임)
+p.add_argument('--comp_sel', type=int, default=0, choices=[0, 1])   # 11-28 M-1: 갈래별 채널 gate(Component Selector)로 성분 고르기 (자르기 대신)
+p.add_argument('--lam_sel', type=float, default=1e-3)   # M-1 희소 손실 λ · mean(g)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
 a = p.parse_args()
 a.calib_bound, a.calib_renorm = 0.0, 0                                   # 11-18: 1단계 보정 파일의 크기 묶기 설정을 그대로 씀 (체크포인트 args에 남아 추론에서도 같게)
@@ -197,7 +199,7 @@ ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None), rw_range=(a.rw_lo, a.rw_hi)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None), rw_range=(a.rw_lo, a.rw_hi), comp_sel=bool(a.comp_sel)).to(dev)
 if a.sil_tmpl:                                                                       # 범주 평균 실루엣 = train(검증 물체 뺌) 물체의 영상 10프레임 평균 지도를 범주마다 평균
     _z = np.load(a.sil_tmpl); _M = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
     _ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt')) if l.strip()]; _by = {}
@@ -295,6 +297,7 @@ KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'r
 if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']
 if a.lam_nce > 0: KEYS += ['tok_nce', 'tok_nce_acc']
 if PAIRED or a.lam_rem > 0: KEYS += ['share_s', 'share_s_acc', 'share_v', 'share_v_acc', 'rem_g', 'rem', 'rem_r2_sv', 'rem_r2_svp']   # 11-11 P = 나머지
+if a.comp_sel: KEYS += ['sel']
 if SEP: KEYS += ['tc', 'd_loss', 'd_acc', 'hsic']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
@@ -312,7 +315,8 @@ TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambd
          'sep': lambda L: a.lam_tc * L.get('tc', 0.0) + a.lam_hsic * L.get('hsic', 0.0),
          'share': lambda L: a.lam_share * min(1.0, step / max(1, a.share_warm)) * (L.get('share_s', 0.0) + (L.get('share_v', 0.0) if a.share_on == 'sv' else 0.0)),
          'rem': lambda L: a.lam_rem * (L.get('rem_g', 0.0) + L.get('rem', 0.0)),
-         'nce': lambda L: a.lam_nce * L.get('tok_nce', 0.0)}
+         'nce': lambda L: a.lam_nce * L.get('tok_nce', 0.0),
+         'sel': lambda L: (a.lam_sel * L.get('sel', 0.0)) if a.comp_sel else 0.0}   # 11-28 M-1
 
 
 def tok_nce(out, b):
