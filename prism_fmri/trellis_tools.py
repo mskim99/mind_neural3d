@@ -48,6 +48,13 @@ p.add_argument('--z32', type=int, default=0)   # ss: 1이면 z를 fp16으로 줄
 p.add_argument('--ss_rng', type=int, default=0)   # gen --ss_z (11-25, V-4c): 1이면 seed 뒤에 형상 단계가 쓰는 CPU noise [1, 8, 16³]를 한 번 뽑아 버림 → 외형 단계 noise가 --pred 경로와 같은 무작위 수에서 시작
 p.add_argument('--model', default='')   # 비우면 HF 캐시의 TRELLIS-image-large 스냅샷 폴더를 직접 씀 (오프라인)
 a = p.parse_args()
+
+if a.mode == 'gen':   # 11-28: 생성(약 18 GB)과 평가 텍스처 지표(LPIPS 약 13 GB)를 GPU 0에서 한 번에 하나만 — 같은 잠금 파일 + 잠근 뒤 남은 메모리 확인 (메모리만 보면 둘이 동시에 시작해 OOM)
+    import fcntl, subprocess
+    _lk = open('/home/oem/jhj/MinD-3D++/gpu_heavy.lock', 'w'); fcntl.flock(_lk, fcntl.LOCK_EX)
+    _dev = os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(',')[0]
+    while int(subprocess.check_output(['nvidia-smi', '-i', _dev, '--query-gpu=memory.free', '--format=csv,noheader,nounits']).split()[0]) < 19000: time.sleep(20)
+
 os.environ.setdefault('SPCONV_ALGO', 'native')
 # 서버 meshgen venv에는 flash_attn이 없음 → TRELLIS attention 백엔드를 xformers로 (기본값 flash_attn이면 모델 로드 실패)
 os.environ.setdefault('ATTN_BACKEND', 'xformers'); os.environ.setdefault('SPARSE_ATTN_BACKEND', 'xformers')
