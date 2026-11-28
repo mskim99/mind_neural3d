@@ -9,6 +9,7 @@ import os, glob, argparse, math, numpy as np, torch, trimesh
 import nvdiffrast.torch as dr
 from PIL import Image
 p = argparse.ArgumentParser(); p.add_argument('--glb', required=True); p.add_argument('--out', required=True); p.add_argument('--res', type=int, default=512)
+p.add_argument('--az_step', type=int, default=60); p.add_argument('--elev', type=float, default=30); p.add_argument('--angle_names', type=int, default=0)   # 11-28 총괄(F-1 정성 각도 맞추기): 방위 간격 · 고도 · 파일 이름을 각도로
 a = p.parse_args(); dev = 'cuda'; ctx = dr.RasterizeCudaContext(); S = a.res
 
 
@@ -23,11 +24,12 @@ def lookat(eye):
 
 
 P = persp(56); AZ0 = 90   # 방위 0이 평가 렌더(Blender render.py) 방위 0과 같은 쪽을 보게
-VIEWS = [lookat([1.5 * math.cos(math.radians(30)) * math.sin(math.radians(az + AZ0)), 1.5 * math.sin(math.radians(30)), 1.5 * math.cos(math.radians(30)) * math.cos(math.radians(az + AZ0))]) for az in range(0, 360, 60)]
+AZS = list(range(0, 360, a.az_step)); E = math.radians(a.elev)
+VIEWS = [lookat([1.5 * math.cos(E) * math.sin(math.radians(az + AZ0)), 1.5 * math.sin(E), 1.5 * math.cos(E) * math.cos(math.radians(az + AZ0))]) for az in AZS]
 files = sorted(glob.glob(f'{a.glb}/*/*.glb')); n_ok = 0
 for f in files:
     uid = os.path.basename(f)[:-4]; od = f'{a.out}/{uid}'
-    if os.path.exists(f'{od}/5.png'): n_ok += 1; continue
+    if os.path.exists(f'{od}/{AZS[-1] if a.angle_names else len(AZS) - 1}.png'): n_ok += 1; continue
     m = trimesh.load(f, force='mesh', process=False)
     tex = m.visual.material.baseColorTexture if hasattr(m.visual.material, 'baseColorTexture') else None
     if tex is None or m.visual.uv is None: print('텍스처 없음', uid, flush=True); continue
@@ -43,6 +45,6 @@ for f in files:
         col = dr.texture(T.contiguous(), tc, filter_mode='linear')
         al = (rast[..., 3:4] > 0).float(); img = torch.cat([col, al], -1)
         img = dr.antialias(img, rast, clip, tri)[0].flip(0)
-        Image.fromarray((img.clamp(0, 1) * 255).round().byte().cpu().numpy(), 'RGBA').save(f'{od}/{k}.png')
+        Image.fromarray((img.clamp(0, 1) * 255).round().byte().cpu().numpy(), 'RGBA').save(f'{od}/{AZS[k] if a.angle_names else k}.png')
     n_ok += 1
 print('DIAG_RENDER_DONE', n_ok, '/', len(files), a.out, flush=True)
