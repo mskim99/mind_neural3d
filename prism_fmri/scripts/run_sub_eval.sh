@@ -8,6 +8,7 @@
 # 사용: GPU=1 NS="06 07 08" CK=… CK_ROOT=… TAG=ukbvl nohup bash run_sub_eval.sh > $W/logs/sub_eval_g1.log 2>&1 < /dev/null & disown
 GPU=${GPU:-0} source $(dirname $0)/common.sh || exit 1
 PY=$W/venv/bin/python; C=${CK_ROOT:?}; ck=${CK:?}; TAG=${TAG:?}; TM=microsoft/TRELLIS-text-base
+while [ -f $W/HOLD_SUBEVAL_$TAG ]; do echo "HOLD_SUBEVAL_$TAG 있음 — 기다림 $(date +%H:%M)"; sleep 120; done   # 11-28: 순서 바꿀 때 kill 없이 멈춤 (파일을 옮기면 이어서 시작)
 F=/home/oem/jhj/fair_eval; V=$F/fair_eval; Y=$W/prism_yaw
 trel() { (cd $MG && source $MG/mg_guard.sh >/dev/null && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 export FE_PY=$F/venv/bin/python FE_BLENDER=$W/tools/blender-4.2.3-linux-x64/blender TORCH_HOME=$F/torch_home
