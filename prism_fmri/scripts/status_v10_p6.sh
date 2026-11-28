@@ -6,10 +6,10 @@ kst() { date -d "@$(( $1 + 32400 ))" +%H:%M; }
 cnt() { ls $1/*/*.glb 2>/dev/null | wc -l; }
 row() {   # 이름 · 폴더 · 시작 시각(초, 0이면 아직)
   local c=$(cnt $2) t=$3
-  if [ $c -ge 104 ]; then printf "%-22s %-8s %s\n" $1 104/104 "끝남 $(kst $(stat -c %Y $(ls -t $2/*/*.glb | head -1)))"
+  if [ $c -ge 104 ]; then printf "%-22s %-8s %s\n" "$1" 104/104 "끝남 $(kst $(stat -c %Y $(ls -t $2/*/*.glb | head -1)))"
   elif [ $c -gt 0 ] && [ $t -gt 0 ]; then local e=$(( now - t )); local r=$(( (104 - c) * e / c ))
-    printf "%-22s %-8s %-10s 남은 %3d분 · 끝 %s\n" $1 $c/104 "$(awk "BEGIN{printf \"%.1f개/분\", $c*60/$e}")" $(( r / 60 )) "$(kst $(( now + r )))"
-  else printf "%-22s %-8s %s\n" $1 $c/104 "대기"; fi; }
+    printf "%-22s %-8s %-10s 남은 %3d분 · 끝 %s\n" "$1" $c/104 "$(awk "BEGIN{printf \"%.1f개/분\", $c*60/$e}")" $(( r / 60 )) "$(kst $(( now + r )))"
+  else printf "%-22s %-8s %s\n" "$1" $c/104 "대기"; fi; }
 ts() { local t=$(grep -a "$1" $2 2>/dev/null | tail -1 | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | tail -1); [ -z "$t" ] && { echo 0; return; }
        local s=$(date -d "$t" +%s); [ $s -gt $now ] && s=$(( s - 86400 )); echo $s; }
 echo "=== V-10 피험자 6번 (Pro6000 GPU 1) · 지금 $(date +%H:%M:%S) · $(grep -a "V-10 s06 시작" $L 2>/dev/null)"
