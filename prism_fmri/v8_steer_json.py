@@ -8,7 +8,7 @@ import os, json, argparse, numpy as np
 p = argparse.ArgumentParser()
 p.add_argument('--base', required=True); p.add_argument('--v5', required=True); p.add_argument('--ann', default=r'C:\Users\jinsw712\Desktop\Files\EEG\DataSet\MinD-3D++\fMRI-Shape\annotations')
 p.add_argument('--mode', choices=['fixed', 'z'], required=True); p.add_argument('--names', default=''); p.add_argument('--alpha', type=float, default=0)
-p.add_argument('--src', default='gt', choices=['gt', 'pred']); p.add_argument('--pred', default=''); p.add_argument('--k', type=float, default=1); p.add_argument('--out', required=True)
+p.add_argument('--src', default='gt', choices=['gt', 'pred']); p.add_argument('--pred', default=''); p.add_argument('--k', type=float, default=1); p.add_argument('--plus', default='a highly detailed, intricate {n}'); p.add_argument('--minus', default='a plain, simple {n}'); p.add_argument('--out', required=True)
 a = p.parse_args()
 lst = lambda s: [l.strip() for l in open(os.path.join(a.ann, f'core_{s}_list.txt')) if l.strip()]
 TR, TE = lst('train'), lst('test'); cat = lambda k: k.split('/')[0]; uid = lambda k: k.split('/')[-1]
@@ -24,6 +24,6 @@ names = [l.strip() for l in open(a.names) if l.strip()] if a.names else list(BAS
 out = {}
 for u in names:
     al = a.alpha if a.mode == 'fixed' else a.k * float(np.clip(z[u], -2, 2))
-    out[u] = {'plus': f'a highly detailed, intricate {noun[u]}', 'minus': f'a plain, simple {noun[u]}', 'alpha': round(al, 4), 'z': round(float(z[u]), 4)}
+    out[u] = {'plus': a.plus.format(n=noun[u]), 'minus': a.minus.format(n=noun[u]), 'alpha': round(al, 4), 'z': round(float(z[u]), 4)}
 json.dump(out, open(a.out, 'w'), indent=1)
 al = np.array([v['alpha'] for v in out.values()]); print(a.mode, a.src, len(out), 'α 범위', al.min().round(2), al.max().round(2), '| train 범주 뺀 sd', round(float(sd), 4), flush=True)
