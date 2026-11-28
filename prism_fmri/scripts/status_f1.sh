@@ -29,3 +29,12 @@ if [ -n "$R" ]; then
   done
 fi
 grep -aE "^CV\||DIAG_READY|S01_DONE|F1_DONE|실패|Traceback" $L | tail -4
+# 11-28 18:29: M-1 (run_m1b.sh)
+M=$W/prism_2s/ausvp_compsel/train_log.csv; ML=$W/logs/m1b.log
+if [ -f $ML ]; then
+  echo "-- M-1 (logs/m1b.log) 단계: $(grep -a '^===' $ML | tail -1)"
+  t1=$(date -d "$(grep -a 'M-1 학습' $ML | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}')" +%s 2>/dev/null || echo $now)
+  [ -f $M ] && echo "학습 ausvp_compsel: $(eta $(tail -1 $M | cut -d, -f1) 20000 $t1 스텝)"
+  g=$(ls $W/prism_2s/eval_ausvp_compsel/text/s01/glb/*/*.glb 2>/dev/null | wc -l); [ $g -gt 0 ] && echo "M-1 s01: GLB $g/104 · $(rend yaw_2sausvp_compsel_s01 | sed 's/^[^:]*: //')"
+  [ -f $W/HOLD_SUBEVAL_f1 ] && echo "F-1 나머지 6명: HOLD (M-1 1번 평가 뒤 자동으로 풀림)"
+fi
