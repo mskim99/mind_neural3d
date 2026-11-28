@@ -231,7 +231,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None, rw_range=(0.1, 0.9), comp_sel=False, bank=0, bank_c=32, bank_lam=0.9):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None, rw_range=(0.1, 0.9), comp_sel=False, bank=0, bank_c=32, bank_lam=0.9, app_head=False):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -619,7 +619,8 @@ def build_from_ckpt(ck, repo):
                   mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
                   calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
                   calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)), csr_drop=args.get('csr_drop', '') or '', no_frame_emb=bool(int(args.get('no_frame_emb', 0) or 0)), region_w=bool(int(args.get('region_w', 0) or 0)), comp_sel=bool(int(args.get('comp_sel', 0) or 0)),
-                  bank=int(ck['model']['bank_h'].shape[1]) if 'bank_h' in ck['model'] else 0, bank_c=int(args.get('bank_c', 32) or 32), bank_lam=float(args.get('bank_lam', 0.9) or 0.9))
+                  bank=int(ck['model']['bank_h'].shape[1]) if 'bank_h' in ck['model'] else 0, bank_c=int(args.get('bank_c', 32) or 32), bank_lam=float(args.get('bank_lam', 0.9) or 0.9),
+                  app_head=float(args.get('lam_app', 0) or 0) > 0)
     check_load(model, ck['model'])
     return model
 
