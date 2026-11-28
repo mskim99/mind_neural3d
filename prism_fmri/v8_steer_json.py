@@ -24,6 +24,6 @@ names = [l.strip() for l in open(a.names) if l.strip()] if a.names else list(BAS
 out = {}
 for u in names:
     al = a.alpha if a.mode == 'fixed' else a.k * float(np.clip(z[u], -2, 2))
-    out[u] = {'plus': a.plus.format(n=noun[u]), 'minus': a.minus.format(n=noun[u]), 'alpha': round(al, 4), 'z': round(float(z[u]), 4)}
+    out[u] = {'plus': a.plus.format(n=noun[u], an=BASE[u]), 'minus': a.minus.format(n=noun[u], an=BASE[u]), 'alpha': round(al, 4), 'z': round(float(z[u]), 4)}
 json.dump(out, open(a.out, 'w'), indent=1)
 al = np.array([v['alpha'] for v in out.values()]); print(a.mode, a.src, len(out), 'α 범위', al.min().round(2), al.max().round(2), '| train 범주 뺀 sd', round(float(sd), 4), flush=True)
