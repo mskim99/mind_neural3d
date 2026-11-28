@@ -8,4 +8,5 @@ echo; echo "################ P-5 Perceptive Bank 2만 스텝 ################"
 MODE=full bash $SD/status_p5.sh 2>/dev/null | grep -v "^--- GPU 1"
 echo; echo "################ P-5b 학습되는 온도 τ 2만 스텝 ################"
 MODE=temp bash $SD/status_p5.sh 2>/dev/null | grep -v "^--- GPU 1\|^(균등"
+[ -f $W/logs/p5_eval.log ] && { echo; echo "################ P-5 · P-5b 평가 ################"; bash $SD/status_p5_eval.sh 2>/dev/null | grep -v "^--- GPU 1"; }
 echo; echo "--- GPU 1: $(nvidia-smi -i 1 --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader) · 디스크 $(df -h $W | tail -1 | awk '{print $4" 남음 ("$5")"}') · 부하 $(cut -d' ' -f1-3 /proc/loadavg)"
