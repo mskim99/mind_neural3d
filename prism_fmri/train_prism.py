@@ -94,6 +94,7 @@ p.add_argument('--region_w', type=int, default=0, choices=[0, 1])   # 11-20 (b):
 p.add_argument('--region_prior', default='')   # 11-20: prep_region_prior.py 출력 npz (영역별 공통성 사전값, train 물체만). 없으면 모든 영역 같은 가중에서 시작
 p.add_argument('--rw_lo', type=float, default=0.3); p.add_argument('--rw_hi', type=float, default=0.7)   # 11-20: 사전값을 옮길 초기 가중 범위 (사용자 승인: 0.3 ~ 0.7, 사전값은 방향만)
 p.add_argument('--lam_rw', type=float, default=0.01)   # 11-20: 피험자별 조정 d의 L2 (클수록 피험자 공통 가중에 묶임)
+p.add_argument('--bank', type=int, default=0, choices=[0, 1]); p.add_argument('--bank_c', type=int, default=32); p.add_argument('--bank_lam', type=float, default=0.9)   # 11-28 P-5 Perceptive Bank (기준 객체 = train 전부)
 p.add_argument('--comp_sel', type=int, default=0, choices=[0, 1])   # 11-28 M-1: 갈래별 채널 gate(Component Selector)로 성분 고르기 (자르기 대신)
 p.add_argument('--lam_sel', type=float, default=1e-3)   # M-1 희소 손실 λ · mean(g)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
@@ -198,8 +199,12 @@ assert a.enc_path or a.enc_dir, '--enc_dir 또는 --enc_path'
 ENC_PATHS = [a.enc_path] * len(SUBS) if a.enc_path else [f'{a.enc_dir}/sub{s[-2:]}_encoder.pt' for s in SUBS]
 enc = [load_encoder(a.enc_path, cfg)] * len(SUBS) if a.enc_path else [load_encoder(pth, cfg) for pth in ENC_PATHS]
 print(f'[init] 피험자별 encoder {len(enc)}개: {ENC_PATHS}', flush=True)
+if a.bank:
+    assert a.holdout == 0 and not a.fold and not a.limit, 'P-5 Bank는 기준 객체 = train 전부 (holdout · fold · limit 없이)'
+    BANK_K = len([k for k in (l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt'))) if k and os.path.exists(f'{a.tgt}/dino/{k.split("/")[1]}.npy')])
+else: BANK_K = 0
 model = Prism(enc, n_classes=len(SYN), n_subjects=len(SUBS), var_mode=a.var_mode, arch=a.arch, sem_clip=a.sem_clip, var_heads=a.var_heads,
-              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None), rw_range=(a.rw_lo, a.rw_hi), comp_sel=bool(a.comp_sel)).to(dev)
+              vdim=a.vdim, grl_v=a.lam_vadv > 0, img_head=IMG, film=bool(a.film), remainder=a.lam_rem > 0, dropout=a.dropout, lin_path=bool(a.lin_path), in_norm=bool(a.in_norm), feat_norm=bool(a.feat_norm), vit_lin=a.vit_lin, mem=a.mem, sv_enc=bool(a.sv_enc), v_center=bool(a.v_center), v_pool=a.v_pool, sem_loc=a.sem_loc, v_res=a.v_res, calib=bool(a.calib), shared_sv=bool(a.shared_sv), calib_bound=a.calib_bound, calib_renorm=bool(a.calib_renorm), oracle_sil=bool(a.oracle_sil), sil_tmpl=bool(a.sil_tmpl), lin_norm=bool(a.lin_norm), csr_drop=a.csr_drop, no_frame_emb=bool(a.no_frame_emb), region_w=bool(a.region_w), region_prior=(np.load(a.region_prior)['prior'] if a.region_prior else None), rw_range=(a.rw_lo, a.rw_hi), comp_sel=bool(a.comp_sel), bank=BANK_K, bank_c=a.bank_c, bank_lam=a.bank_lam).to(dev)
 if a.sil_tmpl:                                                                       # 범주 평균 실루엣 = train(검증 물체 뺌) 물체의 영상 10프레임 평균 지도를 범주마다 평균
     _z = np.load(a.sil_tmpl); _M = {str(u): _z['sil'][i].astype(np.float32).mean(0) / 255.0 for i, u in enumerate(_z['uids'])}
     _ids = [l.strip() for l in open(os.path.join(a.data_root, 'annotations', 'core_train_list.txt')) if l.strip()]; _by = {}
@@ -292,12 +297,27 @@ if a.feat_norm and step == 0:                                                   
                 s1 += t.sum(0); s2 += (t * t).sum(0); n += len(t)
             mu = s1 / n; model.feat_mu[si] = mu.float(); model.feat_sd[si] = ((s2 / n - mu * mu).clamp_min(0).sqrt() + 1e-6).float()
             print(f'[feat_norm] {SUBS[si]} 표본 {n} · 평균 |mu| {float(mu.abs().mean()):.3f} · 평균 sd {float(model.feat_sd[si].mean()):.3f}', flush=True)
+if a.bank and step == 0:                                                             # P-5 Bank 시작: 원문 '첫 관측에서 초기화, 모두 찬 뒤 사용'을 학습 앞으로 모음 — (피험자, 기준 객체) 전부를 처음 파라미터로 한 번 통과
+    assert max(OBJ[k] for _, k in train_set.items) == BANK_K - 1, 'train 물체 번호가 Bank 순서와 다름'
+    model.train(); _t = time.time()
+    with torch.no_grad():
+        for si in range(len(SUBS)):
+            ks = [k for s_, k in train_set.items if s_ == si]
+            for i in range(0, len(ks), 16):
+                x = torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, SUBS[si], 'npy_data', k + '.npy')).astype(np.float32)[FRAMES] for k in ks[i:i + 16]])).to(dev)
+                fi = torch.tensor(FRAMES, device=dev).expand(len(x), -1)
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    hc = model(x, fi, torch.full((len(x),), si, dtype=torch.long, device=dev), bank_init=True)['bank_cur']
+                idx = torch.tensor([OBJ[k] for k in ks[i:i + 16]], device=dev); model.bank_h[si, idx] = hc.float(); model.bank_ok[si, idx] = True
+    _ok = model.bank_ok.float().mean(1).tolist()
+    print(f'[bank] 기준 객체 {BANK_K} × 피험자 {len(SUBS)} 채움 (D {model.bank_h.shape[-1]}, λ {a.bank_lam}) · 피험자별 찬 비율 {[round(v, 3) for v in _ok]} · {time.time() - _t:.0f}s · 균등 w 엔트로피 = ln K = {math.log(BANK_K):.3f}, 균등 최댓값 = 1/K = {1 / BANK_K:.5f}', flush=True)
 W = dict(tok=a.lam_tok, proto=a.lam_proto, var=a.lam_var, subj=a.lam_subj)
 KEYS = ['tok_mse', 'tok_cos', 'proto', 'proto_acc', 'center', 'scale', 'rot', 'ratio', 'vt', 'v_adv', 'v_adv_acc', 'subj', 'subj_acc']
 if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']
 if a.lam_nce > 0: KEYS += ['tok_nce', 'tok_nce_acc']
 if PAIRED or a.lam_rem > 0: KEYS += ['share_s', 'share_s_acc', 'share_v', 'share_v_acc', 'rem_g', 'rem', 'rem_r2_sv', 'rem_r2_svp']   # 11-11 P = 나머지
 if a.comp_sel: KEYS += ['sel']
+if a.bank: KEYS += ['w_ent', 'w_max', 'r_mean']
 if SEP: KEYS += ['tc', 'd_loss', 'd_acc', 'hsic']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
 if os.path.getsize(f'{a.out_dir}/train_log.csv') == 0:
@@ -354,6 +374,7 @@ def validate(loader=None, tag='val'):
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out = model(b['fmri'], b['frame_idx'], b['subj'], sil=b.get('osil'))
         L = prism_losses(out, b)
+        if a.bank: L['w_ent'], L['w_max'], L['r_mean'] = out['bank_w_ent'], out['bank_w_max'], out['bank_r_mean']
         if a.lam_nce > 0 and len(b['cls']) > 1: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if PAIRED or a.lam_rem > 0:
             for k in G: G[k].append((out[k] if k in out else b[k]).float().cpu()) if (k in out or k in b) else None
@@ -375,7 +396,7 @@ def validate(loader=None, tag='val'):
     tot = float(total_loss(L)); write(tag, L, tot)
     print(f'[{tag}] step {step} total {tot:.4f} tok_cos {L["tok_cos"]:.4f} proto_acc {L["proto_acc"]:.3f} '
           f'rot {L["rot"]:.4f} ratio {L["ratio"]:.4f} vt {L["vt"]:.4f} v_adv_acc {L["v_adv_acc"]:.3f} subj_acc {L["subj_acc"]:.3f} '
-          + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '')
+          + (f'img_cos {L["img_cos"]:.4f} img_r1 {L["img_r1"]:.3f} ' if IMG else '') + (f'w_ent {L["w_ent"]:.3f} w_max {L["w_max"]:.5f} r {L["r_mean"]:.3f} ' if a.bank else '')
           + (f'tc {L.get("tc", 0):.4f} d_acc {L.get("d_acc", 0):.3f} hsic {L.get("hsic", 0):.4f} ' if SEP else '') + (f'검색 S {L.get("share_s_acc", 0):.3f} V {L.get("share_v_acc", 0):.3f} rem R2 {L.get("rem_r2_sv", 0):.2f}>{L.get("rem_r2_svp", 0):.2f} ' if PAIRED or a.lam_rem > 0 else '') + '| 피험자별 범주 ' + ' '.join(f'{SUBS[k][-2:]}:{np.mean(v):.3f}' for k, v in sorted(per.items())), flush=True)
     model.train(); return L
 
@@ -402,8 +423,9 @@ while not done:
         model.grl_lam = a.lam_vadv * (2 / (1 + math.exp(-10 * step / a.max_step)) - 1)
         if a.aug_noise > 0 or a.aug_mask > 0: b['fmri'] = augment(b['fmri'])
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            out = model(b['fmri'], b['frame_idx'], b['subj'], sil=b.get('osil'))
+            out = model(b['fmri'], b['frame_idx'], b['subj'], sil=b.get('osil'), bank_idx=b['obj'] if a.bank else None)
         L = prism_losses(out, b); prem_losses(out, b, L, PAIRED)
+        if a.bank: L['w_ent'], L['w_max'], L['r_mean'] = out['bank_w_ent'].detach(), out['bank_w_max'].detach(), out['bank_r_mean'].detach()
         if a.lam_nce > 0: L['tok_nce'], L['tok_nce_acc'] = tok_nce(out, b)
         if SEP:
             pt = PARTS(out)
@@ -418,7 +440,7 @@ while not done:
             print(f'[ep {ep}] step {step}/{a.max_step} total {float(tot):.4f} tok_mse {float(L["tok_mse"]):.4f} tok_cos {float(L["tok_cos"]):.4f} '
                   f'proto {float(L["proto"]):.3f} proto_acc {float(L["proto_acc"]):.3f} rot {float(L["rot"]):.4f} ratio {float(L["ratio"]):.4f} '
                   f'vt {float(L["vt"]):.4f} v_adv_acc {float(L["v_adv_acc"]):.3f} grl {model.grl_lam:.3f} '
-                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s {th.tag()}', flush=True)
+                  f'subj_acc {float(L["subj_acc"]):.3f} ' + (f'w_ent {float(L["w_ent"]):.3f} w_max {float(L["w_max"]):.5f} r {float(L["r_mean"]):.3f} ' if a.bank else '') + (f'share S {float(L.get("share_s", 0)):.3f}/{float(L.get("share_s_acc", 0)):.2f} V {float(L.get("share_v", 0)):.3f}/{float(L.get("share_v_acc", 0)):.2f} rem R2 {float(L.get("rem_r2_sv", 0)):.2f}>{float(L.get("rem_r2_svp", 0)):.2f} ' if PAIRED or a.lam_rem > 0 else '') + (f'tc {float(L.get("tc", 0)):.3f} d_acc {float(L.get("d_acc", 0)):.3f} hsic {float(L.get("hsic", 0)):.3f} ' if SEP else '') + f'lr {sched.get_last_lr()[0]:.2e} mem {torch.cuda.max_memory_allocated() / 1e9:.1f}GB {time.time() - t0:.0f}s {th.tag()}', flush=True)
         if step % a.val_every == 0: validate_all()
         if step in SAVE_STEPS:
             torch.save({'model': STATE(), 'step': step, 'args': vars(a), 'subs': SUBS, 'classes': SYN, 'enc_paths': ENC_PATHS}, f'{a.out_dir}/model_step{step}.pt'); print(f'saved model_step{step}.pt', flush=True)

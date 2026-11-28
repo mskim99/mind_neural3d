@@ -218,7 +218,7 @@ class Prism(nn.Module):
     """encoder: 피험자별 fMRI ViT 리스트 (n_subjects개, 고정). ViT · Semantic · Variational은 피험자마다 따로 (각자 자기 피험자 데이터로만 학습).
     공유: Temporal Stem · SV Encoder · Perceptive(Subject Projector · 피험자 분류 · FiLM) · Transformer Decoder."""
     def __init__(self, encoder, n_classes, n_subjects, d=1024, splits=(384, 384, 256), dc=768, n_query=1374, dec_layers=2, n_frames=10,
-                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None, rw_range=(0.1, 0.9), comp_sel=False):
+                 sem_ch=512, sem_blocks=2, head_dim=256, var_mode='feat', arch='res', sem_clip='back', var_heads='csr', vdim=0, grl_v=False, img_head=False, film=True, remainder=False, dropout=0.0, lin_path=False, in_norm=False, feat_norm=False, vit_lin=0, mem='cat', sv_enc=True, v_center=False, v_pool=1, sem_loc=0, v_res=0, calib=False, shared_sv=False, calib_bound=0.0, calib_renorm=False, oracle_sil=False, sil_tmpl=False, lin_norm=False, csr_drop='', no_frame_emb=False, region_w=False, region_prior=None, rw_range=(0.1, 0.9), comp_sel=False, bank=0, bank_c=32, bank_lam=0.9):
         super().__init__()
         assert mem in ('cat', 'branch'); self.mem = mem; self.v_center = bool(v_center) and mem == 'branch'   # 11-13 새 구조 (맨 위 설명)
         assert mem == 'cat' or sem_clip == 'front', 'mem branch는 sem_clip front에서만'
@@ -305,6 +305,16 @@ class Prism(nn.Module):
         if grl_v:                                                           # 11-09: V에서 범주 정보 빼기 — Variational Features로 범주를 맞히는 분류기를 GRL 뒤에 붙임 (공유)
             self.v_adv = nn.Sequential(nn.Linear(dc, 256), nn.GELU(), nn.Linear(256, n_classes))
         self.subj_proj = nn.Sequential(nn.Linear(dp, 256), nn.BatchNorm1d(256), nn.GELU())
+        self.bank_K = int(bank or 0)
+        if self.bank_K:   # 11-28 P-5 박사님 설계 (Perceptive_Branch_국문.docx): Bank · Match to Bank · Peer Contrast → 피험자 코드 z_B → FiLM
+            #  F_B = Perceptive 채널(dp) patch 토큰 256개 → Linear(dp → bank_c) · BN → 프레임 평균 → 펼침 [D = 256 × bank_c]
+            #  Bank h[s, k] (기준 객체 K개 = train 전부, EMA λ, 기울기 없음) → 평균 중심화 · 단위 길이 U_s
+            #  r_k = u_{s,k}ᵀ q, w = softmax(r) (온도 없음 — 원문대로), 학습 중 자기 기준 객체 k*는 뺌
+            #  p = Σ w_k ΔS_s[k] = (wᵀU_s)U_sᵀ − mean_{r≠s} (wᵀU_r)U_rᵀ,  z_B = GELU(BN(Linear(p))) → 기존 FiLM · 피험자 분류 보조 그대로
+            self.bank_lam = float(bank_lam); self.bank_c = int(bank_c)
+            self.bank_lin = nn.Linear(dp, self.bank_c); self.bank_bn = nn.BatchNorm1d(self.bank_c)
+            self.register_buffer('bank_h', torch.zeros(n_subjects, self.bank_K, 256 * self.bank_c)); self.register_buffer('bank_ok', torch.zeros(n_subjects, self.bank_K, dtype=torch.bool))
+            self.subj_proj = nn.Sequential(nn.Linear(self.bank_K, 256), nn.BatchNorm1d(256), nn.GELU())   # Subject Projector (입력 = Profile 가중합 p ∈ R^K)
         self.subj_cls = nn.Linear(256, max(n_subjects, 1))
         self.film = nn.Linear(256, 2 * dc); nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)   # 처음엔 보정 없음
         if remainder:                                                       # 11-11 P = 나머지: 고정 ViT 특징 중 S · V로 설명 안 되는 부분을 P가 복원 (sep_losses.rem_losses)
@@ -346,6 +356,36 @@ class Prism(nn.Module):
 
     def train(self, mode=True):
         super().train(mode); self.encoders.eval(); return self
+
+    def bank_cur(self, p):
+        """P-5: F_B(Perceptive patch 토큰) → Linear · BN → 프레임 평균 → 펼친 벡터 [B, 256 × bank_c] (float32)."""
+        with torch.autocast('cuda', enabled=False):
+            B, T = p.shape[:2]; x = self.bank_lin(p[:, :, 1:].float())              # [B, T, 256, C] (0번 = cls 토큰 제외)
+            x = self.bank_bn(x.flatten(0, 2)).view(B, T, -1, self.bank_c).mean(1)
+            return x.flatten(1)
+
+    def _bank(self, p, subj, bank_idx):
+        """P-5 Match to Bank · Peer Contrast → (z_B 입력 p [B, K], 기록용 dict). Bank는 기울기 없음, 학습 중이면 EMA로 누적."""
+        cn = lambda x: F.normalize(x - x.mean(-1, keepdim=True), dim=-1)
+        hc = self.bank_cur(p)
+        with torch.autocast('cuda', enabled=False):
+            q = cn(hc); U = cn(self.bank_h.float()); S, K, D = U.shape; B = q.shape[0]
+            r = (q @ U.reshape(S * K, D).t()).view(B, S, K)[torch.arange(B, device=q.device), subj]   # [B, K] Pearson 상관
+            own = None
+            if bank_idx is not None:
+                own = (bank_idx >= 0) & (bank_idx < K)
+                if own.any(): r = r.masked_fill(F.one_hot(bank_idx.clamp(0, K - 1), K).bool() & own[:, None], float('-inf'))   # w_{k*} = 0
+            w = torch.softmax(r, -1)
+            A = torch.einsum('bk,skd->bsd', w, U); Sv = torch.einsum('bsd,skd->bsk', A, U)   # Sv[b, s'] = (wᵀU_s')U_s'ᵀ
+            mine = Sv[torch.arange(B, device=q.device), subj]
+            pv = mine - (Sv.sum(1) - mine) / max(S - 1, 1) if S > 1 else mine         # Σ_k w_k ΔS_s[k]
+            ent = -(w * torch.log(w.clamp_min(1e-30))).sum(-1)
+            info = {'bank_w_ent': ent.mean(), 'bank_w_max': w.max(-1).values.mean(), 'bank_r_mean': r[torch.isfinite(r)].mean(), 'bank_w_ent_b': ent, 'bank_w_max_b': w.max(-1).values}
+        if self.training and own is not None and own.any():                         # Accum: EMA h ← λh + (1 − λ)sg(h_cur)
+            with torch.no_grad():
+                s_, k_ = subj[own], bank_idx[own]; new = hc[own].detach().float(); old = self.bank_h[s_, k_]
+                self.bank_h[s_, k_] = torch.where(self.bank_ok[s_, k_][:, None], self.bank_lam * old + (1 - self.bank_lam) * new, new); self.bank_ok[s_, k_] = True
+        return pv, info
 
     def _res_tokens(self, out):
         """범주 평균 토큰(Semantic 범주 확률로 섞음, 기울기 안 보냄) + Variational 잔차 → [B, 1374, 1024]. out['res_base'] · out['res_var']도 남김."""
@@ -391,7 +431,7 @@ class Prism(nn.Module):
             order = torch.cat(order); inv = torch.empty_like(order); inv[order] = torch.arange(len(order), device=order.device)
             return torch.cat(outs)[inv]
 
-    def forward(self, fmri, frame_idx, subj=None, perceptive_override=None, sem_override=None, var_override=None, sil=None):
+    def forward(self, fmri, frame_idx, subj=None, perceptive_override=None, sem_override=None, var_override=None, sil=None, bank_idx=None, bank_init=False):
         """fmri [B, T, 256, 256], frame_idx [B, T] (fMRI 프레임 번호, 0~9), subj [B] 피험자 번호 (없으면 0).
         perceptive_override: 평가 때 Perceptive 벡터를 바꿔 끼우기 ('mean' → 배치 평균 = 사실상 버리기, 텐서 → 그 값).
         sem_override · var_override (11-12 판정 2): 디코더에 들어가는 Semantic Features [B, 256, dc] · Variational Features [B, T, dc]를 바꿔 끼우기
@@ -413,6 +453,7 @@ class Prism(nn.Module):
             s, v, p = (lin(mixed * g[i].to(mixed.dtype)) for i, lin in enumerate(self.sel_lin))
         else:
             s, v, p = mixed.split(self.splits, dim=-1)                              # 채널 분할 (학습 파라미터 없음)
+        if bank_init: return {'bank_cur': self.bank_cur(p)}                         # P-5: Bank 채우기용 (학습 전 한 번)
         # Semantic (피험자별): 프레임 평균(정적 성분) → (front) CLIP Projection → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
         st = s[:, :, 1:].mean(1)                                                     # [B, 256, ds]
         if self.mem == 'branch':                                                     # 11-13: attention pooling → CLIP Projection → 벡터 1개
@@ -497,7 +538,13 @@ class Prism(nn.Module):
         pv = p.mean((1, 2))
         if perceptive_override is not None:
             pv = pv.mean(0, keepdim=True).expand_as(pv) if isinstance(perceptive_override, str) else perceptive_override
-        h = self.subj_proj(pv)
+        if self.bank_K:                                                              # P-5: Match to Bank · Peer Contrast → z_B
+            pb, binfo = self._bank(p, subj, bank_idx); out.update(binfo)
+            if perceptive_override is not None: pb = pb.mean(0, keepdim=True).expand_as(pb) if isinstance(perceptive_override, str) else perceptive_override
+            with torch.autocast('cuda', enabled=False): h = self.subj_proj(pb.float())
+            out['z_B'] = h; out['bank_p'] = pb
+        else:
+            h = self.subj_proj(pv)
         out['subj_logit'] = self.subj_cls(h); out['perc_vec'] = pv
         if hasattr(self, 'rem_g'):
             out['enc_vec'] = enc_vec; out['rem_sv'] = self.rem_g(torch.cat([out['sem_vec'], out['var_vec']], -1).detach()); out['rem_p'] = self.rem_r(pv)
@@ -555,7 +602,8 @@ def build_from_ckpt(ck, repo):
                   dropout=float(args.get('dropout', 0) or 0), lin_path=bool(int(args.get('lin_path', 0) or 0)), in_norm=bool(int(args.get('in_norm', 0) or 0)), feat_norm=bool(int(args.get('feat_norm', 0) or 0)), vit_lin=int(args.get('vit_lin', 0) or 0),
                   mem=args.get('mem', 'cat') or 'cat', sv_enc=bool(int(args.get('sv_enc', 1))), v_center=bool(int(args.get('v_center', 0) or 0)), v_pool=int(args.get('v_pool', 1) or 1), sem_loc=int(args.get('sem_loc', 0) or 0), v_res=int(args.get('v_res', 0) or 0),
                   calib=bool(int(args.get('calib', 0) or 0)), shared_sv=bool(int(args.get('shared_sv', 0) or 0)),
-                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)), csr_drop=args.get('csr_drop', '') or '', no_frame_emb=bool(int(args.get('no_frame_emb', 0) or 0)), region_w=bool(int(args.get('region_w', 0) or 0)), comp_sel=bool(int(args.get('comp_sel', 0) or 0)))
+                  calib_bound=float(args.get('calib_bound', 0) or 0), calib_renorm=bool(int(args.get('calib_renorm', 0) or 0)), oracle_sil=bool(args.get('oracle_sil', '') or ''), sil_tmpl=bool(args.get('sil_tmpl', '') or ''), lin_norm=bool(int(args.get('lin_norm', 0) or 0)), csr_drop=args.get('csr_drop', '') or '', no_frame_emb=bool(int(args.get('no_frame_emb', 0) or 0)), region_w=bool(int(args.get('region_w', 0) or 0)), comp_sel=bool(int(args.get('comp_sel', 0) or 0)),
+                  bank=int(ck['model']['bank_h'].shape[1]) if 'bank_h' in ck['model'] else 0, bank_c=int(args.get('bank_c', 32) or 32), bank_lam=float(args.get('bank_lam', 0.9) or 0.9))
     check_load(model, ck['model'])
     return model
 
