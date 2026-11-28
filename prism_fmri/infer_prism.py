@@ -59,7 +59,7 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
                 s1 += t.sum(0); s2 += (t * t).sum(0); n_ += len(t)
         mu = s1 / n_; model.feat_mu[si] = mu.float(); model.feat_sd[si] = ((s2 / n_ - mu * mu).clamp_min(0).sqrt() + 1e-6).float()
         print(f'[own_stats] {dsub} 자기 fMRI ({a.own_stats}, 물체 {len(sk)} · 표본 {n_})로 feat_norm 통계 · 평균 |mu| {float(mu.abs().mean()):.3f} · 평균 sd {float(model.feat_sd[si].mean()):.3f}', flush=True)
-    comp = {k: [] for k in ('name', 'sem', 'var', 'perc', 'cls_pred', 'cls_score', 'cls', 'subj_pred', 'tok_pool', 'img', 'clip', 'vt', 'zb', 'w_ent', 'w_max')}
+    comp = {k: [] for k in ('name', 'sem', 'var', 'perc', 'cls_pred', 'cls_score', 'cls', 'subj_pred', 'tok_pool', 'img', 'clip', 'vt', 'zb', 'w_ent', 'w_max', 'app')}
     for i in range(0, len(ids), a.bs):
         ks = ids[i:i + a.bs]
         x = torch.from_numpy(np.stack([np.load(os.path.join(a.data_root, dsub, 'npy_data', k + '.npy')).astype(np.float32)[FRAMES] for k in ks])).cuda()
@@ -80,9 +80,10 @@ for sub in (a.subs.split(',') if a.subs else SUBS):
         if 'sem_img' in out: comp['img'].append(out['sem_img'].float().cpu())
         comp['clip'].append(out['sem_clip'].float().cpu())
         if 'z_B' in out: comp['zb'].append(out['z_B'].float().cpu()); comp['w_ent'].append(out['bank_w_ent_b'].float().cpu()); comp['w_max'].append(out['bank_w_max_b'].float().cpu())   # 11-28 P-5                                  # 11-10: S의 CLIP 벡터 (정규화, 프로토타입 공간)
+        if 'app' in out: comp['app'].append(out['app'].float().cpu())                  # 11-28 F-1: 질감 PC1 · PC2 예측
         if 'vt' in out: comp['vt'].append(out['vt'].float().mean(1).cpu())               # 11-10: V 예측 (shape면 개체 형상 [cy, w, h, area] 표준화, 프레임 평균)             # 11-10 A안: 예측 이미지 임베딩 (정규화 전)
     np.savez(f'{od}/components.npz', name=np.array(comp['name']), cls=np.array(comp['cls']), classes=np.array(SYN),
-             **{k: torch.cat(comp[k]).numpy() for k in ('sem', 'var', 'perc', 'cls_pred', 'cls_score', 'subj_pred', 'tok_pool', 'img', 'clip', 'vt', 'zb', 'w_ent', 'w_max') if comp[k]})
+             **{k: torch.cat(comp[k]).numpy() for k in ('sem', 'var', 'perc', 'cls_pred', 'cls_score', 'subj_pred', 'tok_pool', 'img', 'clip', 'vt', 'zb', 'w_ent', 'w_max', 'app') if comp[k]})
     cl = np.array(comp['cls']); kn = cl >= 0
     acc = float((torch.cat(comp['cls_pred']).numpy()[kn] == cl[kn]).mean()) if kn.any() else float('nan')
     print(f'{dsub} ({sub} 갈래) {a.perceptive}: {len(ids)} 물체 → {od}, 범주 정확도 {acc:.3f} (13범주 안 {int(kn.sum())}개)', flush=True)

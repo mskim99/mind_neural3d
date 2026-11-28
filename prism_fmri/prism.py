@@ -88,6 +88,19 @@ class GradReverse(torch.autograd.Function):
         return -ctx.lam * g, None
 
 
+class AppHead(nn.Module):
+    """11-28 F-1 Statistic Regressor (V-10 Appearance Head를 모델 안에): Mixed Features 프레임 평균 [B, 257, d] → 질감 통계 PCA 주성분 2개.
+    Linear Readout(토큰마다 Linear(d → r) → 펴서 Linear → 2, 비선형 없음) + Residual Refiner(토큰 평균 → MLP×3 → LayerNorm → Linear → 2). 두 출력층 0 초기화.
+    V-10(고정 모델 위 head)은 펼친 263k에 바로 Linear를 걸었지만, 함께 학습하며 Adam 보폭이 커지는 것을 피하려고 토큰마다 r차원으로 줄인 뒤 펼침."""
+    def __init__(self, d=1024, r=8, n_tok=257, h=256):
+        super().__init__()
+        self.n = nn.LayerNorm(d); self.red = nn.Linear(d, r); self.lin = nn.Linear(n_tok * r, 2)
+        self.mlp = nn.Sequential(nn.Linear(d, h), nn.GELU(), nn.Linear(h, h), nn.GELU(), nn.Linear(h, h), nn.GELU(), nn.LayerNorm(h), nn.Linear(h, 2))
+        for m in (self.lin, self.mlp[-1]): nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+    def forward(self, x):
+        x = self.n(x); return self.lin(self.red(x).flatten(1)) + self.mlp(x.mean(1))
+
+
 class PoseHead(nn.Module):
     """구조도 Variational head (Scale · Ratio, 이전 Center · Rotate): MLP×3 → LayerNorm → Linear (+ 활성은 밖에서). 특징(LayerNorm 출력)도 돌려줌."""
     def __init__(self, d, k, h=256):
@@ -244,6 +257,8 @@ class Prism(nn.Module):
             self.register_buffer('feat_mu', torch.zeros(K, 257, d)); self.register_buffer('feat_sd', torch.ones(K, 257, d))
         ds, dv, dp = splits
         self.comp_sel = bool(comp_sel)
+        self.app_head = bool(app_head)
+        if self.app_head: self.app = nn.ModuleList([AppHead(d) for _ in range(K)])   # 11-28 F-1: 피험자별 Statistic Regressor (질감 PC1 · PC2)
         if self.comp_sel:                                                   # 11-28 M-1 Component Selector: 갈래마다 채널 gate g_b = sigmoid(w_b) (처음 0.5) → Linear_b(g_b ⊙ Mixed) → 원래 폭 (자르기 대신)
             self.sel_w = nn.Parameter(torch.zeros(3, d)); self.sel_lin = nn.ModuleList([nn.Linear(d, w) for w in splits])
         assert arch in ('res', 'fig'); self.arch = arch
@@ -453,6 +468,7 @@ class Prism(nn.Module):
             s, v, p = (lin(mixed * g[i].to(mixed.dtype)) for i, lin in enumerate(self.sel_lin))
         else:
             s, v, p = mixed.split(self.splits, dim=-1)                              # 채널 분할 (학습 파라미터 없음)
+        if self.app_head: out['app'] = _route(self.app, subj, mixed.mean(1))        # 11-28 F-1: 자르기 전 Mixed Features 전체 → 질감 PC1 · PC2 [B, 2]
         if bank_init: return {'bank_cur': self.bank_cur(p)}                         # P-5: Bank 채우기용 (학습 전 한 번)
         # Semantic (피험자별): 프레임 평균(정적 성분) → (front) CLIP Projection → 패치 16×16 격자 → ConvNeXt식 encoder → Semantic Features [B, 256, dc]
         st = s[:, :, 1:].mean(1)                                                     # [B, 256, ds]
@@ -650,6 +666,10 @@ def prism_losses(out, batch, proto_temp=0.07):
         L['img_nce'] = (F.cross_entropy(lg, y) + F.cross_entropy(lg.t(), y)) / 2; L['img_r1'] = (lg.argmax(-1) == y).float().mean()
     else:
         L['img_cos'] = z; L['img_nce'] = z; L['img_r1'] = z
+    if 'app' in out and 'app' in batch:                                              # 11-28 F-1 L_app: 질감 PC1 · PC2 L2, 정답 없는 물체는 뺌
+        m = batch['app_ok'].float()[:, None]; L['app'] = ((out['app'] - batch['app'].float()) ** 2 * m).sum() / (m.sum() * 2).clamp_min(1)
+    else:
+        L['app'] = z
     L['sel'] = out['sel_gate'].mean(1).sum() if 'sel_gate' in out else z            # 11-28 M-1 희소 손실 (세 갈래 gate 평균의 합)
     if out['subj_logit'].shape[-1] > 1:
         L['subj'] = F.cross_entropy(out['subj_logit'], batch['subj']); L['subj_acc'] = (out['subj_logit'].argmax(-1) == batch['subj']).float().mean()

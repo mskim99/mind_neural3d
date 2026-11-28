@@ -95,6 +95,8 @@ p.add_argument('--region_prior', default='')   # 11-20: prep_region_prior.py 출
 p.add_argument('--rw_lo', type=float, default=0.3); p.add_argument('--rw_hi', type=float, default=0.7)   # 11-20: 사전값을 옮길 초기 가중 범위 (사용자 승인: 0.3 ~ 0.7, 사전값은 방향만)
 p.add_argument('--lam_rw', type=float, default=0.01)   # 11-20: 피험자별 조정 d의 L2 (클수록 피험자 공통 가중에 묶임)
 p.add_argument('--bank', type=int, default=0, choices=[0, 1]); p.add_argument('--bank_c', type=int, default=32); p.add_argument('--bank_lam', type=float, default=0.9)   # 11-28 P-5 Perceptive Bank (기준 객체 = train 전부)
+p.add_argument('--lam_app', type=float, default=0.0)   # 11-28 F-1: > 0이면 Statistic Regressor(prism.AppHead) + L_app 가중치
+p.add_argument('--app_tgt', default='')   # F-1 정답 npz (prep_app_target.py: keys · app [N, 2] · ok)
 p.add_argument('--comp_sel', type=int, default=0, choices=[0, 1])   # 11-28 M-1: 갈래별 채널 gate(Component Selector)로 성분 고르기 (자르기 대신)
 p.add_argument('--lam_sel', type=float, default=1e-3)   # M-1 희소 손실 λ · mean(g)
 p.add_argument('--seed', type=int, default=-1)   # 11-10: ≥ 0이면 torch · numpy · random 시드 고정 (반복 실험용), -1이면 이전처럼 고정 안 함
@@ -114,6 +116,10 @@ if a.var_heads in ('sil', 'view', 'shape'):                                     
     _z = np.load(a.view_tgt); _y = _z[a.var_heads].astype(np.float32); _ok = _z[a.var_heads + '_ok']
     VT = {str(k).split('/')[-1]: (_y[i], bool(_ok[i])) for i, k in enumerate(_z['keys'])}; a.vdim = int(_y.shape[-1])
     print(f'[view] {a.var_heads} 정답 {len(VT)}개 (정상 {int(_ok.sum())}), vdim {a.vdim}', flush=True)
+APP = {}
+if a.lam_app > 0:                                                                    # 11-28 F-1: uid → (질감 PC1 · PC2, ok)
+    _z = np.load(a.app_tgt); APP = {str(k).split('/')[-1]: (_z['app'][i].astype(np.float32), bool(_z['ok'][i])) for i, k in enumerate(_z['keys'])}
+    print(f'[app] 질감 PC 정답 {len(APP)}개 (정상 {int(_z["ok"].sum())})', flush=True)
 OSIL = {}
 if a.oracle_sil:
     assert a.mem == 'branch', '--oracle_sil은 --mem branch에서만'
@@ -156,6 +162,7 @@ def load_item(si, k):
             'rot': torch.from_numpy(np.stack([rot_target(float(t['az_deg'][j])) for j in vf])), 'name': k,
             **(lambda r: {'ratio': torch.from_numpy(r[0]), 'ratio_ok': r[1]})(ratio_target(uid) if a.var_heads == 'sr' else (np.zeros(3, np.float32), False)),
             **(lambda v: {'vt': torch.from_numpy(v[0]), 'vt_ok': v[1]})(VT.get(uid, (np.zeros((len(FRAMES), max(a.vdim, 1)), np.float32), False))),
+            **({'app': torch.from_numpy(APP.get(uid, (np.zeros(2, np.float32), False))[0]), 'app_ok': APP.get(uid, (None, False))[1]} if APP else {}),
             **({'img_emb': torch.from_numpy(np.load(f'{IMG_TGT}/{uid}.npy').astype(np.float32))} if IMG else {}),
             **({'osil': torch.from_numpy(OSIL.get((SUBS[si], uid), OSIL.get(('*', uid))))} if OSIL else {})}
 
@@ -317,6 +324,7 @@ if IMG: KEYS += ['img_cos', 'img_nce', 'img_r1']
 if a.lam_nce > 0: KEYS += ['tok_nce', 'tok_nce_acc']
 if PAIRED or a.lam_rem > 0: KEYS += ['share_s', 'share_s_acc', 'share_v', 'share_v_acc', 'rem_g', 'rem', 'rem_r2_sv', 'rem_r2_svp']   # 11-11 P = 나머지
 if a.comp_sel: KEYS += ['sel']
+if a.lam_app > 0: KEYS += ['app']
 if a.bank: KEYS += ['w_ent', 'w_max', 'r_mean']
 if SEP: KEYS += ['tc', 'd_loss', 'd_acc', 'hsic']                                   # 끈 학습은 csv 열 그대로
 log = open(f'{a.out_dir}/train_log.csv', 'a')
@@ -336,6 +344,7 @@ TERMS = {'tok': lambda L: W['tok'] * (L['tok_mse'] + L['tok_cos']), 'sem': lambd
          'share': lambda L: a.lam_share * min(1.0, step / max(1, a.share_warm)) * (L.get('share_s', 0.0) + (L.get('share_v', 0.0) if a.share_on == 'sv' else 0.0)),
          'rem': lambda L: a.lam_rem * (L.get('rem_g', 0.0) + L.get('rem', 0.0)),
          'nce': lambda L: a.lam_nce * L.get('tok_nce', 0.0),
+         'app': lambda L: a.lam_app * L.get('app', 0.0),   # 11-28 F-1
          'sel': lambda L: (a.lam_sel * L.get('sel', 0.0)) if a.comp_sel else 0.0}   # 11-28 M-1
 
 

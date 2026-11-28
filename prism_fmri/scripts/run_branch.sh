@@ -46,6 +46,8 @@ flags() { case $1 in g0) echo "$EP";;   # 11-15: 기존 Ours 설정 (공개 인�
                      ausvp_oraclesil_catmean) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --oracle_sil $W/prism_calib/vmaps/sil_catmean.npz";;   # 11-19 V-0 대조: 정답 범주의 평균 실루엣 지도만 (diag_vceil.py --maps_out)
                      ausvp_oraclesil_pred) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --oracle_sil $W/prism_calib/vmaps/sil_pred.npz";;   # 11-19 V-0 대조: 범주 평균 + V1–V4 커널 릿지 예측 잔차 (피험자별, train은 5겹 밖 예측)
                      ausvp_siltmpl) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --sil_tmpl $TGT/silhouettes32.npz";;   # 11-19 V-T: 최종 Ours(ausvp) + 범주 평균 실루엣을 Semantic 예측 범주 확률로 섞어 V 메모리에 (정답 안 씀)
+                     ausvp_app) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --lam_app 1.0 --app_tgt $TGT/app_target.npz";;   # 11-28 F-1: 최종 Ours(ausvp) + Statistic Regressor(질감 PC1 · PC2, Mixed 전체 · 피험자별) L_app w 1.0
+                     ausvp_app_w01) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --lam_app 0.1 --app_tgt $TGT/app_target.npz";;   # 11-28 F-1: 같은 것, w 0.1
                      ausvp_compsel) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --comp_sel 1 --lam_sel 1e-3";;   # 11-28 M-1: 최종 Ours(ausvp) + 갈래별 채널 gate(Component Selector, 자르기 대신), 희소 λ 1e-3
                      ausvp_compsel_l2) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --comp_sel 1 --lam_sel 1e-2";;   # 11-28 M-1: 같은 것, 희소 λ 1e-2
                      ausvp_linpath) echo "$EU --mem branch --v_pool 2 --sv_enc 0 --lin_path 1 --lin_norm 1";;   # 11-19 C-1: 최종 Ours(ausvp) + Semantic 원 신호 선형 경로(프레임 평균 65,536픽셀 → 1024, 피험자별, 0 초기화, 입력 z-score)

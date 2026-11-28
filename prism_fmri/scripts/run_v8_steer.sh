@@ -3,8 +3,8 @@
 #  STEERS="이름=<α json> …", 선택 NAMES=<물체 목록 txt>(작은 묶음). 생성은 run_v8.sh와 같은 gen.lock으로 줄을 섬
 # 사용: STEERS="s_a5=$W/prism_v8/steer/small_a5.json" NAMES=$W/prism_v8/steer/small_names.txt nohup bash run_v8_steer.sh > log 2>&1 &
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh" || exit 1
-GPU=0; export CUDA_VISIBLE_DEVICES=0; PY=$W/venv/bin/python; TM=microsoft/TRELLIS-text-base; O=$W/prism_v8; SN=${SUBN:-s01}; SEL=$W/prism_yaw/fullausvp_$SN/yawsel.json   # 11-28 V-10: SUBN=s06 등 다른 피험자 (기본 s01)
-TOK=$W/prism_full/eval_ausvp/infer/$SN/sub-000${SN#s0}_keep/tokens; P0=$W/prism_full/eval_ausvp/text/$SN/prompt.json
+GPU=0; export CUDA_VISIBLE_DEVICES=0; PY=$W/venv/bin/python; TM=microsoft/TRELLIS-text-base; O=${O8:-$W/prism_v8}; SN=${SUBN:-s01}; SEL=${SEL:-$W/prism_yaw/fullausvp_$SN/yawsel.json}   # 11-28 F-1: SEL · TOK · P0 · O8 바꿔 끼울 수 있음   # 11-28 V-10: SUBN=s06 등 다른 피험자 (기본 s01)
+TOK=${TOK:-$W/prism_full/eval_ausvp/infer/$SN/sub-000${SN#s0}_keep/tokens}; P0=${P0:-$W/prism_full/eval_ausvp/text/$SN/prompt.json}
 trel() { (cd $MG && source $MG/mg_guard.sh >/dev/null && export HF_HUB_OFFLINE=1 && python $PR/trellis_tools.py "$@"); }
 freewait() { until [ "$(nvidia-smi -i 0 --query-gpu=memory.free --format=csv,noheader,nounits)" -ge $1 ]; do sleep 30; done; }
 for kv in ${STEERS:?}; do
