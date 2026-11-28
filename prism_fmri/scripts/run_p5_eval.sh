@@ -5,6 +5,7 @@
 #     ②는 그 모델의 ① GLB가 다 만들어진 뒤 시작 (GPU 메모리: 생성 한 줄 약 18 GB)
 #  ③ z_B · w 통계: 추론 components.npz(zb · w_ent · w_max)에 들어감 → 로컬 분석
 #  BASE=1: 기존 Ours(prism_full/ausvp)도 같은 절차로 7명 + AP · APAC (Pro6000 6번 br_fullausvp_s6은 이미 있어 건너뜀)
+#  기존 Ours만 따로: MODELS="fullausvp=$W/prism_full/ausvp/model_final.pt" PACK=p5_eval_base … > logs/p5_eval_base.log
 #  모델 파일이 아직 없으면 생길 때까지 기다림 (학습 끝나기 전에 띄워 둬도 됨)
 # 사용: [BASE=1] nohup bash /home/oem/jhj/MinD-3D++/mind_neural3d/prism_fmri/scripts/run_p5_eval.sh > /home/oem/jhj/MinD-3D++/logs/p5_eval.log 2>&1 < /dev/null & disown
 GPU=1 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh" || exit 1
@@ -46,10 +47,10 @@ one() {   # 이름 · 체크포인트
 J=""; for kv in $MODELS; do one ${kv%%=*} ${kv#*=} & J="$J $!"; sleep 20; done
 wait $J
 # 로컬로 가져갈 묶음: 지표 · components(z_B · w) · 학습 로그 · 정성용 정면 렌더(피험자 1 · 6)
-cd $W; P=prism_p5/p5_eval_pack.tar; F=""
+cd $W; PK=${PACK:-p5_eval}; P=prism_p5/${PK}_pack.tar; F=""
 for kv in $MODELS; do n=${kv%%=*}
   F="$F $(ls -d fair_eval_ref/out/yaw_br_${n}_s*/values.txt fair_eval_ref/out/yaw_${n}_AP/values.txt fair_eval_ref_apac/out/yaw_${n}_APAC220/values.txt prism_branch/subs/$n/sub-000*_keep/components.npz prism_branch/subs/$n/sub-000*_keep/prompt_text.json prism_p5/apac_$n/*/components.npz 2>/dev/null)"
 done
 F="$F $(ls -d prism_p5/ausvp_bank*/train_log.csv 2>/dev/null)"
-tar cf $P $F; tar cf prism_p5/p5_eval_render0.tar $(ls fair_eval_ref/out/yaw_br_*_s[16]/render_R2/*/0.png 2>/dev/null | grep -E "br_(p5bank|p5temp|fullausvp)_s[16]/")
-echo "=== P5_EVAL_DONE $(date +%H:%M:%S) | $(ls -la $W/prism_p5/p5_eval_pack.tar $W/prism_p5/p5_eval_render0.tar | awk '{print $5" "$9}' | tr '\n' ' ') | 디스크 $(df -h $W | tail -1 | awk '{print $4" 남음"}')"
+tar cf $P $F; tar cf prism_p5/${PK}_render0.tar $(ls fair_eval_ref/out/yaw_br_*_s[16]/render_R2/*/0.png 2>/dev/null | grep -E "br_(p5bank|p5temp|fullausvp)_s[16]/")
+echo "=== P5_EVAL_DONE $(date +%H:%M:%S) | $(ls -la $W/prism_p5/${PK}_pack.tar $W/prism_p5/${PK}_render0.tar | awk '{print $5" "$9}' | tr '\n' ' ') | 디스크 $(df -h $W | tail -1 | awk '{print $4" 남음"}')"
